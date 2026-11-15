@@ -1263,6 +1263,120 @@ mod diagnostic_socket_tests {
     use std::path::PathBuf;
 
     #[test]
+    fn connection_cases_are_isolated() {
+        for case in ["missing", "live", "fd", "nonunicode"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "kwin::diagnostic_socket_tests::connection_case",
+                    "--nocapture",
+                ])
+                .env("SLIPSTREAM_WAYLAND_TEST_CASE", case)
+                .env_remove("WAYLAND_SOCKET")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("XDG_RUNTIME_DIR")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("test result: ok. 1 passed"),
+                "case {case}: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_case() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let Ok(case) = std::env::var("SLIPSTREAM_WAYLAND_TEST_CASE") else {
+            return;
+        };
+        let path =
+            std::env::temp_dir().join(format!("slipstream-wayland-test-{}", std::process::id()));
+        match case.as_str() {
+            "missing" => {
+                use std::io::Write;
+                use std::sync::{Arc, Mutex};
+                #[derive(Clone)]
+                struct Capture(Arc<Mutex<Vec<u8>>>);
+                struct Sink(Arc<Mutex<Vec<u8>>>);
+                impl Write for Sink {
+                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                        self.0.lock().unwrap().extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+                    type Writer = Sink;
+                    fn make_writer(&'a self) -> Sink {
+                        Sink(self.0.clone())
+                    }
+                }
+                assert!(!path.exists());
+                std::env::set_var("WAYLAND_DISPLAY", &path);
+                let bytes = Arc::new(Mutex::new(Vec::new()));
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(Capture(bytes.clone()))
+                    .without_time()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish();
+                tracing::subscriber::with_default(subscriber, || {
+                    assert!(matches!(
+                        super::connect_wayland_diagnostic(),
+                        Err(wayland_client::ConnectError::NoCompositor)
+                    ));
+                });
+                let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+                assert!(output.contains("errno=Some(2)"), "{output}");
+                assert!(!output.contains("slipstream-wayland-test-"), "{output}");
+            }
+            "live" => {
+                let listener = UnixListener::bind(&path).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                std::env::set_var("WAYLAND_DISPLAY", &path);
+                let result = super::connect_wayland_diagnostic();
+                let _first = listener.accept().expect("one socket connection");
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert!(result.is_ok());
+                drop(result);
+                drop(listener);
+                std::fs::remove_file(&path).unwrap();
+            }
+            "fd" => {
+                let (client, _server) = UnixStream::pair().unwrap();
+                std::env::set_var("WAYLAND_SOCKET", client.into_raw_fd().to_string());
+                std::env::set_var("WAYLAND_DISPLAY", &path);
+                assert!(super::connect_wayland_diagnostic().is_ok());
+                assert!(std::env::var_os("WAYLAND_SOCKET").is_none());
+            }
+            "nonunicode" => {
+                std::env::set_var("WAYLAND_SOCKET", OsString::from_vec(vec![255]));
+                std::env::set_var("WAYLAND_DISPLAY", &path);
+                assert!(matches!(
+                    super::connect_wayland_diagnostic(),
+                    Err(wayland_client::ConnectError::NoCompositor)
+                ));
+            }
+            _ => panic!("unknown connection test case"),
+        }
+    }
+
+    #[test]
     fn resolves_only_valid_wayland_paths() {
         let v = |s: &str| Some(OsString::from(s));
         assert_eq!(diagnostic_socket_path(None, v("/run/user/1")), None);

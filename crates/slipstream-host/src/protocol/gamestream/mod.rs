@@ -664,6 +664,7 @@ mod session_tests {
             fps: 60,
             packet_size: 1024,
             bitrate_kbps: 20_000,
+            fec_percentage: 20,
             codec: crate::encode::Codec::H265,
             min_fec: 0,
             hdr: false,

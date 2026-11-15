@@ -308,12 +308,7 @@ pub(super) fn stream_body(
     // Tell the encoder how deep the capturer lets it pipeline. Passing the actual ring depth
     // prevents a texture from rotating out from under a live encode.
     enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
-    // FEC overhead percent (Sunshine default 20). Override with SLIPSTREAM_FEC_PCT (0 = data-only).
-    let fec_pct: u8 = std::env::var("SLIPSTREAM_FEC_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
-    let pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
+    let pk = VideoPacketizer::new(cfg.packet_size, cfg.fec_percentage, cfg.min_fec);
 
     // Pace at the client's negotiated frame rate, re-encoding the last captured frame when the
     // compositor produced no new one. Compositors only emit frames on damage, so a static or

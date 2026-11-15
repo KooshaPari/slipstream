@@ -7,6 +7,7 @@
 
 use super::super::video::{FrameType, VideoPacketizer};
 use super::super::OnSessionLost;
+use super::queue_recovery::{offer_batch, request_keyframe, Offer};
 use super::{gs_bit_depth, StreamConfig};
 use crate::capture::Capturer;
 use crate::encode;
@@ -528,20 +529,12 @@ pub(super) fn stream_body(
         // Coalesce: emit at most one forced keyframe per in-flight window, so a burst of recovery
         // requests during one loss event doesn't turn every frame into a full IDR (see above).
         if want_keyframe {
-            let now = Instant::now();
-            let emit = match last_keyframe {
-                Some(t) => now.duration_since(t) >= keyframe_coalesce,
-                None => true,
-            };
-            if emit {
-                enc.request_keyframe();
-                last_keyframe = Some(now);
-                // A drop-recovery request is satisfied by an EMITTED keyframe, not by being
-                // read: coalesced away it would be lost — never retried — leaving duplicate wire
-                // indices in the encoder's reference table for a later RFI to anchor on (the
-                // stale-anchor case rfi.rs exists to prevent). Keep it armed until this point.
-                recover_after_drop = false;
-            } else {
+            if !request_keyframe(
+                &mut last_keyframe,
+                keyframe_coalesce,
+                &mut recover_after_drop,
+                || enc.request_keyframe(),
+            ) {
                 tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
             }
         }
@@ -662,14 +655,18 @@ pub(super) fn stream_body(
                     t.source_meta_pts_ns = s.source_meta_pts_ns;
                 }
             }
-            match raw_tx.try_send(RawFrame { aus, ts, timings }) {
-                Ok(()) => {
+            match offer_batch(
+                &raw_tx,
+                RawFrame { aus, ts, timings },
+                batch_len,
+                &mut au_seq,
+                &mut recover_after_drop,
+            ) {
+                Offer::Queued => {
                     sent_batches += 1;
-                    au_seq = au_seq.wrapping_add(batch_len);
                 }
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                Offer::Full => {
                     dropped_batches += 1;
-                    recover_after_drop = true; // re-anchor the reference chain on the next frame
                     if dropped_batches.is_power_of_two() {
                         tracing::warn!(
                             dropped_batches,
@@ -677,7 +674,7 @@ pub(super) fn stream_body(
                         );
                     }
                 }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Offer::Disconnected => {
                     break; // packetizer/sender exited (client gone)
                 }
             }

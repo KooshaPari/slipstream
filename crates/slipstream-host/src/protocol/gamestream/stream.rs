@@ -23,6 +23,8 @@ pub struct StreamConfig {
     pub fps: u32,
     pub packet_size: usize,
     pub bitrate_kbps: u32,
+    /// FEC percentage selected for both bitrate budgeting and packetization.
+    pub fec_percentage: u8,
     pub codec: Codec,
     /// Client's `x-nv-vqos[0].fec.minRequiredFecPackets` — parity floor per FEC block.
     pub min_fec: u8,
@@ -36,6 +38,13 @@ pub struct StreamConfig {
     /// (Amlogic — Chromecast with Google TV) wedge the whole device on multi-slice AUs they
     /// never asked for (the 0.17.0 4-slice-default field regression). Absent ⇒ 1.
     pub slices: u32,
+}
+
+pub(super) fn fec_percentage() -> u8 {
+    std::env::var("SLIPSTREAM_FEC_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
 }
 
 /// A pooled capturer plus the three properties reuse must match on — its HDR-ness, its

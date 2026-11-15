@@ -23,10 +23,47 @@ const FLAG_PIC: u8 = 0x1;
 const FLAG_EOF: u8 = 0x2;
 const FLAG_SOF: u8 = 0x4;
 const MULTI_FEC_FLAGS: u8 = 0x10;
-const MAX_DATA_SHARDS_PER_BLOCK: usize = 255;
+const MAX_DATA_SHARDS_WITHOUT_FEC: usize = 1023;
 const MAX_FEC_BLOCKS: usize = 4;
 /// Per-shard header: RTP(12) + reserved(4) + NV_VIDEO_PACKET(16).
 const SHARD_HEADER: usize = 32;
+
+#[derive(Debug)]
+pub enum PacketizeError {
+    FrameTooLarge,
+    UnrepresentableFec { data: usize, parity: usize },
+    Fec(slipstream_core::fec::FecError),
+}
+
+impl std::fmt::Display for PacketizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameTooLarge => write!(f, "frame exceeds GameStream FEC block limits"),
+            Self::UnrepresentableFec { data, parity } => write!(
+                f,
+                "{parity} FEC shards for {data} data shards cannot be represented"
+            ),
+            Self::Fec(error) => write!(f, "FEC encoding failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PacketizeError {}
+
+fn wire_fec_percentage(data: usize, parity: usize) -> Option<u8> {
+    if parity == 0 {
+        return Some(0);
+    }
+    let pct = (100 * parity / data).min(u8::MAX as usize);
+    (pct > 0 && (data * pct).div_ceil(100) == parity).then_some(pct as u8)
+}
+
+fn block_bounds(total: usize, blocks: usize, index: usize) -> (usize, usize) {
+    let base = total / blocks;
+    let remainder = total % blocks;
+    let first = index * base + index.min(remainder);
+    (first, first + base + usize::from(index < remainder))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameType {
@@ -49,6 +86,7 @@ pub struct VideoPacketizer {
     frame_index: u32,
     /// Monotonic per-stream packet counter (the RTP sequence / streamPacketIndex source).
     seq: u32,
+    oversized_frames: u64,
     /// Persistent GF(2⁸) coder so its `(k, m)` Cauchy-matrix cache survives across frames
     /// (plan Phase 1.4) — a stream's block shape only moves with frame size.
     coder: Gf8Coder,
@@ -68,6 +106,7 @@ impl VideoPacketizer {
             min_fec: min_fec as usize,
             frame_index: 0,
             seq: 0,
+            oversized_frames: 0,
             coder: Gf8Coder::default(),
         }
     }
@@ -83,44 +122,80 @@ impl VideoPacketizer {
         frame_type: FrameType,
         timestamp_90k: u32,
         frame_index: Option<u32>,
-    ) -> Vec<Vec<u8>> {
+    ) -> Result<Vec<Vec<u8>>, PacketizeError> {
+        let pps = self.payload_per_shard;
+        let blocksize = SHARD_HEADER + pps; // = packet_size + 16
+        let mut pct = self.fec_percentage;
+
+        // frame payload = 8-byte short frame header + the AU bitstream.
+        let total_len = au
+            .len()
+            .checked_add(8)
+            .ok_or(PacketizeError::FrameTooLarge)?;
+        let last_payload_len = match total_len % pps {
+            0 => pps,
+            r => r,
+        };
+        let total_data = total_len.div_ceil(pps).max(1);
+        // With parity, cap per-block data so k + m ≤ 255 (the GF(2⁸) ceiling): parity for k
+        // data shards is ⌈k·pct/100⌉, so k ≤ 255·100/(100+pct).
+        let max_data = if pct > 0 {
+            ((255 * 100) / (100 + pct)).min(255usize.saturating_sub(self.min_fec))
+        } else {
+            MAX_DATA_SHARDS_WITHOUT_FEC
+        };
+        if max_data == 0 {
+            return Err(PacketizeError::UnrepresentableFec {
+                data: 1,
+                parity: self.min_fec,
+            });
+        }
+        let mut n_blocks = total_data.div_ceil(max_data).max(1);
+        let without_fec = pct > 0 && n_blocks > MAX_FEC_BLOCKS;
+        if without_fec {
+            pct = 0;
+            n_blocks = MAX_FEC_BLOCKS;
+        }
+        if n_blocks > MAX_FEC_BLOCKS || total_data.div_ceil(n_blocks) > MAX_DATA_SHARDS_WITHOUT_FEC
+        {
+            return Err(PacketizeError::FrameTooLarge);
+        }
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for b in 0..n_blocks {
+            let (first, last) = block_bounds(total_data, n_blocks, b);
+            let k = last - first;
+            let m = if pct > 0 {
+                (k * pct).div_ceil(100).max(self.min_fec)
+            } else {
+                0
+            };
+            let wire_pct = wire_fec_percentage(k, m)
+                .ok_or(PacketizeError::UnrepresentableFec { data: k, parity: m })?;
+            blocks.push((first, last, m, wire_pct));
+        }
+
+        if without_fec {
+            self.oversized_frames = self.oversized_frames.saturating_add(1);
+            if self.oversized_frames.is_power_of_two() {
+                tracing::warn!(
+                    frames = self.oversized_frames,
+                    data_shards = total_data,
+                    "video: oversized frame sent without FEC"
+                );
+            }
+        }
+
         let frame_index = frame_index.unwrap_or_else(|| {
             let i = self.frame_index;
             self.frame_index = i.wrapping_add(1);
             i
         });
-        let pps = self.payload_per_shard;
-        let blocksize = SHARD_HEADER + pps; // = packet_size + 16
-        let pct = self.fec_percentage;
-
-        // frame payload = 8-byte short frame header + the AU bitstream.
-        let total_len = 8 + au.len();
-        let last_payload_len = match total_len % pps {
-            0 => pps,
-            r => r,
-        };
         let mut fp = Vec::with_capacity(total_len);
         fp.extend_from_slice(&short_frame_header(frame_type, last_payload_len as u16));
         fp.extend_from_slice(au);
 
-        let total_data = total_len.div_ceil(pps).max(1);
-        // With parity, cap per-block data so k + m ≤ 255 (the GF(2⁸) ceiling): parity for k
-        // data shards is ⌈k·pct/100⌉, so k ≤ 255·100/(100+pct).
-        let max_data = if pct > 0 {
-            (255 * 100) / (100 + pct)
-        } else {
-            MAX_DATA_SHARDS_PER_BLOCK
-        };
-        let n_blocks = total_data.div_ceil(max_data).clamp(1, MAX_FEC_BLOCKS);
-        let per_block = total_data.div_ceil(n_blocks);
-
         let mut packets = Vec::with_capacity(total_data + total_data * pct / 100 + n_blocks);
-        for b in 0..n_blocks {
-            let first = b * per_block;
-            let last = ((b + 1) * per_block).min(total_data);
-            if first >= last {
-                break;
-            }
+        for (b, (first, last, m, wire_pct)) in blocks.into_iter().enumerate() {
             let k = last - first;
             let block_seq_base = self.seq;
             let multi_fec_blocks = ((b as u8) << 4) | (((n_blocks - 1) as u8) << 6);
@@ -131,13 +206,13 @@ impl VideoPacketizer {
             let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k);
             for i in 0..k {
                 let global = first + i;
-                let seq = block_seq_base + i as u32;
+                let seq = block_seq_base.wrapping_add(i as u32);
                 let mut buf = vec![0u8; blocksize];
                 let mut flags = FLAG_PIC;
-                if global == 0 {
+                if i == 0 {
                     flags |= FLAG_SOF;
                 }
-                if global == total_data - 1 {
+                if i == k - 1 {
                     flags |= FLAG_EOF;
                 }
                 buf[16..20].copy_from_slice(&(seq << 8).to_le_bytes()); // streamPacketIndex
@@ -154,15 +229,9 @@ impl VideoPacketizer {
             // 2. m = ⌈k·pct/100⌉ parity shards (floored at the client's min, capped so k+m≤255)
             //    over the full datagrams. The wire percentage is recomputed from m so the client
             //    derives the same count.
-            let m = if pct > 0 {
-                (k * pct).div_ceil(100).max(self.min_fec).min(255 - k)
-            } else {
-                0
-            };
-            let wire_pct = if m > 0 { (100 * m) / k } else { 0 };
             let parity = if m > 0 {
                 let refs: Vec<&[u8]> = shards.iter().map(|s| s.as_slice()).collect();
-                self.coder.encode(&refs, m).unwrap_or_default()
+                self.coder.encode(&refs, m).map_err(PacketizeError::Fec)?
             } else {
                 Vec::new()
             };
@@ -170,16 +239,16 @@ impl VideoPacketizer {
             // 3. Stamp transport headers (RTP + fecInfo) on every shard. We do NOT touch the
             //    flags/streamPacketIndex bytes, so a recovered data shard's RS-reconstructed
             //    NV header stays valid.
-            self.seq = block_seq_base + k as u32;
+            self.seq = block_seq_base.wrapping_add(k as u32);
             for (i, mut buf) in shards.into_iter().enumerate() {
-                let seq = block_seq_base + i as u32;
+                let seq = block_seq_base.wrapping_add(i as u32);
                 finalize(
                     &mut buf,
                     seq,
                     timestamp_90k,
                     frame_index,
                     multi_fec_blocks,
-                    fec_info(k, i, wire_pct),
+                    fec_info(k, i, wire_pct as usize),
                 );
                 packets.push(buf);
             }
@@ -192,12 +261,12 @@ impl VideoPacketizer {
                     timestamp_90k,
                     frame_index,
                     multi_fec_blocks,
-                    fec_info(k, k + j, wire_pct),
+                    fec_info(k, k + j, wire_pct as usize),
                 );
                 packets.push(buf);
             }
         }
-        packets
+        Ok(packets)
     }
 
     /// Number of data (non-parity) shards `packetize` will emit for an AU of `au_len` bytes —
@@ -250,11 +319,151 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wire_percentage_matches_receiver_for_all_valid_shard_counts() {
+        for data in 1..=255usize {
+            for parity in 0..=(255 - data) {
+                let possible = (0..=255usize).any(|pct| (data * pct).div_ceil(100) == parity);
+                let actual = wire_fec_percentage(data, parity);
+                assert_eq!(actual.is_some(), possible, "data={data} parity={parity}");
+                if let Some(pct) = actual {
+                    assert_eq!((data * pct as usize).div_ceil(100), parity);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_split_never_advertises_empty_blocks() {
+        for total in 1..=(MAX_DATA_SHARDS_WITHOUT_FEC * MAX_FEC_BLOCKS) {
+            for count in 1..=total.min(MAX_FEC_BLOCKS) {
+                let mut previous = 0;
+                for index in 0..count {
+                    let (first, last) = block_bounds(total, count, index);
+                    assert_eq!(first, previous);
+                    assert!(last > first);
+                    assert!(last - first <= total.div_ceil(count));
+                    previous = last;
+                }
+                assert_eq!(previous, total);
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_minimum_fallback_emits_every_advertised_block() {
+        let mut pk = VideoPacketizer::new(1392, 20, 254);
+        let packets = pk
+            .packetize(
+                &vec![0; 5 * pk.payload_per_shard - 8],
+                FrameType::P,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(packets.len(), 5);
+        let mut counts = [0; MAX_FEC_BLOCKS];
+        for packet in &packets {
+            let block = ((packet[27] >> 4) & 3) as usize;
+            assert_eq!((packet[27] >> 6) & 3, 3);
+            counts[block] += 1;
+        }
+        assert_eq!(counts, [2, 1, 1, 1]);
+    }
+
+    #[test]
+    fn minimum_three_parity_shards_fit_one_data_shard() {
+        let mut pk = VideoPacketizer::new(1392, 20, 3);
+        let packets = pk.packetize(&[0x42], FrameType::P, 0, None).unwrap();
+        assert_eq!(packets.len(), 4);
+        for (index, packet) in packets.iter().enumerate() {
+            let info = u32::from_le_bytes(packet[28..32].try_into().unwrap());
+            assert_eq!((info >> 12) & 0x3ff, index as u32);
+            assert_eq!((info >> 4) & 0xff, 255);
+            assert_eq!(((info >> 4) & 0xff).div_ceil(100), 3);
+        }
+    }
+
+    #[test]
+    fn impossible_minimum_fails_without_advancing_sequence() {
+        let mut pk = VideoPacketizer::new(1392, 20, 4);
+        assert!(matches!(
+            pk.packetize(&[0x42], FrameType::P, 0, None),
+            Err(PacketizeError::UnrepresentableFec { data: 1, parity: 4 })
+        ));
+        assert_eq!((pk.frame_index, pk.seq), (0, 0));
+    }
+
+    #[test]
+    fn shard_limit_is_enforced_before_frame_state_changes() {
+        let mut pk = VideoPacketizer::new(1392, 20, 0);
+        let max_data = (255 * 100) / 120;
+        let max_au = MAX_DATA_SHARDS_WITHOUT_FEC * MAX_FEC_BLOCKS * pk.payload_per_shard - 8;
+        assert!(matches!(
+            pk.packetize(&vec![0; max_au + 1], FrameType::P, 0, None),
+            Err(PacketizeError::FrameTooLarge)
+        ));
+        assert_eq!((pk.frame_index, pk.seq), (0, 0));
+        let packets = pk
+            .packetize(
+                &vec![0; max_data * pk.payload_per_shard - 8],
+                FrameType::P,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(packets.len(), 255);
+    }
+
+    #[test]
+    fn oversized_fec_frame_falls_back_to_well_formed_unprotected_blocks() {
+        let mut pk = VideoPacketizer::new(1392, 20, 3);
+        let fec_data_limit = (255 * 100) / 120;
+        let au_len = fec_data_limit * MAX_FEC_BLOCKS * pk.payload_per_shard - 8 + 1;
+        let packets = pk
+            .packetize(&vec![0; au_len], FrameType::Idr, 0, None)
+            .unwrap();
+        assert_eq!(pk.oversized_frames, 1);
+        let mut total_data = 0;
+        let mut block_counts = [0; MAX_FEC_BLOCKS];
+        for packet in &packets {
+            let info = u32::from_le_bytes(packet[28..32].try_into().unwrap());
+            let data = (info >> 22) as usize;
+            let index = ((info >> 12) & 0x3ff) as usize;
+            let pct = (info >> 4) & 0xff;
+            let block = ((packet[27] >> 4) & 3) as usize;
+            assert_eq!((packet[27] >> 6) & 3, 3);
+            assert_eq!(pct, 0);
+            assert!(index < data && data <= MAX_DATA_SHARDS_WITHOUT_FEC);
+            assert_eq!(packet[24] & FLAG_SOF != 0, index == 0);
+            assert_eq!(packet[24] & FLAG_EOF != 0, index + 1 == data);
+            block_counts[block] += 1;
+            if index == 0 {
+                total_data += data;
+            }
+        }
+        assert_eq!(packets.len(), total_data);
+        assert!(block_counts.iter().all(|count| *count > 0));
+    }
+
+    #[test]
+    fn packet_sequence_wraps_without_panicking() {
+        let mut pk = VideoPacketizer::new(1392, 0, 0);
+        pk.seq = u32::MAX - 1;
+        let packets = pk.packetize(&vec![0; 4000], FrameType::P, 0, None).unwrap();
+        let seqs: Vec<_> = packets
+            .iter()
+            .map(|p| u16::from_be_bytes(p[2..4].try_into().unwrap()))
+            .collect();
+        assert_eq!(seqs, [u16::MAX - 1, u16::MAX, 0]);
+        assert_eq!(pk.seq, 1);
+    }
+
+    #[test]
     fn single_block_layout() {
         let mut pk = VideoPacketizer::new(1392, 0, 0); // data-only; pps = 1392+16-32 = 1376
         assert_eq!(pk.payload_per_shard, 1376);
         let au = vec![0xABu8; 4000]; // 8+4000 = 4008 → ceil(4008/1376) = 3 data shards
-        let pkts = pk.packetize(&au, FrameType::Idr, 90_000, None);
+        let pkts = pk.packetize(&au, FrameType::Idr, 90_000, None).unwrap();
         assert_eq!(pkts.len(), 3);
         for p in &pkts {
             assert_eq!(p.len(), SHARD_HEADER + 1376);
@@ -292,11 +501,11 @@ mod tests {
     #[test]
     fn multi_block_split() {
         let mut pk = VideoPacketizer::new(1392, 0, 0); // data-only
-        let au = vec![0u8; 600_000];
-        let pkts = pk.packetize(&au, FrameType::P, 0, None);
+        let au = vec![0u8; 1_500_000];
+        let pkts = pk.packetize(&au, FrameType::P, 0, None).unwrap();
         let total = (8 + au.len()).div_ceil(1376);
         assert_eq!(pkts.len(), total);
-        let n_blocks = total.div_ceil(255).clamp(1, 4);
+        let n_blocks = total.div_ceil(MAX_DATA_SHARDS_WITHOUT_FEC);
         let last_block = ((pkts.last().unwrap()[27]) >> 6) & 0x3;
         assert_eq!(last_block as usize, n_blocks - 1);
     }
@@ -305,7 +514,7 @@ mod tests {
     fn emits_parity_shards() {
         let mut pk = VideoPacketizer::new(1392, 20, 0); // pps = 1376, 20% FEC
         let au = vec![0xABu8; 4000]; // 8+4000 = 4008 → 3 data shards (k=3)
-        let pkts = pk.packetize(&au, FrameType::Idr, 0, None);
+        let pkts = pk.packetize(&au, FrameType::Idr, 0, None).unwrap();
         // m = ceil(3*20/100) = 1 parity shard → 4 packets; wire_pct = 100*1/3 = 33.
         assert_eq!(pkts.len(), 4);
         for p in &pkts {
@@ -332,7 +541,7 @@ mod tests {
     fn parity_recovers_full_datagram_incl_flags() {
         let mut pk = VideoPacketizer::new(1392, 50, 0); // high pct → plenty of parity
         let au = vec![0x5Au8; 4000]; // k = 3
-        let pkts = pk.packetize(&au, FrameType::Idr, 0, None);
+        let pkts = pk.packetize(&au, FrameType::Idr, 0, None).unwrap();
         let k = 3usize;
         let m = pkts.len() - k;
         assert!(m >= 1);

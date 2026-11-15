@@ -297,8 +297,17 @@ fn default_bus(env: &EnvProbe, runtime: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn is_kwin_compositor_comm(comm: &str) -> bool {
-    matches!(comm, "kwin_wayland" | ".kwin_wayland-w")
+fn is_kwin_compositor_comm(comm: &str, cmdline: Option<&[u8]>) -> bool {
+    match comm {
+        "kwin_wayland" => true,
+        ".kwin_wayland-w" => {
+            cmdline
+                .and_then(|args| args.split(|b| *b == 0).next())
+                .and_then(|arg| arg.rsplit(|b| *b == b'/').next())
+                == Some(b"kwin_wayland".as_slice())
+        }
+        _ => false,
+    }
 }
 
 /// Detect the graphical session live for our uid right now (cheap, side-effect-free: a `/proc`
@@ -340,9 +349,19 @@ pub fn detect_active_session() -> ActiveSession {
             let Ok(comm) = std::fs::read_to_string(pid_path.join("comm")) else {
                 continue;
             };
-            let (k, prio) = match comm.trim() {
+            let comm = comm.trim();
+            let kwin_cmdline = (comm == ".kwin_wayland-w")
+                .then(|| {
+                    let args = std::fs::read(pid_path.join("cmdline")).ok()?;
+                    let after = std::fs::metadata(&pid_path).ok()?;
+                    (after.uid() == uid && after.ino() == md.ino()).then_some(args)
+                })
+                .flatten();
+            let (k, prio) = match comm {
                 "gamescope" | "gamescope-wl" => (ActiveKind::Gaming, 1),
-                name if is_kwin_compositor_comm(name) => (ActiveKind::DesktopKde, 4),
+                name if is_kwin_compositor_comm(name, kwin_cmdline.as_deref()) => {
+                    (ActiveKind::DesktopKde, 4)
+                }
                 "gnome-shell" => (ActiveKind::DesktopGnome, 4),
                 // Hyprland is its own backend (hyprctl + xdph) — split it out of the sway/river
                 // wlroots-proper family (design/hyprland-support.md D1).
@@ -706,12 +725,27 @@ mod tests {
 
     #[test]
     fn detects_native_and_nixos_wrapped_kwin_without_matching_other_processes() {
-        assert!(is_kwin_compositor_comm("kwin_wayland"));
-        assert!(is_kwin_compositor_comm(".kwin_wayland-w"));
-        assert!(!is_kwin_compositor_comm(".kwin_wayland_w"));
-        assert!(!is_kwin_compositor_comm("kwin_wayland_x"));
-        assert!(!is_kwin_compositor_comm(".kwin_wayland_x"));
-        assert!(!is_kwin_compositor_comm(""));
+        assert!(is_kwin_compositor_comm("kwin_wayland", None));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b"kwin_wayland\0--wayland\0")
+        ));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b"/usr/bin/kwin_wayland\0")
+        ));
+        assert!(!is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b".kwin_wayland-wrong\0")
+        ));
+        assert!(!is_kwin_compositor_comm(".kwin_wayland-w", None));
+        assert!(!is_kwin_compositor_comm(
+            ".kwin_wayland_w",
+            Some(b"kwin_wayland\0")
+        ));
+        assert!(!is_kwin_compositor_comm("kwin_wayland_x", None));
+        assert!(!is_kwin_compositor_comm(".kwin_wayland_x", None));
+        assert!(!is_kwin_compositor_comm("", None));
     }
 
     /// A scratch runtime dir with the sway-ipc sockets named in `pids`, plus the uid the names are

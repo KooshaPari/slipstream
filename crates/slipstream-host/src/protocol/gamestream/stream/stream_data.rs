@@ -127,6 +127,8 @@ pub(super) fn spawn_packetizer(
     tx: std::sync::mpsc::SyncSender<WireBatch>,
     mut pk: VideoPacketizer,
     goodput: Arc<std::sync::atomic::AtomicU64>,
+    running: Arc<AtomicBool>,
+    on_lost: OnSessionLost,
 ) -> Result<()> {
     std::thread::Builder::new()
         .name("slipstream-pkt".into())
@@ -138,7 +140,16 @@ pub(super) fn spawn_packetizer(
                 for (au, ft, idx) in frame.aus {
                     let data = pk.data_shard_count(au.len());
                     let before = batch.len();
-                    batch.extend(pk.packetize(&au, ft, frame.ts, Some(idx)));
+                    match pk.packetize(&au, ft, frame.ts, Some(idx)) {
+                        Ok(packets) => batch.extend(packets),
+                        Err(error) => {
+                            tracing::error!(%error, "video: packetization failed — ending session");
+                            if running.swap(false, Ordering::SeqCst) {
+                                on_lost();
+                            }
+                            return;
+                        }
+                    }
                     frame.timings.fec_packets += (batch.len() - before) as u32 - data as u32;
                 }
                 if batch.is_empty() {
@@ -351,7 +362,14 @@ pub(super) fn stream_body(
         artifact.clone(),
     )?;
     let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(2);
-    spawn_packetizer(raw_rx, batch_tx, pk, goodput.clone())?;
+    spawn_packetizer(
+        raw_rx,
+        batch_tx,
+        pk,
+        goodput.clone(),
+        running.clone(),
+        on_lost.clone(),
+    )?;
 
     // Per-stage timing (SLIPSTREAM_PERF=1): max µs/stage per second + unique vs re-encoded frames,
     // to pinpoint stalls. `unique` counts genuinely-new captured frames (vs re-encoded holds).

@@ -1227,6 +1227,58 @@ fn run_existing(
     Ok(())
 }
 
+fn diagnostic_socket_path(
+    display: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let display = std::path::PathBuf::from(display?);
+    if display.is_absolute() {
+        return Some(display);
+    }
+    let runtime = std::path::PathBuf::from(runtime?);
+    runtime.is_absolute().then(|| runtime.join(display))
+}
+
+fn connect_wayland_diagnostic() -> std::result::Result<Connection, wayland_client::ConnectError> {
+    if std::env::var("WAYLAND_SOCKET").is_ok() {
+        return Connection::connect_to_env();
+    }
+    let Some(path) = diagnostic_socket_path(
+        std::env::var_os("WAYLAND_DISPLAY"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    ) else {
+        return Connection::connect_to_env();
+    };
+    let stream = std::os::unix::net::UnixStream::connect(path).map_err(|error| {
+        tracing::warn!(errno = ?error.raw_os_error(), "KWin Wayland socket connect failed");
+        wayland_client::ConnectError::NoCompositor
+    })?;
+    Connection::from_socket(stream)
+}
+
+#[cfg(test)]
+mod diagnostic_socket_tests {
+    use super::diagnostic_socket_path;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolves_only_valid_wayland_paths() {
+        let v = |s: &str| Some(OsString::from(s));
+        assert_eq!(diagnostic_socket_path(None, v("/run/user/1")), None);
+        assert_eq!(diagnostic_socket_path(v("wayland-0"), None), None);
+        assert_eq!(diagnostic_socket_path(v("wayland-0"), v("relative")), None);
+        assert_eq!(
+            diagnostic_socket_path(v("wayland-0"), v("/run/user/1")),
+            Some(PathBuf::from("/run/user/1/wayland-0"))
+        );
+        assert_eq!(
+            diagnostic_socket_path(v("/tmp/wayland-1"), None),
+            Some(PathBuf::from("/tmp/wayland-1"))
+        );
+    }
+}
+
 fn run(
     width: u32,
     height: u32,
@@ -1235,7 +1287,7 @@ fn run(
     setup_tx: &Sender<Result<u32, String>>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let conn = Connection::connect_to_env()
+    let conn = connect_wayland_diagnostic()
         .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();

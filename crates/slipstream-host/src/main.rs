@@ -435,7 +435,9 @@ fn real_main() -> Result<()> {
             let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
             #[cfg(target_os = "linux")]
             ss_vdisplay::drm_force::startup_recover();
-            gamestream::serve(mgmt_opts, native, gamestream)
+            #[cfg(target_os = "linux")]
+    ss_vdisplay::warm_socket();
+    gamestream::serve(mgmt_opts, native, gamestream)
         }
         // Report other Moonlight-compatible hosts (Sunshine/Apollo/…) installed or running on this
         // machine — side-by-side use is unsupported. Exit 1 if any are found (so the installers and
@@ -775,6 +777,8 @@ fn env_flag_enabled(name: &str) -> bool {
 #[cfg(target_os = "windows")]
 pub(crate) fn run_default_serve() -> Result<()> {
     let (mgmt_opts, native, gamestream) = parse_serve(&[])?;
+    #[cfg(target_os = "linux")]
+    ss_vdisplay::warm_socket();
     gamestream::serve(mgmt_opts, native, gamestream)
 }
 

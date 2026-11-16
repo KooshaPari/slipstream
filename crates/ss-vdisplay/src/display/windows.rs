@@ -144,9 +144,51 @@ impl VirtualDisplay for WindowsMirrorDisplay {
                 "windows: head already at the client mode"
             );
         }
+        // `ChangeDisplaySettingsExW`'s success verdict is a statement about the call, not about the
+        // head: on an RTX 3090 Ti / `\\.\DISPLAY1` panel it returns SUCCESSFUL for a
+        // `1920x1080@144` ask that the panel cannot hold, and the head silently stays at its native
+        // `2560x1440@144`. Capture configured from the *requested* mode then waits forever on a
+        // frame pool for a mode that was never programmed: the session negotiates, opens NVENC,
+        // streams audio and ships zero AUs with no error anywhere. Read the actual mode back and
+        // make it the source of truth for everything downstream.
+        let effective = read_mode(&self.device).context("read back the head mode after the set")?;
+        let requested = (mode.width, mode.height, mode.refresh_hz);
+        let effective_dims = effective.dims();
+        let (width, height, hz) = match decide_mode_readback(requested, effective_dims, true) {
+            ModeReadback::UseRequested => {
+                tracing::info!(
+                    device = %self.device,
+                    requested = %fmt_mode(requested),
+                    effective = %fmt_mode(effective_dims),
+                    mismatch = false,
+                    "head mode readback"
+                );
+                requested
+            }
+            ModeReadback::UseEffective => {
+                tracing::warn!(
+                    device = %self.device,
+                    requested = %fmt_mode(requested),
+                    effective = %fmt_mode(effective_dims),
+                    mismatch = true,
+                    "head mode readback  -  the display did not hold the requested mode; capturing \
+                     where it actually is"
+                );
+                effective_dims
+            }
+            ModeReadback::Fail { reason } => anyhow::bail!(
+                "head mode readback for {}: requested={} effective={}: {reason}",
+                self.device,
+                fmt_mode(requested),
+                fmt_mode(effective_dims)
+            ),
+        };
+        // A driver may report `dmDisplayFrequency` 0/1 for "default"; pacing needs a real rate, so
+        // fall back to the session's ask there rather than to a nonsense 1 Hz.
+        let hz = if hz > 1 { hz } else { mode.refresh_hz };
         Ok(VirtualOutput {
             node_id: 0, // no PipeWire node — capture resolves `windows_head` instead
-            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+            preferred_mode: Some((width, height, hz)),
             keepalive: Box::new(restore),
             ownership: DisplayOwnership::External,
             reused_gen: None,
@@ -154,6 +196,57 @@ impl VirtualDisplay for WindowsMirrorDisplay {
             windows_head: Some(self.device.clone()),
         })
     }
+}
+
+/// What the mode readback says capture should be configured from.
+///
+/// Pure and separable from Win32 on purpose: the API boundary (`read_mode`) cannot be unit tested,
+/// while this decision is the whole defect. `UseRequested` and `UseEffective` differ only where the
+/// head ignored the ask; both mean "capture here", but only one is a warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModeReadback {
+    /// The head is at the requested mode (or the ask was already satisfied): capture there.
+    UseRequested,
+    /// The head ignored or refused the ask but its actual mode is usable: capture there.
+    UseEffective,
+    /// The head reports a mode capture cannot be configured for: refuse the session loudly.
+    Fail { reason: String },
+}
+
+/// Decide what a `requested`/`effective` pair means for capture configuration.
+///
+/// The measured case that motivates this: requesting `1920x1080@144` on a panel whose EDID lists
+/// only `2560x1440@144` leaves the head at `2560x1440@144` while `ChangeDisplaySettingsExW` returns
+/// SUCCESSFUL. Capturing at the requested 1080p then produces zero frames forever, so an effective
+/// mode that differs must win  -  `UseEffective`  -  never be silently reported as the request.
+fn decide_mode_readback(
+    requested: (u32, u32, u32),
+    effective: (u32, u32, u32),
+    capture_supported: bool,
+) -> ModeReadback {
+    if effective.0 == 0 || effective.1 == 0 {
+        return ModeReadback::Fail {
+            reason: "the display reports a zero-sized mode, so no frame can be captured".into(),
+        };
+    }
+    if !capture_supported {
+        return ModeReadback::Fail {
+            reason: "capture cannot be configured for the display's effective mode".into(),
+        };
+    }
+    // Compare pixels only: a driver is free to report a fractional refresh rounded to a neighbour
+    // (143.998 Hz reads back as 143 or 144), and that is the same mode for capture purposes. The
+    // rate is still logged from the effective mode, which is what paces the stream.
+    if (effective.0, effective.1) == (requested.0, requested.1) {
+        ModeReadback::UseRequested
+    } else {
+        ModeReadback::UseEffective
+    }
+}
+
+/// `WxH@Hz` for a log line.
+fn fmt_mode(mode: (u32, u32, u32)) -> String {
+    format!("{}x{}@{}", mode.0, mode.1, mode.2)
 }
 
 /// The head's mode as (width, height, Hz), for compare + restore.
@@ -326,4 +419,78 @@ fn to_wide_nul(s: &str) -> Vec<u16> {
 fn wide_to_string(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
+}
+
+#[cfg(test)]
+mod readback_tests {
+    use super::{decide_mode_readback, ModeReadback};
+
+    /// The panel's native mode: asked for `2560x1440@144`, held it (measured: 410 frames / 10 s).
+    #[test]
+    fn readback_uses_the_request_for_the_native_mode() {
+        assert_eq!(
+            decide_mode_readback((2560, 1440, 144), (2560, 1440, 144), true),
+            ModeReadback::UseRequested
+        );
+    }
+
+    /// A mode the driver can genuinely drive: asked `1920x1080@60`, held it (measured: 275 / 8 s).
+    #[test]
+    fn readback_uses_the_request_for_a_working_1080p60_mode() {
+        assert_eq!(
+            decide_mode_readback((1920, 1080, 60), (1920, 1080, 60), true),
+            ModeReadback::UseRequested
+        );
+    }
+
+    /// THE defect, measured on this desk: `1920x1080@144` is absent from the panel's EDID, the
+    /// change call still reports SUCCESSFUL, and the head stays at `2560x1440@144` while capture is
+    /// configured for the requested 1080p — 0 frames with no error. The effective mode must win.
+    #[test]
+    fn readback_uses_the_effective_mode_when_the_head_ignored_1080p144() {
+        let decision = decide_mode_readback((1920, 1080, 144), (2560, 1440, 144), true);
+        assert_eq!(decision, ModeReadback::UseEffective);
+        assert_ne!(
+            decision,
+            ModeReadback::UseRequested,
+            "capturing at the requested 1920x1080 produced zero frames on the measured panel"
+        );
+    }
+
+    /// A readback with no pixels can never be captured; it must fail the session, not degrade it.
+    #[test]
+    fn readback_fails_on_a_zero_sized_effective_mode() {
+        for effective in [(0, 0, 0), (1920, 0, 60), (0, 1080, 60)] {
+            match decide_mode_readback((1920, 1080, 60), effective, true) {
+                ModeReadback::Fail { reason } => {
+                    assert!(reason.contains("zero-sized"), "reason was {reason:?}")
+                }
+                other => panic!("expected Fail for effective {effective:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// If capture cannot be configured for the effective mode, refuse rather than ship audio only.
+    #[test]
+    fn readback_fails_when_capture_cannot_be_configured() {
+        match decide_mode_readback((1920, 1080, 144), (2560, 1440, 144), false) {
+            ModeReadback::Fail { reason } => {
+                assert!(
+                    reason.contains("capture cannot be configured"),
+                    "{reason:?}"
+                )
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// A fractional EDID rate read back as a neighbouring integer is the same mode for capture:
+    /// `2560x1440@143.998` may enumerate as 143 or 144 Hz and must not be treated as a mismatch.
+    #[test]
+    fn readback_tolerates_a_rounded_refresh_for_the_same_pixels() {
+        assert_eq!(
+            decide_mode_readback((2560, 1440, 144), (2560, 1440, 143), true),
+            ModeReadback::UseRequested
+        );
+    }
 }

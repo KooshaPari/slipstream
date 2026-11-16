@@ -231,7 +231,7 @@ struct SpeedTestSheet: View {
         Task.detached(priority: .userInitiated) {
             // Connect (blocking) — same identity/trust as a session, but TOFU results are
             // NOT persisted from here.
-            let identity = (try? ClientIdentityStore.shared.load())?.identity
+            let identity = try? ClientIdentityStore.shared.load()
             let conn: SlipstreamConnection
             do {
                 conn = try SlipstreamConnection(

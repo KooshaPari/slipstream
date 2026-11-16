@@ -138,16 +138,26 @@ struct LibraryView: View {
         .disabled(loading)
     }
 
+    /// Loads the persistent identity, distinguishing a stored identity that cannot be read
+    /// (which must never be papered over with a freshly minted key) from the plain failure.
+    private func loadedIdentity() -> ClientIdentity? {
+        do {
+            return try ClientIdentityStore.shared.load()
+        } catch {
+            errorText = "This Mac's client identity can't be read (\(error)). The library stays "
+                + "unavailable so another device record isn't created by accident."
+            return nil
+        }
+    }
+
     private func load() async {
         loading = true
         errorText = nil
         let current = store.hosts.first { $0.id == host.id } ?? host
         // mTLS uses this client's persistent identity (the host paired it over QUIC). No identity
         // yet → the user hasn't connected/paired, which is also when there's nothing to browse.
-        guard let identity = (try? ClientIdentityStore.shared.load())?.identity else {
+        guard let identity = loadedIdentity() else {
             games = []
-            errorText = "Connect to this host once first — the library uses the identity created "
-                + "on pairing to authenticate."
             loading = false
             return
         }

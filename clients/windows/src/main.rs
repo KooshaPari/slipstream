@@ -9,13 +9,19 @@
 //! the exact anchors and why they are not in this change (no FFmpeg development SDK on the build
 //! box, and `ss-presenter` is Vulkan/Linux-only). Everything else here is real: no stubs in the
 //! connect path.
-#![forbid(unsafe_code)]
+//!
+//! Decode is Media Foundation (the OS HEVC/H.264 decoder MFTs) and presentation is a Win32 window
+//! with a GDI blit: [`mf`] and [`window`]. Those two modules hold the only `unsafe` in the crate.
+#![deny(unsafe_code)]
 
 mod args;
 mod connect;
 mod discovery;
+mod ff;
 mod identity;
+mod mf;
 mod present;
+mod window;
 
 use anyhow::{anyhow, Context, Result};
 use args::{hex, Action, Args, Target};
@@ -58,8 +64,104 @@ fn run(args: Args) -> Result<()> {
         }
         Some(Action::Discover(secs)) => discovery::run(secs),
         Some(Action::Pair) => pair(&args),
+        Some(Action::Play) => play(&args),
         Some(Action::Connect) => stream(args),
     }
+}
+
+/// `--play FILE`: decode a recorded Annex-B stream into the window with no network.
+///
+/// This is the decode+present stack in isolation, which is exactly what a live-session run cannot
+/// separate from host/network state.
+fn play(args: &Args) -> Result<()> {
+    let path = args.play.as_deref().context("--play needs a file")?;
+    let data = std::fs::read(path).with_context(|| format!("read {path}"))?;
+    let codec = if args.preferred_codec == 0 {
+        slipstream_core::quic::CODEC_HEVC
+    } else {
+        args.preferred_codec
+    };
+    let mut decoder = ff::FfmpegDecoder::new(args.mode.width, args.mode.height, codec)?;
+    let mut presenter =
+        window::GdiPresenter::new(&format!("slipstream — {path}"), args.mode.width, args.mode.height)
+            .context("create window")?;
+    let aus = split_aus(&data);
+    if aus.is_empty() {
+        return Err(anyhow!("{path}: no Annex-B access units found"));
+    }
+    let started = Instant::now();
+    let mut presented = 0u64;
+    let frame_gap = Duration::from_micros(1_000_000 / args.mode.refresh_hz.max(1) as u64);
+    for au in &aus {
+        if presenter.closed() {
+            break;
+        }
+        if let Some(s) = args.seconds {
+            if started.elapsed() > Duration::from_secs(s) {
+                break;
+            }
+        }
+        match decoder.decode_one(au)? {
+            Some(f) => {
+                presented += 1;
+                presenter.present(Some(&f));
+            }
+            None => presenter.present(None),
+        }
+        // Pace to the nominal refresh so the run is watchable and the counter is time-bounded.
+        std::thread::sleep(frame_gap);
+    }
+    // Drain what the decoder still holds once its input closes.
+    for f in decoder.finish() {
+        if presenter.closed() {
+            break;
+        }
+        presented += 1;
+        presenter.present(Some(&f));
+    }
+    let secs = started.elapsed().as_secs_f64();
+    println!(
+        "played {} AUs from {path}: presented {presented} frames in {secs:.1}s ({:.1} fps presented)",
+        aus.len(),
+        presented as f64 / secs.max(0.001)
+    );
+    Ok(())
+}
+
+/// Split an Annex-B elementary stream into access units at AUD NALs (HEVC type 35, H.264 type 9).
+/// A stream without AUDs falls back to one NAL per unit, which is what the encoder block emits.
+fn split_aus(data: &[u8]) -> Vec<Vec<u8>> {
+    // Start-code offsets.
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let pos = if i > 0 && data[i - 1] == 0 { i - 1 } else { i };
+            starts.push((pos, i + 3));
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let nal_type = |body: usize| -> u8 {
+        data.get(body).map(|b| (b >> 1) & 0x3F).unwrap_or(0)
+    };
+    let auds: Vec<usize> = (0..starts.len())
+        .filter(|&k| nal_type(starts[k].1) == 35)
+        .collect();
+    let boundaries: Vec<usize> = if auds.len() > 1 {
+        auds.iter().map(|&k| starts[k].0).collect()
+    } else {
+        starts.iter().map(|&(pos, _)| pos).collect()
+    };
+    boundaries
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &start)| {
+            let end = boundaries.get(k + 1).copied().unwrap_or(data.len());
+            (end > start).then(|| data[start..end].to_vec())
+        })
+        .collect()
 }
 
 fn target_of(args: &Args) -> Result<Target> {
@@ -160,8 +262,19 @@ async fn stream_async(args: Args) -> Result<()> {
         .encode(),
     )
     .await?;
+    // A host that completes the QUIC handshake but never sends `Welcome` (wedged encoder/parked
+    // session) must fail, not hang the client forever.
+    let welcome_msg = tokio::time::timeout(Duration::from_secs(15), recv.read_msg())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "host {remote} accepted the QUIC handshake but sent no session offer within 15 s \
+                 (the host's capture/encode pipeline is stalled, or the session is parked for \
+                 approval) — this is a host-side condition, not a client one"
+            )
+        })??;
     let welcome =
-        Welcome::decode(&recv.read_msg().await?).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
+        Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
     tracing::info!(
         mode = ?welcome.mode,
         frames = welcome.frames,
@@ -203,11 +316,13 @@ async fn stream_async(args: Args) -> Result<()> {
     let cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
     let codec = welcome.codec;
+    let mode = welcome.mode;
     let record = args.record.clone();
     let seconds = args.seconds;
 
     let started = Instant::now();
-    let (frames, bytes, aus) = tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64)> {
+    let (frames, bytes, _aus, presented) =
+        tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, u64)> {
         let transport = UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
             .context("bind data plane")?;
         let mut session =
@@ -218,12 +333,48 @@ async fn stream_async(args: Args) -> Result<()> {
             )),
             None => None,
         };
-        let mut decoder = PassthroughDecoder::default();
-        let mut presenter = ConsolePresenter::default();
+
+        // Decode + present. `SLIPSTREAM_WINDOWS_HEADLESS=1` keeps the old counting path (CI, and
+        // `--record`-only runs). Otherwise: Media Foundation → Win32 window. A window that cannot
+        // be created is reported and the session still runs headless — never a silent black frame.
+        let headless = std::env::var_os("SLIPSTREAM_WINDOWS_HEADLESS").is_some();
+        let (mut decoder, mut presenter): (Box<dyn Decoder>, Box<dyn Presenter>) = if headless {
+            (
+                Box::new(PassthroughDecoder::default()),
+                Box::new(ConsolePresenter::default()),
+            )
+        } else {
+            // Default decode is the `ffmpeg.exe` child (see [`ff`]); the Media Foundation MFT is
+            // opt-in because the Microsoft HEVC decoder is an async DXVA MFT that needs a D3D11
+            // device manager before it emits anything.
+            let use_mf = std::env::var_os("SLIPSTREAM_WINDOWS_DECODER_MF").is_some();
+            let dec: Box<dyn Decoder> = if use_mf {
+                Box::new(mf::MfDecoder::new(mode.width, mode.height, codec)?)
+            } else {
+                Box::new(ff::FfmpegDecoder::new(mode.width, mode.height, codec)?)
+            };
+            let pres: Box<dyn Presenter> = match window::GdiPresenter::new(
+                &format!("slipstream — {host_label}"),
+                mode.width,
+                mode.height,
+            ) {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "no window — presenting headless");
+                    Box::new(ConsolePresenter::default())
+                }
+            };
+            (dec, pres)
+        };
         presenter.status(&format!("receiving from {host_label}"));
         let (mut frames, mut bytes) = (0u64, 0u64);
+        let mut presented = 0u64;
         let mut last_rx = Instant::now();
         loop {
+            if presenter.closed() {
+                tracing::info!("window closed — ending the session");
+                break;
+            }
             if let Some(secs) = seconds {
                 if started.elapsed() > Duration::from_secs(secs) {
                     break;
@@ -247,6 +398,9 @@ async fn stream_async(args: Args) -> Result<()> {
                         s.write_all(&frame.data).context("write AU")?;
                     }
                     let decoded = decoder.decode(&frame.data, codec);
+                    if decoded.is_some() {
+                        presented += 1;
+                    }
                     presenter.present(decoded.as_ref());
                 }
                 Err(SlipstreamError::NoFrame) => {
@@ -258,14 +412,15 @@ async fn stream_async(args: Args) -> Result<()> {
         if let Some(mut s) = sink {
             s.flush().ok();
         }
-        Ok((frames, bytes, decoder.aus))
+        Ok((frames, bytes, 0, presented))
     })
     .await??;
 
     conn.close(0u32.into(), b"quit");
     println!(
-        "session ended: received {frames} video AUs ({aus} through the decoder), {bytes} bytes in {:.1}s",
-        started.elapsed().as_secs_f64()
+        "session ended: received {frames} video AUs, presented {presented} frames, {bytes} bytes in {:.1}s ({:.1} fps presented)",
+        started.elapsed().as_secs_f64(),
+        presented as f64 / started.elapsed().as_secs_f64().max(0.001),
     );
     if frames == 0 {
         tracing::warn!(

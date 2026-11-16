@@ -143,13 +143,54 @@ in
         '';
       };
 
+      extraArgs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "--mgmt-bind" "127.0.0.1:47992" ];
+        description = ''
+          Extra arguments appended to `serve`, AFTER `--gamestream`. For flags the module does not
+          model — chiefly `--mgmt-bind` (the host defaults to `0.0.0.0:47990`; an operator pinning
+          the admin API to loopback or another port has no other way to say so). A list, so each
+          entry stays one argv element and is shell-escaped. Moving the API off
+          `127.0.0.1:47990` also affects `services.slipstream.web` (see `web.enable`).
+        '';
+      };
+
+      restartSec = mkOption {
+        type = types.ints.positive;
+        default = 2;
+        description = ''
+          `RestartSec` for the host unit. Matches the pre-option hardcoded value by default, so
+          existing configurations generate a byte-identical unit.
+        '';
+      };
+
+      extraPath = mkOption {
+        type = types.listOf types.package;
+        default = [ ];
+        example = literalExpression "[ pkgs.kdePackages.libkscreen ]";
+        description = ''
+          Packages APPENDED to the unit's `path`, after the built-in bash/coreutils/pipewire (and
+          the HDR gamescope when `gamescopeHdr`). For helpers the host shells out to but does not
+          depend on — e.g. `kscreen-doctor` from `kdePackages.libkscreen`, which the 144 Hz
+          custom-mode path falls back to.
+        '';
+      };
+
       environmentFile = mkOption {
-        type = types.nullOr types.path;
+        # `either` accepts both a store path (`pkgs.writeText`) and a runtime absolute path.
+        # The hazard is NOT the type: `types.path` only checks "string-like, starts with /" and
+        # copies nothing. The EVALUATOR copies an unquoted path LITERAL into the world-readable
+        # store before any module sees it, so quote it: "/run/secrets/x.env", never /run/secrets/x.env.
+        type = types.nullOr (types.either types.path types.str);
         default = null;
         example = "/run/secrets/slipstream-host.env";
         description = ''
           Extra `EnvironmentFile` layered AFTER `settings` (its values win). For secrets such as
           `SLIPSTREAM_MGMT_TOKEN`. Loaded optionally (a missing file does not fail the unit).
+
+          Pass a runtime absolute path as a QUOTED STRING so it stays a reference: an unquoted
+          path literal is copied into the world-readable store by the evaluator.
         '';
       };
 
@@ -220,6 +261,12 @@ in
           by default whenever the host is enabled — set to `false` for a console-less host. It
           auto-wires to `~/.config/slipstream/{mgmt-token,cert.pem,key.pem}` (written by the host's
           `serve`) and generates a login password on first start.
+
+          Two couplings to be aware of before you rely on the default: the console binds TCP 47992
+          itself, and it proxies the host's admin API at the hardwired `https://127.0.0.1:47990`.
+          If the host is pinned elsewhere (`host.extraArgs = [ "--mgmt-bind" ... ]`), or something
+          else already owns 47992, set this to `false` — the module emits a warning to that effect
+          when `--mgmt-bind` appears in `host.extraArgs`.
         '';
       };
 
@@ -352,12 +399,16 @@ in
         ]
         # The HDR-capable gamescope, if enabled. On PATH rather than pinned through
         # SLIPSTREAM_GAMESCOPE_BIN so an operator's own override of that env still wins.
-        ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage;
+        ++ optional cfg.host.gamescopeHdr cfg.host.gamescopePackage
+        ++ cfg.host.extraPath;
         serviceConfig = {
           ExecStart =
-            "${cfg.host.package}/bin/slipstream-host serve" + optionalString cfg.host.gamestream " --gamestream";
+            "${cfg.host.package}/bin/slipstream-host serve"
+            + optionalString cfg.host.gamestream " --gamestream"
+            # `extraArgs` last so an operator flag can override a module-implied one.
+            + concatStringsSep "" (map (a: " ${lib.escapeShellArg a}") cfg.host.extraArgs);
           Restart = "on-failure";
-          RestartSec = 2;
+          RestartSec = cfg.host.restartSec;
           EnvironmentFile =
             (optional (cfg.host.settings != { }) "${hostSettingsFile}")
             ++ (optional (cfg.host.environmentFile != null) "-${toString cfg.host.environmentFile}");
@@ -386,6 +437,19 @@ in
     # to the host's per-user mgmt token + identity cert (no env editing on a packaged install).
     (mkIf cfg.web.enable {
       environment.systemPackages = [ cfg.web.package ];
+
+      # The console proxies a hardwired https://127.0.0.1:47990 and binds 47992 itself; it is ON by
+      # default whenever the host is, so a moved admin API gets a warning rather than silence.
+      warnings =
+        optional
+          (lib.any (a: a == "--mgmt-bind" || lib.hasPrefix "--mgmt-bind=" a) cfg.host.extraArgs)
+          ''
+            services.slipstream: `host.extraArgs` sets --mgmt-bind, but `services.slipstream.web` is
+            enabled and its console is hardwired to https://127.0.0.1:47990 on TCP 47992. If the
+            host's admin API is no longer on 127.0.0.1:47990, set
+            `services.slipstream.web.enable = false;` (or move the API back) — otherwise the
+            console will proxy to the wrong address, or collide on 47992.
+          '';
 
       networking.firewall = mkIf cfg.web.openFirewall {
         allowedTCPPorts = [ 47992 ]; # console HTTPS (packaging/linux/slipstream-web.xml)

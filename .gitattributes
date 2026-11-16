@@ -1,0 +1,3 @@
+# Vector PDF assets are binary: core.autocrlf must never rewrite their line endings, because a
+# PDF's xref table holds byte offsets (a CRLF rewrite silently invalidates the file).
+*.pdf binary

@@ -376,6 +376,8 @@ fn real_main() -> Result<()> {
             let (mgmt_opts, native, gamestream) = parse_serve(&args[1..])?;
             #[cfg(target_os = "linux")]
             ss_vdisplay::drm_force::startup_recover();
+            #[cfg(target_os = "linux")]
+            ss_vdisplay::warm_socket();
             gamestream::serve(mgmt_opts, native, gamestream)
         }
         // Report other Moonlight-compatible hosts (Sunshine/Apollo/…) installed or running on this

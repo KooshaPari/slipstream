@@ -199,7 +199,9 @@ impl VirtualDisplay for WindowsIddDisplay {
         ioctl_modes(&path, self.connector, &modes).context("publish indirect-display modes")?;
         // The driver needs a moment to advertise the mode before GDI will accept it.
         std::thread::sleep(std::time::Duration::from_millis(150));
-        set_mode(&self.device, mode.width, mode.height, mode.refresh_hz).with_context(|| {
+        // A published mode the driver still refuses falls back to the nearest mode it does
+        // accept (the fallback is reported, so the session sizes to what the head shows).
+        let choice = set_mode(&self.device, mode).with_context(|| {
             format!(
                 "set {}x{}@{} on {}",
                 mode.width, mode.height, mode.refresh_hz, self.device
@@ -210,7 +212,11 @@ impl VirtualDisplay for WindowsIddDisplay {
         let device = self.device.clone();
         Ok(VirtualOutput {
             node_id: 0,
-            preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
+            preferred_mode: Some((
+                choice.applied.width,
+                choice.applied.height,
+                choice.applied.refresh_hz,
+            )),
             keepalive: Box::new(IddKeepalive {
                 path,
                 connector,

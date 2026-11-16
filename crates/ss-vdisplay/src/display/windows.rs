@@ -19,6 +19,7 @@
 
 use crate::monitors::PhysicalMonitor;
 use crate::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
+use crate::mode_select::{self, ModeChoice};
 
 #[path = "windows_idd.rs"]
 mod idd;
@@ -134,7 +135,22 @@ impl VirtualDisplay for WindowsMirrorDisplay {
                 to_hz = mode.refresh_hz,
                 "windows: setting head to the client mode (restored on session end)"
             );
-            set_mode(&self.device, mode.width, mode.height, mode.refresh_hz)?;
+            let choice = set_mode(&self.device, mode)?;
+            return Ok(VirtualOutput {
+                node_id: 0, // no PipeWire node — capture resolves `windows_head` instead
+                // Report what the head actually shows, so capture/encode size the pipeline for
+                // the frames that will really arrive (a fallback is a different WxH than asked).
+                preferred_mode: Some((
+                    choice.applied.width,
+                    choice.applied.height,
+                    choice.applied.refresh_hz,
+                )),
+                keepalive: Box::new(restore),
+                ownership: DisplayOwnership::External,
+                reused_gen: None,
+                pool_gen: None,
+                windows_head: Some(self.device.clone()),
+            });
         } else {
             tracing::info!(
                 device = %self.device,
@@ -236,10 +252,112 @@ fn current_mode(device: &str) -> Result<(u32, u32, u32)> {
     read_mode(device).map(|m| (m.width, m.height, m.hz))
 }
 
-/// Set the head to WxH@Hz, testing the mode first so a refusal names the mode.
-fn set_mode(device: &str, width: u32, height: u32, hz: u32) -> Result<()> {
+/// Set the head to `mode`, testing it first so a refusal names the mode.
+///
+/// A refusal is not fatal: the panel simply cannot hold what the client asked for (a laptop
+/// asked for `640x360@144` answers `DISP_CHANGE_BADMODE`). The nearest mode the head does
+/// support is applied instead and reported, because a scaled picture beats a black window. A
+/// refusal that even the fallback cannot survive is a hard error carrying
+/// [`mode_select::MODE_REFUSED_MARKER`], which the session's retry loop treats as permanent
+/// rather than burning eight attempts against a driver that already said no.
+fn set_mode(device: &str, mode: Mode) -> Result<ModeChoice> {
     let current = read_mode(device)?;
-    apply_mode(device, width, height, hz, &current.devmode)
+    match apply_mode(device, mode.width, mode.height, mode.refresh_hz, &current.devmode) {
+        Ok(()) => Ok(ModeChoice {
+            requested: mode,
+            applied: mode,
+            fallback: false,
+        }),
+        Err(first) => {
+            let supported = supported_modes(device);
+            let choice = mode_select::choose_mode(mode, &supported).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}: requested {}x{}@{} was refused ({first:#}) and no fallback exists: {e:#}",
+                    mode_select::MODE_REFUSED_MARKER,
+                    mode.width,
+                    mode.height,
+                    mode.refresh_hz
+                )
+            })?;
+            if choice.applied == mode {
+                // Nothing else to try — the enumerator listed the mode the driver just refused.
+                return Err(anyhow::anyhow!(
+                    "{}: requested {}x{}@{} was refused ({first:#}) and it is the only mode the \
+                     head offers",
+                    mode_select::MODE_REFUSED_MARKER,
+                    mode.width,
+                    mode.height,
+                    mode.refresh_hz
+                ));
+            }
+            apply_mode(
+                device,
+                choice.applied.width,
+                choice.applied.height,
+                choice.applied.refresh_hz,
+                &current.devmode,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "{}: requested {}x{}@{} was refused ({first:#}) and the fallback {}x{}@{} was \
+                     refused too ({e:#})",
+                    mode_select::MODE_REFUSED_MARKER,
+                    mode.width,
+                    mode.height,
+                    mode.refresh_hz,
+                    choice.applied.width,
+                    choice.applied.height,
+                    choice.applied.refresh_hz
+                )
+            })?;
+            tracing::warn!(
+                device,
+                requested_w = mode.width,
+                requested_h = mode.height,
+                requested_hz = mode.refresh_hz,
+                applied_w = choice.applied.width,
+                applied_h = choice.applied.height,
+                applied_hz = choice.applied.refresh_hz,
+                "windows: the head cannot hold the requested mode  -  applied the nearest \
+                 supported mode (the picture is scaled)"
+            );
+            Ok(choice)
+        }
+    }
+}
+
+/// Every mode this head advertises, in GDI enumeration order (empty when the driver answers
+/// nothing, which [`mode_select::choose_mode`] reports as a hard failure).
+fn supported_modes(device: &str) -> Vec<Mode> {
+    let name = to_wide_nul(device);
+    let mut out = Vec::new();
+    let mut index = 0u32;
+    loop {
+        let mut dm = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        // SAFETY: `dm` is a live, correctly sized struct filled synchronously; the device name
+        // outlives the call. Enumeration ends at the first index the API rejects.
+        let more = unsafe {
+            EnumDisplaySettingsW(
+                windows::core::PCWSTR(name.as_ptr()),
+                ENUM_DISPLAY_SETTINGS_MODE(index),
+                &mut dm,
+            )
+            .as_bool()
+        };
+        if !more {
+            break;
+        }
+        out.push(Mode {
+            width: dm.dmPelsWidth,
+            height: dm.dmPelsHeight,
+            refresh_hz: dm.dmDisplayFrequency,
+        });
+        index += 1;
+    }
+    out
 }
 
 /// Apply WxH@Hz onto `device`, cloned from `template` (preserves depth/orientation).

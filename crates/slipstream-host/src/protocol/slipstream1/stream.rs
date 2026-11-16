@@ -4144,6 +4144,11 @@ fn is_permanent_build_error(chain: &str) -> bool {
         "could not find output", // KWin < 6.5.6: createVirtualOutput unsupported
         "must be a node id",     // SLIPSTREAM_GAMESCOPE_NODE not an integer
         "is it installed",       // gamescope / kscreen-doctor not on PATH
+        // A mode the head cannot hold. `ss-vdisplay` already tried the nearest supported mode
+        // and this is the failure that survived that fallback (see `mode_select`), so the driver
+        // has said no twice: eight backoff attempts can only delay the same black window.
+        // (Live 2026-11-16: `640x360@144` -> DISP_CHANGE_BADMODE, 8 retries, zero frames.)
+        ss_vdisplay::mode_select::MODE_REFUSED_MARKER,
         // 4:4:4 NVENC got a CUDA frame  -  should never happen now the Linux capturer honors gpu=false,
         // but fail fast instead of 8× retry (~90 s) rather than wedge the session if it ever recurs.
         "capture/encoder negotiation mismatch",
@@ -4567,6 +4572,17 @@ mod tests {
             "spawn gamescope (is it installed? `apt install gamescope`)"
         ));
         assert!(is_permanent_build_error("virtual displays require Linux"));
+        // A refused display mode is the driver's answer, not a race: `ss-vdisplay` already tried
+        // the nearest supported mode, so this error must fail once instead of burning 8 attempts
+        // (~80 s of backoff) on the way to the same black window. (Live 2026-11-16: 640x360@144.)
+        assert!(is_permanent_build_error(
+            "create virtual output: vdisplay-mode-refused: display mode 640x360@144 not selectable: \
+             the output reports no supported modes"
+        ));
+        assert!(is_permanent_build_error(
+            "create virtual output: vdisplay-mode-refused: requested 640x360@144 was refused \
+             (DISP_CHANGE_BADMODE) and the fallback 1280x720@60 was refused too"
+        ));
         // Transient: negotiation/timeout races  -  exactly what backoff is for.
         assert!(!is_permanent_build_error(
             "first frame: no PipeWire frame within 10s (node 42): format negotiation never completed"

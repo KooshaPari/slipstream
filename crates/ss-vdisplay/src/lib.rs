@@ -800,6 +800,12 @@ pub mod headless;
 #[path = "display/windows.rs"]
 pub mod windows;
 
+/// Platform-neutral nearest-supported-mode selection: when a head cannot hold the client's
+/// mode, choose the closest one it advertises instead of failing the session. Pure, so the
+/// preference order is table-tested without a display.
+#[path = "display/mode_select.rs"]
+pub mod mode_select;
+
 #[cfg(target_os = "linux")]
 pub use headless::{
     available as headless_available, start as start_headless, start_at as start_headless_at,

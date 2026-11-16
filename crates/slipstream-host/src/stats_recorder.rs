@@ -557,6 +557,11 @@ mod tests {
             capture_age_us: 0,
             capture_age_over_limit: false,
             capture_backend: String::new(),
+            // Cadence counters added with the WGC drain instrumentation; zero is the "not
+            // measured" value this fixture wants.
+            capture_frames_arrived: 0,
+            capture_try_next_ok: 0,
+            capture_try_next_empty: 0,
             capture_frames_published: 0,
             capture_frames_overwritten: 0,
             capture_buffers_drained: 0,

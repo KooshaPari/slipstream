@@ -25,6 +25,11 @@ pub trait Decoder {
     /// `codec` is the host's negotiated `CODEC_*` byte (`welcome.codec`). `None` means "this
     /// backend cannot decode this codec" — the session keeps receiving, it just presents nothing.
     fn decode(&mut self, au: &[u8], codec: u8) -> Option<DecodedFrame>;
+    /// Flow-control instrumentation: `(max frame-queue depth seen, milliseconds blocked writing an
+    /// AU)`. Backends without a queue report zeros.
+    fn flow_stats(&self) -> (usize, u64) {
+        (0, 0)
+    }
 }
 
 /// One surface to draw on. `None` = no new picture (the presenter keeps the last frame).

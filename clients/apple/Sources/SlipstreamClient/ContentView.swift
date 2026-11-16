@@ -64,6 +64,9 @@ struct ContentView: View {
     /// A delegated-approval connect is in flight (host parks it until the operator approves):
     /// drives the cancelable "Waiting for approval" prompt and the pin-as-paired on success.
     @State private var awaitingApproval: ApprovalRequest?
+    /// Watches a `.connecting` phase for a parked (pairing-required) dial, which sends nothing
+    /// back until a human approves it in the host's console. Cancelled whenever the phase moves on.
+    @State private var approvalWatch: Task<Void, Never>?
     @State private var speedTestTarget: StoredHost?
     @State private var libraryTarget: StoredHost?
     /// Wakes a sleeping host and waits for it to come back online before connecting (drives the
@@ -274,6 +277,8 @@ struct ContentView: View {
         .onChange(of: model.phase) { _, phase in
             switch phase {
             case .streaming:
+                approvalWatch?.cancel()
+                approvalWatch = nil
                 #if os(macOS) || os(tvOS)
                 showShortcutHint = true // the 6 s shortcut banner, per session start
                 #endif
@@ -298,9 +303,24 @@ struct ContentView: View {
                     if let approvedFingerprint { store.pin(host.id, fingerprint: approvedFingerprint) }
                 }
             case .idle:
+                approvalWatch?.cancel()
+                approvalWatch = nil
                 // The delegated-approval connect failed, timed out, or was cancelled — drop the
                 // wait prompt (SessionModel surfaces any error via `errorMessage`).
                 if awaitingApproval != nil { awaitingApproval = nil }
+            case .connecting:
+                // An identified connect can be PARKED by a pairing-required host: it holds the
+                // connection until the operator approves it and sends nothing meanwhile, which
+                // reads as a hang. A healthy or dead host has resolved long before this fires
+                // (QUIC declares a silent peer dead at ~8 s), so past this point the dial is
+                // parked and the only way forward is an approval in the host's console.
+                guard let host = model.activeHost else { break }
+                approvalWatch?.cancel()
+                approvalWatch = Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(12))
+                    guard !Task.isCancelled, model.phase == .connecting else { return }
+                    awaitingApproval = ApprovalRequest(host: host, advertisedFingerprint: nil)
+                }
             default:
                 break
             }

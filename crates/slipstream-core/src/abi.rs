@@ -2004,6 +2004,27 @@ unsafe fn connect_ex_impl(
                 return std::ptr::null_mut();
             }
         };
+        // The label the host shows for this device (its pending-approval list and its paired
+        // store). When the OS reports no usable machine name the label is generic, so append the
+        // identity's fingerprint prefix: two otherwise-identical clients must never share one
+        // row, or the operator cannot tell which one they are revoking.
+        let device_label = {
+            let name = crate::client::device_name();
+            if name == crate::client::GENERIC_DEVICE_NAME {
+                match identity.as_ref().and_then(|(cert, _)| {
+                    crate::quic::endpoint::fingerprint_of_pem(cert).ok()
+                }) {
+                    Some(fp) => {
+                        let prefix: String =
+                            fp.iter().take(4).map(|b| format!("{b:02x}")).collect();
+                        format!("{name} {prefix}")
+                    }
+                    None => name,
+                }
+            } else {
+                name
+            }
+        };
         match crate::client::NativeClient::connect(
             host,
             port,
@@ -2033,7 +2054,7 @@ unsafe fn connect_ex_impl(
             // embedder gets the OS hostname default — this is what the host's pending-approval
             // list shows when an unpaired embedder knocks. An `ex10` variant can make it explicit
             // if an embedder ever wants a custom label (e.g. the platform's marketing name).
-            Some(crate::client::device_name()),
+            Some(device_label),
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),

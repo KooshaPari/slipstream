@@ -22,6 +22,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # LAN discovery: the same `_slipstream._udp` browser crate (and version) the probe and the host
 # advertise with, so one TXT contract serves every platform.
 mdns-sd = "0.20"
+# Win32: Media Foundation (the OS HEVC/H.264 decoder MFTs — no FFmpeg SDK, no extra codec crate)
+# and the GDI window that blits decoded frames. Same crate/version the Windows tray already uses.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [lints]
 workspace = true

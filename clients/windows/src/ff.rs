@@ -19,6 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const IMAGEMAGICK_FFMPEG: &str =
     r"C:\Program Files\ImageMagick-7.1.0-Q16-HDRI\ffmpeg.exe";
@@ -50,6 +51,13 @@ pub struct FfmpegDecoder {
     /// when nobody drains stdout, and we block writing AUs when ffmpeg stops reading stdin — so a
     /// dedicated reader thread is what keeps the pipe from deadlocking in both directions.
     frames: Receiver<Vec<u8>>,
+    /// Live frames waiting to be presented, and the high-water mark since the session started.
+    /// Bounded by [`QUEUE_BOUND`]: the reader thread blocks on `send` when the queue is full, which
+    /// is the backpressure that stops ffmpeg from decoding further ahead.
+    queued: std::sync::Arc<AtomicUsize>,
+    pub max_queued: usize,
+    /// Nanoseconds spent waiting for the queue to drain before an AU could be written.
+    pub blocked_ns: u64,
     width: u32,
     height: u32,
     frame_index: u32,
@@ -76,6 +84,10 @@ const HWACCELS: [&str; 2] = ["d3d11va", "dxva2"];
 /// more than software (a d3d11va pipe run decodes fine, it just starts later), so this is generous:
 /// ~6 s at the host's ~95 AUs/s.
 const HWACCEL_GRACE_AUS: u32 = 600;
+
+/// Frames of decode-ahead allowed. A small bound is the whole point: at ~11 ms/frame, 3 frames is
+/// ~33 ms of standing latency instead of the ~0.8 s a 75-frame backlog implied.
+const QUEUE_BOUND: usize = 3;
 
 impl FfmpegDecoder {
     pub fn new(width: u32, height: u32, codec_u8: u8) -> Result<Self> {
@@ -141,7 +153,9 @@ impl FfmpegDecoder {
         let stdin = child.stdin.take();
         let mut stdout: ChildStdout = child.stdout.take().ok_or_else(|| anyhow!("ffmpeg stdout"))?;
         // Reader thread: one raw RGBA frame per message until ffmpeg's stdout closes.
-        let (tx, frames) = mpsc::channel::<Vec<u8>>();
+        let (tx, frames) = mpsc::sync_channel::<Vec<u8>>(QUEUE_BOUND);
+        let queued = std::sync::Arc::new(AtomicUsize::new(0));
+        let queued_reader = queued.clone();
         let frame_bytes = width as usize * height as usize * 4;
         std::thread::Builder::new()
             .name("ffmpeg-frames".into())
@@ -149,8 +163,14 @@ impl FfmpegDecoder {
                 let mut frame = vec![0u8; frame_bytes];
                 match read_exact_or_eof(&mut stdout, &mut frame) {
                     Ok(true) => {
+                        // Blocks here when the queue is full — that stop is the flow control.
                         if tx.send(frame).is_err() {
                             break; // the client went away
+                        }
+                        let d = queued_reader.fetch_add(1, Ordering::Relaxed) + 1;
+                        if d > QUEUE_BOUND + 1 {
+                            // Only reachable if a sender raced ahead; keep the high-water honest.
+                            tracing::debug!(depth = d, "frame queue over bound");
                         }
                     }
                     _ => break, // EOF or a broken pipe: ffmpeg is done
@@ -169,6 +189,9 @@ impl FfmpegDecoder {
             child,
             stdin,
             frames,
+            queued,
+            max_queued: 0,
+            blocked_ns: 0,
             width,
             height,
             frame_index: 0,
@@ -190,9 +213,16 @@ impl FfmpegDecoder {
     /// frames are collected as they appear; only the newest is presented, so a decoder slower than
     /// the stream cannot grow an unbounded queue of 8 MB frames.
     pub fn decode_one(&mut self, au: &[u8]) -> Result<Option<DecodedFrame>> {
+        // Pop before writing: with a bounded channel this is what frees the reader thread so
+        // ffmpeg can advance. Writing first would block us on a full stdin pipe while the frame we
+        // need to pop sits in the queue — the classic two-thread pipe deadlock.
+        let mut frame = self.try_next();
         if let Some(si) = self.stdin.as_mut() {
             // A broken pipe means ffmpeg exited (bad input); surface it instead of looping.
-            si.write_all(au).context("write AU to ffmpeg")?;
+            let t0 = std::time::Instant::now();
+            let res = si.write_all(au).context("write AU to ffmpeg");
+            self.blocked_ns += t0.elapsed().as_nanos() as u64;
+            res?;
             si.flush().ok();
         }
         self.fed += 1;
@@ -234,11 +264,13 @@ impl FfmpegDecoder {
             }
             return Ok(None);
         }
-        // Pop one frame per AU rather than draining to the newest: newest-wins silently discards
-        // frames ffmpeg already decoded, which looks like "the decoder cannot keep up" in the
-        // counters even when it can. Software HEVC here decodes ~213 fps (measured, `-benchmark`),
-        // far above the ~98 AUs/s the host publishes, so the queue stays shallow.
-        Ok(self.try_next())
+        // One frame per AU, never newest-wins: newest-wins silently discards frames ffmpeg already
+        // decoded, which reads as "the decoder cannot keep up" in the counters. If more than one
+        // frame is ready here it stays queued (bounded by QUEUE_BOUND) and is taken next call.
+        if frame.is_none() {
+            frame = self.try_next();
+        }
+        Ok(frame)
     }
 
     /// Close the input pipe and drain the frames ffmpeg still holds (end of a `--play` file).
@@ -263,6 +295,8 @@ impl FfmpegDecoder {
     pub fn try_next(&mut self) -> Option<DecodedFrame> {
         match self.frames.try_recv() {
             Ok(frame) => {
+                let d = self.queued.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                self.max_queued = self.max_queued.max(d + 1);
                 self.frame_index = self.frame_index.wrapping_add(1);
                 self.decoded += 1;
                 Some(DecodedFrame {
@@ -283,6 +317,11 @@ impl FfmpegDecoder {
 
     pub fn frame_bytes(&self) -> usize {
         self.frame_bytes
+    }
+
+    /// Frames decoded but not yet presented (the bounded decode-ahead queue).
+    pub fn backlog(&self) -> usize {
+        self.queued.load(Ordering::Relaxed)
     }
 }
 
@@ -316,5 +355,9 @@ impl Decoder for FfmpegDecoder {
                 None
             }
         }
+    }
+
+    fn flow_stats(&self) -> (usize, u64) {
+        (self.max_queued, self.blocked_ns / 1_000_000)
     }
 }

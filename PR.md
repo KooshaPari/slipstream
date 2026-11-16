@@ -19,13 +19,15 @@ Two honest halves, in one PR:
    ceremony, QUIC connect + Hello/Welcome negotiation, admission, and the full video-plane receive
    loop (with `--record` writing a playable elementary stream). This is the part that must not be a
    stub, and it is not.
-2. **Seam, not yet a backend:** the window (winit + softbuffer) and the hardware decode
-   (D3D11VA via FFmpeg / NVDEC) attach at two traits — `Decoder` and `Presenter`. They are not in
-   this PR because this box has no FFmpeg **development SDK** (only `ffmpeg.exe` from ImageMagick),
-   and `crates/ss-presenter` is Vulkan/Linux-only (`cfg(target_os = "linux")` throughout). Writing a
-   winit + D3D11VA path that cannot be compiled or seen here would be an unverified 600-line blob;
-   the traits are the smallest thing that is honest today and keeps the session loop unchanged when
-   the backend lands.
+2. **Pixels on screen (new):** `Decoder` and `Presenter` now have real implementations.
+   `ff.rs` decodes Annex-B access units with the installed `ffmpeg.exe` (stdin → raw RGBA stdout);
+   `window.rs` creates a Win32 window with a 32-bpp DIB and `StretchDIBits` per frame, aspect
+   preserved, closing on the window's X or Esc. `mf.rs` is a Media Foundation decoder built on the
+   OS HEVC/H.264 MFTs — it compiles and accepts every AU, but the Microsoft HEVC decoder is an
+   async DXVA MFT that produces no output until a D3D11 device manager is attached, so it is
+   opt-in (`SLIPSTREAM_WINDOWS_DECODER_MF=1`) and not the default.
+   `--play FILE` decodes a recorded Annex-B stream into the window with no network, which is how the
+   decode+present stack is proven independently of host/network state.
 
 Reuse, not reinvention: `slipstream-core` (QUIC endpoint, `client::NativeClient::pair`, `Session`,
 `UdpTransport`, `Hello`/`Welcome`/`Start`), the same `mdns-sd` crate/version the probe browses with,
@@ -60,7 +62,10 @@ portable path) instead of `ss-client-core`.
 | `clients/windows/src/connect.rs` | 411 | `HostAdvert`, `PairingPolicy`, `Admission`, `ConnectOutcome`, `Machine` |
 | `clients/windows/src/discovery.rs` | 181 | mDNS browse, `DiscoveredHost`, console rows |
 | `clients/windows/src/identity.rs` | 59 | cert/key at `%APPDATA%\slipstream\`, shared with the other clients |
-| `clients/windows/src/present.rs` | 198 | `Decoder`/`Presenter` seam, RGBA `TestPattern`, counting presenter |
+| `clients/windows/src/present.rs` | 202 | `Decoder`/`Presenter` traits, RGBA `TestPattern`, counting presenter |
+| `clients/windows/src/ff.rs` | 201 | ffmpeg child-process decoder (Annex-B in, raw RGBA out) |
+| `clients/windows/src/mf.rs` | 400 | Media Foundation MFT decoder (opt-in; async DXVA MFT needs D3D11) |
+| `clients/windows/src/window.rs` | 294 | Win32 window + GDI DIB blit presenter |
 | `clients/windows/README.md` | 80 | build recipe, run examples, StreamLight disclaimer |
 | `Cargo.toml` | +1 | `"clients/windows"` workspace member |
 
@@ -118,6 +123,24 @@ test present::tests::console_presenter_status_does_not_count_frames ... ok
 
 test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 ```
+
+### Decode + present proof (`--play`, no network)
+
+```
+cargo build --release -p slipstream-windows
+target\release\slipstream-windows.exe --play C:\Users\koosh\Agents\scratch\test-1080p144.h265 \
+    --mode 1920x1080x144 --seconds 20
+
+window created width=1920 height=1080
+present frames=171  fps="13.9" mib=1352
+present frames=339  fps="23.8" mib=2681
+present frames=499  fps="30.7" mib=3947
+present frames=683  fps="37.4" mib=5402
+played 720 AUs from test-1080p144.h265: presented 720 frames in 18.8s (38.4 fps presented)
+```
+
+720/720 AUs decoded and blitted into the window. The source is a 1080p144 HEVC stream generated on
+this box (`testsrc2` + libx265, `aud=1`) because the live host could not be reached for video (below).
 
 ### Live attempt (one, as scoped)
 
@@ -180,6 +203,7 @@ lane, this was attempted once and not chased.
 - [x] Files under ~500 lines (largest: `connect.rs` 411)
 - [x] `Cargo.toml` workspace member added; no change to the main checkout
 - [x] README with build + run + the StreamLight disclaimer
-- [ ] Live stream verified end to end (host silent; follow-up 4 hardens the failure)
-- [ ] Video presented in a window (follow-ups 1–2)
+- [ ] Live stream verified end to end (host silent; the Welcome read is now bounded to 15 s so this
+      fails with that message instead of hanging)
+- [x] Video presented in a window (`--play` proof above: 720 frames, 38.4 fps)
 - [ ] Input plane (follow-up 3)

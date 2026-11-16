@@ -3,7 +3,8 @@
 //!
 //! Flags mirror the sibling clients and the probe so an operator's muscle memory transfers:
 //! `--connect HOST[:PORT]`, `--discover [SECS]`, `--pair PIN`, `--pin HEX`, `--name LABEL`,
-//! `--mode WxHxFPS`, `--bitrate KBPS`, `--codec auto|h264|hevc|av1`, `--seconds N`, `--record FILE`.
+//! `--mode WxHxFPS`, `--bitrate KBPS`, `--codec auto|h264|hevc|av1`, `--seconds N`,
+//! `--record FILE`, `--play FILE`.
 
 use slipstream_core::Mode;
 
@@ -32,6 +33,9 @@ pub struct Args {
     pub seconds: Option<u64>,
     /// `--record FILE`: write received AUs (annex-B, playable: `.h265`/`.h264`/`.av1`).
     pub record: Option<String>,
+    /// `--play FILE`: decode a recorded Annex-B elementary stream (with AUD NALs) into a window,
+    /// with no network at all. Proves the decode+present stack on its own.
+    pub play: Option<String>,
 }
 
 impl Default for Args {
@@ -52,6 +56,7 @@ impl Default for Args {
             audio_channels: 2,
             seconds: None,
             record: None,
+            play: None,
         }
     }
 }
@@ -70,6 +75,7 @@ pub enum Action {
     Discover(u64),
     Pair,
     Connect,
+    Play,
 }
 
 impl Args {
@@ -79,6 +85,9 @@ impl Args {
         }
         if self.pair.is_some() {
             return Some(Action::Pair);
+        }
+        if self.play.is_some() {
+            return Some(Action::Play);
         }
         self.connect.as_ref().map(|_| Action::Connect)
     }
@@ -243,6 +252,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                 );
             }
             "--record" => args.record = Some(value(&mut i, "--record")?),
+            "--play" => args.play = Some(value(&mut i, "--play")?),
             "-h" | "--help" => return Err(usage().to_string()),
             other if other.starts_with("--") => return Err(format!("unknown flag {other}")),
             other => {
@@ -255,8 +265,9 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
         }
         i += 1;
     }
-    if args.connect.is_some() && (args.discover.is_some() || args.pair.is_some()) {
-        return Err("--connect cannot be combined with --discover or --pair".into());
+    if args.connect.is_some() && (args.discover.is_some() || args.pair.is_some() || args.play.is_some())
+    {
+        return Err("--connect cannot be combined with --discover, --pair or --play".into());
     }
     Ok(args)
 }
@@ -264,7 +275,8 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
 pub fn usage() -> &'static str {
     "usage: slipstream-windows [HOST[:PORT]] [--connect HOST[:PORT]] [--pin HEX | --pair PIN]\n\
      \x20      [--discover [SECS]] [--name LABEL] [--mode WxHxFPS] [--bitrate KBPS]\n\
-     \x20      [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8] [--seconds N] [--record FILE]"
+     \x20      [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
+     \x20      [--play FILE]"
 }
 
 #[cfg(test)]

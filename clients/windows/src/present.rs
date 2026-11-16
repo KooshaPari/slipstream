@@ -31,6 +31,10 @@ pub trait Decoder {
 pub trait Presenter {
     fn present(&mut self, frame: Option<&DecodedFrame>);
     fn status(&mut self, message: &str);
+    /// True once the user closed the window (the session loop treats it as "stop").
+    fn closed(&self) -> bool {
+        false
+    }
 }
 
 /// No decoder: the honest state of this crate before the hardware path lands. The session still

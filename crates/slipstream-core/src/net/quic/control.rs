@@ -373,20 +373,42 @@ impl BitrateChanged {
 /// and frames that went unrecoverable. Loss ≈ (recovered − late) / (received + recovered − late) —
 /// the fraction of shards that truly never arrived (a late shard is inside `received`, so the
 /// denominator nets it too; saturating, so reorder straddling a window boundary can't go
-/// negative). A frame drop means loss exceeded the current FEC budget (so `recovered` plateaus),
-/// so add a fixed bump to push the host's FEC up past the cap on the next adjustment. Returns
-/// parts-per-million, capped at 1e6.
-pub fn window_loss_ppm(recovered: u64, late: u64, received: u64, frames_dropped: u64) -> u32 {
+/// negative). Returns parts-per-million, capped at 1e6.
+///
+/// This is a MEASUREMENT. It used to take `frames_dropped` and add a flat `+50_000` whenever a
+/// frame went unrecoverable, which turned one dropped frame into a "5 % loss" reading that the
+/// bitrate controller then obeyed as link loss (17 descents, 0 climbs in the 2026-11-16 field
+/// session). That constant was never a measurement - it is a hint to the HOST's adaptive FEC, and
+/// it now lives in [`fec_hint_ppm`], which only the host's FEC budget consumes. Frame drops reach
+/// the bitrate controller as a frame COUNT on their own threshold (see `abr::QUALITY_DROPS_BAD`).
+pub fn window_loss_ppm(recovered: u64, late: u64, received: u64) -> u32 {
     let lost = recovered.saturating_sub(late);
     let denom = received.saturating_add(lost);
-    let mut ppm = lost
-        .saturating_mul(1_000_000)
+    lost.saturating_mul(1_000_000)
         .checked_div(denom)
-        .unwrap_or(0) as u32;
-    if frames_dropped > 0 {
-        ppm = ppm.saturating_add(50_000); // +5%: unrecoverable loss → raise FEC past the current cap
+        .unwrap_or(0)
+        .min(1_000_000) as u32
+}
+
+/// Flat bump added to the HOST-FACING FEC hint when a frame went unrecoverable.
+///
+/// Intent (from the original inline comment): a frame drop means loss exceeded the current FEC
+/// budget, so `recovered` plateaus and the measured loss understates how far past the parity cap
+/// the link is - the bump pushes the host's `adapt_fec` up past its current cap on the next
+/// adjustment. It is deliberately NOT part of [`window_loss_ppm`]: it is not a measurement, and
+/// feeding it into the bitrate controller is what caused the non-recovering descent.
+pub const FEC_UNDERPROVISION_PPM: u32 = 50_000;
+
+/// The value sent to the HOST's adaptive FEC for one window: honest shard loss plus the
+/// under-provisioning hint when the window had an unrecoverable frame. Never fed to the client's
+/// bitrate controller - that consumer reads [`window_loss_ppm`] and the raw frame-drop count.
+pub fn fec_hint_ppm(loss_ppm: u32, frames_dropped: u64) -> u32 {
+    if frames_dropped == 0 {
+        return loss_ppm;
     }
-    ppm.min(1_000_000)
+    loss_ppm
+        .saturating_add(FEC_UNDERPROVISION_PPM)
+        .min(1_000_000)
 }
 
 impl ProbeRequest {
@@ -1111,22 +1133,37 @@ mod tests {
     #[test]
     fn window_loss_ppm_estimates_and_caps() {
         // No traffic → 0. A clean window (nothing recovered) → 0.
-        assert_eq!(window_loss_ppm(0, 0, 0, 0), 0);
-        assert_eq!(window_loss_ppm(0, 0, 1000, 0), 0);
+        assert_eq!(window_loss_ppm(0, 0, 0), 0);
+        assert_eq!(window_loss_ppm(0, 0, 1000), 0);
         // 50 recovered of 1000 total (950 received + 50 recovered) = 5%.
-        assert_eq!(window_loss_ppm(50, 0, 950, 0), 50_000);
-        // An unrecoverable frame adds the +5% bump (push FEC past the current cap).
-        assert_eq!(window_loss_ppm(50, 0, 950, 1), 100_000);
-        // A total-loss window with a drop but nothing received still reports the bump, capped at 1e6.
-        assert_eq!(window_loss_ppm(0, 0, 0, 3), 50_000);
-        assert!(window_loss_ppm(u64::MAX, 0, 1, 9) <= 1_000_000);
+        assert_eq!(window_loss_ppm(50, 0, 950), 50_000);
+        assert!(window_loss_ppm(u64::MAX, 0, 1) <= 1_000_000);
         // Reordering: shards "recovered" early that then arrived are late, not lost — netted out, so
         // a pure-reorder window reads 0. Partially late nets to the true loss (20 of 1000 = 2%).
-        assert_eq!(window_loss_ppm(50, 50, 1000, 0), 0);
-        assert_eq!(window_loss_ppm(50, 30, 980, 0), 20_000);
+        assert_eq!(window_loss_ppm(50, 50, 1000), 0);
+        assert_eq!(window_loss_ppm(50, 30, 980), 20_000);
         // `late` can outrun `recovered` across a window boundary (reorder straddling the report
         // tick) or via a rare wire duplicate — saturate at a clean window, never underflow.
-        assert_eq!(window_loss_ppm(10, 25, 1000, 0), 0);
+        assert_eq!(window_loss_ppm(10, 25, 1000), 0);
+    }
+
+    /// The 2026-11-16 regression: one unrecoverable frame used to add a flat `+50_000` to the
+    /// loss report, so the ABR read "5 % link loss" for a frame WE dropped and took a SEVERE
+    /// x0.7 step (17 descents, 0 climbs). Loss stays a measurement; the FEC hint is separate.
+    #[test]
+    fn single_dropped_frame_does_not_report_five_percent_loss() {
+        // Nothing was actually lost on the wire...
+        assert_eq!(window_loss_ppm(0, 0, 1_200), 0);
+        // ...and what the ABR reads stays below its heavy-loss bucket (2 %).
+        assert!(window_loss_ppm(0, 0, 1_200) < 20_000);
+        // The host-FEC hint still fires: that consumer needs the "past the parity cap" signal.
+        assert_eq!(fec_hint_ppm(0, 1), FEC_UNDERPROVISION_PPM);
+        assert_eq!(fec_hint_ppm(0, 0), 0);
+        // A real 0.49 % window (the 06:31:46 field sample) stays a sub-1 % measurement.
+        assert_eq!(window_loss_ppm(5, 0, 1_024), 4_859);
+        assert!(window_loss_ppm(5, 0, 1_024) < 20_000);
+        // The hint is bounded: it can never exceed 100 %, whatever the drop count.
+        assert_eq!(fec_hint_ppm(999_000, 3), 1_000_000);
     }
 
     #[test]

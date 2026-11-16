@@ -328,22 +328,44 @@ impl DataPump {
                 }
                 let discard = std::mem::take(&mut discard_abr_window);
                 let window_dropped = st.frames_dropped.wrapping_sub(last_dropped);
+                // Two DIFFERENT signals, deliberately kept apart:
+                //   `loss_ppm`   - what the NETWORK did (honest shard loss). The ABR and the
+                //                  standing-latency detector read this.
+                //   `fec_hint_ppm` - what WE did (an unrecoverable frame the FEC budget could not
+                //                  cover), as a bounded bump on top of the measurement. Only the
+                //                  HOST's adaptive FEC consumes it. It is NOT loss, and feeding it
+                //                  to the ABR is what produced 17 descents / 0 climbs on 2026-11-16.
                 let loss_ppm = window_loss_ppm(
                     st.fec_recovered_shards.wrapping_sub(last_recovered),
                     st.fec_late_shards.wrapping_sub(last_late),
                     st.packets_received.wrapping_sub(last_received),
-                    window_dropped,
                 );
+                let fec_hint_ppm = fec_hint_ppm(loss_ppm, window_dropped);
                 if discard {
                     // Probe-tail residue (see `discard_abr_window`): a LossReport from this
                     // window would also spike the host's adaptive FEC off deliberate overload.
                     tracing::debug!(
                         loss_ppm,
+                        fec_hint_ppm,
                         window_dropped,
+                        cause = "probe-tail",
                         "discarding the first post-probe ABR window (probe-tail residue)"
                     );
                 } else {
-                    let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                    tracing::debug!(
+                        loss_ppm,
+                        fec_hint_ppm,
+                        window_dropped,
+                        cause = if window_dropped > 0 {
+                            "frame-drop"
+                        } else {
+                            "measured"
+                        },
+                        "window loss report"
+                    );
+                    let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport {
+                        loss_ppm: fec_hint_ppm,
+                    }));
                 }
                 // Standing-latency bleed: close the detector's window with this report's loss
                 // verdict and run its escalation ladder — re-sync first (free; a stale offset
@@ -464,12 +486,22 @@ impl DataPump {
                     tracing::info!(
                         kbps,
                         loss_ppm,
+                        window_dropped,
                         owd_mean_us = owd_mean_us.unwrap_or(-1),
                         decode_mean_us = decode_mean_us.unwrap_or(-1),
                         encode_mean_us = encode_mean_us.unwrap_or(-1),
                         actual_kbps,
                         flushed = flush_in_window,
                         recovery_kf = recovery_kf_reqs,
+                        // Distinguishes "network said so" (loss_ppm) from "we dropped a frame"
+                        // (window_dropped) without a second log line.
+                        cause = if loss_ppm > 0 {
+                            "network-loss"
+                        } else if window_dropped > 0 {
+                            "frame-drop"
+                        } else {
+                            "other"
+                        },
                         "adaptive bitrate: requesting encoder re-target"
                     );
                     let _ = ctrl_tx.try_send(CtrlRequest::SetBitrate(kbps));

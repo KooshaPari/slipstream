@@ -12,7 +12,7 @@ import SwiftUI
 /// different machines to the person reading the card. A distro with no mark of its own
 /// still degrades to its family's and finally to Tux via the chain walk.
 private let osIconTokensShipped: Set<String> = [
-    "apple", "linux", "steam", "ubuntu", "fedora", "arch", "debian", "nixos",
+    "apple", "windows", "linux", "steam", "ubuntu", "fedora", "arch", "debian", "nixos",
     "opensuse", "bazzite", "cachyos", "nobara",
 ]
 

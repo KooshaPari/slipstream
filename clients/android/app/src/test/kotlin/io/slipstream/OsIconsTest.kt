@@ -21,7 +21,7 @@ class OsIconsTest {
 
     @Test
     fun defaultSizeCarriesTheViewportAspect() {
-        for (chain in listOf("linux", "opensuse", "steam", "apple", "bazzite")) {
+        for (chain in listOf("linux", "opensuse", "steam", "apple", "windows", "bazzite")) {
             val v = resolveOsIcon(chain)
             assertNotNull("no mark for $chain", v)
             v!!
@@ -62,6 +62,8 @@ class OsIconsTest {
         assertEquals("linux", markOf("linux/frontier/chimera"))
         assertEquals("steam", markOf("linux/arch/steamos")) // brand alias
         assertEquals("apple", markOf("macos"))
+        // A Windows host advertises `windows` as its whole chain; it must not degrade to Tux.
+        assertEquals("windows", markOf("windows"))
     }
 
     @Test

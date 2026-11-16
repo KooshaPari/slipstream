@@ -49,6 +49,10 @@ struct PipeStats {
     intervals: Vec<u32>,
     last_present: Option<Instant>,
     window: Option<Instant>,
+    /// Highest frame-queue depth the decoder reported (flow control, bounded).
+    queue_max: usize,
+    /// Milliseconds blocked writing an AU because the queue was full.
+    blocked_ms: u64,
 }
 
 impl PipeStats {
@@ -95,6 +99,8 @@ impl PipeStats {
             ivl_p99_ms = format!("{:.1}", pick(0.99)),
             ivl_max_ms = format!("{:.1}", pick(1.0)),
             n_ivl = iv.len(),
+            queue_max = self.queue_max,
+            blocked_ms = self.blocked_ms,
             "pipeline received -> decoded -> presented"
         );
         self.window = Some(now);
@@ -477,6 +483,9 @@ async fn stream_async(args: Args) -> Result<()> {
                         stats.note_presented();
                     }
                     presenter.present(decoded.as_ref());
+                    let (qm, bm) = decoder.flow_stats();
+                    stats.queue_max = qm;
+                    stats.blocked_ms = bm;
                     stats.tick();
                 }
                 Err(SlipstreamError::NoFrame) => {

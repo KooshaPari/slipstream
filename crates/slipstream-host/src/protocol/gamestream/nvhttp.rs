@@ -461,8 +461,21 @@ mod tests {
         );
 
         // After pinning, the same fingerprint is accepted but a different cert still isn't.
-        st.paired.lock().unwrap().push(der);
+        st.paired.lock().unwrap().push(der.clone());
         assert!(peer_is_paired(&peer, &st), "pinned cert must be accepted");
+
+        // Unpair (what `mgmt::clients::unpair_client` does to this store) must revoke: the cert
+        // that was just accepted is refused once its record is gone, so the device cannot launch
+        // again without re-pairing.
+        let pinned_fp = fp_of(&der);
+        st.paired
+            .lock()
+            .unwrap()
+            .retain(|d| fp_of(d) != pinned_fp);
+        assert!(
+            !peer_is_paired(&peer, &st),
+            "unpaired cert must be rejected on the next launch"
+        );
         let other = Some(Extension(PeerCertFingerprint(Some(fp_of(
             b"different-der",
         )))));

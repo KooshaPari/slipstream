@@ -248,8 +248,18 @@ pub(super) async fn serve_session(
         });
     }
 
-    let (hello, welcome, udp_port, data_sock, direct, start, compositor, gamescope_route, prep) =
-        tokio::time::timeout(
+    let (
+        hello,
+        welcome,
+        udp_port,
+        data_sock,
+        direct,
+        start,
+        compositor,
+        gamescope_route,
+        prep,
+        claim_guard,
+    ) = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
             handshake::negotiate(
                 &conn,
@@ -535,30 +545,12 @@ pub(super) async fn serve_session(
         });
     }
 
-    // Register this now-live session for mode-conflict admission (Stage 4): carry its identity, the
-    // negotiated mode, and its stop flag so a LATER connecting client's admission can see it and
-    // (under `steal`) signal it. The guard removes the entry when this session ends.
-    let _live_guard = {
-        let id = endpoint::peer_fingerprint(&conn);
-        let label = id
-            .map(|fp| {
-                fp.iter()
-                    .take(4)
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|| "client".to_string());
-        crate::vdisplay::admission::register(
-            id,
-            (
-                welcome.mode.width,
-                welcome.mode.height,
-                welcome.mode.refresh_hz,
-            ),
-            stop.clone(),
-            label,
-        )
-    };
+    // This session was registered for mode-conflict admission during the handshake, BEFORE any
+    // pipeline existed (`handshake::negotiate` → `admission::claim`), so a simultaneous Hello
+    // from the same identity cannot slip past a still-empty table and build a second display.
+    // Holding the guard here is the whole lifetime contract: it releases the identity on every
+    // exit path of this function, including a pipeline that fails to come up.
+    let _live_guard = claim_guard;
 
     // Audio plane (virtual source only — synthetic runs are protocol tests): desktop Opus
     // → host→client QUIC datagrams, on its own native thread. Best-effort on every failure

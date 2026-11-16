@@ -379,19 +379,22 @@ final class SessionModel: ObservableObject {
                 }
                 switch result {
                 case .success(let conn):
-                    if pin != nil || autoTrust || requestAccess {
-                        // requestAccess: the operator approved this device on the host, so the
-                        // session is trusted — stream directly (the caller pins it as paired).
+                    switch ConnectionAdmission.decide(
+                        pinned: pin != nil, autoTrust: autoTrust,
+                        requestAccess: requestAccess, hostAllowsTofu: allowTofu) {
+                    case .stream:
+                        // Pinned, auto-trusted, or an operator-approved request-access connect
+                        // — the session is trusted: stream directly.
                         self.connection = conn
                         self.startStatsTimer()
                         self.beginStreaming()
-                    } else if allowTofu {
+                    case .confirmTrust:
                         // Host advertised pair=optional — offer the reduced-security TOFU prompt
                         // over the live (blurred) stream (rule 3a).
                         self.connection = conn
                         self.startStatsTimer()
                         self.phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
-                    } else {
+                    case .refuseUnpaired:
                         // Unpinned and TOFU not permitted (rule 3b): never let this silently
                         // become trustable. Drop the connection; the caller routes to pairing.
                         Task.detached { conn.close() } // joins Rust threads — off-main
@@ -422,16 +425,11 @@ final class SessionModel: ObservableObject {
                             + "Approve it in the host's web console (port 47992 → Pairing), then "
                             + "request access again — the request expires after a few minutes."
                     } else {
-                        self.errorMessage = pin != nil
-                            ? "Could not connect to \(host.displayName) — host unreachable, "
-                                + "not running, its identity no longer matches the pinned "
-                                + "fingerprint, or it requires pairing and no longer "
-                                + "recognizes this Mac (right-click the host card to pair "
-                                + "again)."
-                            : "Could not connect to \(host.displayName) — is slipstream-host "
-                                + "running on \(host.address):\(host.port)? If it requires "
-                                + "pairing, right-click the host card and pair with its PIN "
-                                + "first."
+                        // Every remaining failure is classified (and worded) by the kit, so a
+                        // stated rejection is never reported as "unreachable".
+                        self.errorMessage = ConnectionFailure.classify(error).message(
+                            hostName: host.displayName, pinned: pin != nil,
+                            endpoint: "\(host.address):\(host.port)")
                     }
                 }
             }

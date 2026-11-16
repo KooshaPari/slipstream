@@ -95,11 +95,30 @@ impl DataPump {
         // AU instead of strict FIFO (see `FrameChannel::set_all_intra`), so a slow consumer
         // caps its standing queue at ~1 frame with zero recovery cost.
         frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
-        let mut abr = BitrateController::new(if bitrate_kbps == 0 && !rate_pinned {
-            resolved_bitrate_kbps
-        } else {
-            0
-        });
+        // Adaptive bitrate arming. Three cases, in precedence order:
+        //  1. PyroWave pins its rate by design - controller and probe stay off (`0`).
+        //  2. Automatic (`bitrate_kbps == 0`): the host echo is the ceiling and the startup
+        //     capacity probe may raise it (unchanged).
+        //  3. An explicitly requested start rate. This used to disarm adaptation outright
+        //     (`0`), which is right for a measurement pin but wrong for an ordinary
+        //     "start at 48 Mb/s" session: the encoder then has no way back down from
+        //     congestion, and a wrong pin is unrecoverable for the whole session.
+        //     `SLIPSTREAM_ABR_WITHIN_REQUESTED=1` seeds the controller at the requested rate
+        //     instead. `BitrateController`'s climb ceiling IS its seed and `set_ceiling`
+        //     never lowers it, so this mode can descend on congestion and recover back UP TO
+        //     the requested rate, but can never climb past it. The startup capacity probe
+        //     stays Automatic-only (still guarded on `bitrate_kbps == 0` below), so a
+        //     requested-rate session never has its ceiling raised by a burst.
+        // Unset env => case 3 yields `0`, i.e. the pinned path is byte-for-byte unchanged.
+        let abr_within_requested =
+            std::env::var("SLIPSTREAM_ABR_WITHIN_REQUESTED").map_or(false, |v| v != "0");
+        let abr_start_kbps = abr_seed_kbps(
+            rate_pinned,
+            bitrate_kbps,
+            resolved_bitrate_kbps,
+            abr_within_requested,
+        );
+        let mut abr = BitrateController::new(abr_start_kbps);
         // Startup link-capacity probe (Automatic sessions): the controller's ceiling is the
         // negotiated start rate — the conservative 20 Mbps default, historically a box Automatic
         // could NEVER climb out of. One speed-test burst shortly after the stream settles
@@ -689,5 +708,107 @@ impl DataPump {
         // `next_frame` with a Closed signal instead of a spurious timeout (the old mpsc did this
         // implicitly when the sender dropped).
         frames.close();
+    }
+}
+
+/// The seed handed to [`BitrateController::new`]: the full ABR arming table in one testable place.
+///
+/// `0` builds a permanently-DISABLED controller (`on_window` returns immediately), which is what
+/// PyroWave wants (it pins its rate by design) and what an explicit-rate pin keeps unless
+/// `SLIPSTREAM_ABR_WITHIN_REQUESTED=1` opts into adaptation. Automatic arms at the host echo.
+///
+/// Extracted from the pump body so the table can be asserted directly: the module is behind
+/// `feature = "quic"`, so a default-feature `cargo test -p slipstream-core --lib` never compiles
+/// this file at all (that is how `a87da37`'s "144 passed" came to mean nothing for it).
+pub(crate) fn abr_seed_kbps(
+    rate_pinned: bool,
+    bitrate_kbps: u32,
+    resolved_bitrate_kbps: u32,
+    abr_within_requested: bool,
+) -> u32 {
+    if rate_pinned {
+        0
+    } else if bitrate_kbps == 0 {
+        resolved_bitrate_kbps
+    } else if abr_within_requested {
+        bitrate_kbps
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abr::BitrateController;
+    use std::time::{Duration, Instant};
+
+    /// 750 ms report cadence, matching the pump.
+    const TICK: Duration = Duration::from_millis(750);
+
+    /// Every row of the arming table, including the two that keep the pinned path unchanged.
+    #[test]
+    fn abr_seed_table_covers_every_arming_case() {
+        // 1. PyroWave pins by design, over-riding everything else.
+        assert_eq!(abr_seed_kbps(true, 0, 20_000, false), 0);
+        assert_eq!(abr_seed_kbps(true, 48_000, 20_000, true), 0);
+        // 2. Automatic: the resolved host echo is the ceiling.
+        assert_eq!(abr_seed_kbps(false, 0, 20_000, false), 20_000);
+        assert_eq!(abr_seed_kbps(false, 0, 20_000, true), 20_000);
+        // 3. Explicit rate + opt-in: seeded at the request (a87da37's change).
+        assert_eq!(abr_seed_kbps(false, 48_000, 20_000, true), 48_000);
+        // ...and without the opt-in the pinned path is byte-for-byte unchanged.
+        assert_eq!(abr_seed_kbps(false, 48_000, 20_000, false), 0);
+    }
+
+    /// An explicitly requested rate now descends under congestion AND climbs back, capped at the
+    /// request. Fails if the controller is disarmed (`enabled == false`, the pre-a87da37 pin) and
+    /// fails if the probe-up is removed (the 2026-11-16 deadlock) - the two defects this seed
+    /// combination exists to avoid.
+    #[test]
+    fn explicit_rate_session_descends_and_recovers_up_to_its_request() {
+        let requested = 48_000;
+        let seed = abr_seed_kbps(false, requested, 20_000, true);
+        assert_eq!(seed, requested);
+        let start = Instant::now();
+        let mut c = BitrateController::new(seed);
+        // One SEVERE window (a jump-to-live flush): instant x0.7.
+        assert_eq!(
+            c.on_window(start, 0, 900_000, None, None, None, 1_000, true, 0),
+            Some(33_600)
+        );
+        c.on_ack(33_600);
+        // Clean windows then probe the rate back up (+1/8).
+        let mut climbed = None;
+        for i in 1..=40u32 {
+            if let Some(kbps) = c.on_window(
+                start + TICK * i * 2,
+                0,
+                0,
+                None,
+                None,
+                None,
+                1_000,
+                false,
+                0,
+            ) {
+                climbed = Some(kbps);
+                break;
+            }
+        }
+        assert_eq!(
+            climbed,
+            Some(37_800),
+            "probe-up must add 1/8 after a clean run (None here = deadlock or disarmed)"
+        );
+        // The seed's promise: recovery never passes the request.
+        assert!(climbed.unwrap() <= requested);
+
+        // The pinned row stays silent even under a severe window - no adaptation by design.
+        let mut pinned = BitrateController::new(abr_seed_kbps(false, requested, 20_000, false));
+        assert_eq!(
+            pinned.on_window(start, 0, 900_000, None, None, None, 1_000, true, 0),
+            None
+        );
     }
 }

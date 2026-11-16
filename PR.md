@@ -142,7 +142,22 @@ played 720 AUs from test-1080p144.h265: presented 720 frames in 18.8s (38.4 fps 
 720/720 AUs decoded and blitted into the window. The source is a 1080p144 HEVC stream generated on
 this box (`testsrc2` + libx265, `aud=1`) because the live host could not be reached for video (below).
 
-### Live attempt (one, as scoped)
+### Live session (192.168.1.138:9777, 1080p144, 8 Mbit/s)
+
+The earlier "host never answered" behaviour was the admission gate, not a wedged host: the host
+logged `unpaired device knocked — parking connection for delegated approval in the console
+name=KOOSHAPARI-DESK`, and the client's 15 s Welcome bound then fired. After approving the pending
+device on the host (`POST /api/v1/native/pending/0/approve` → 200):
+
+```
+session offer mode=1920x1080@144 codec=2 bit_depth=8 encrypt=true
+session ended: received 1893 video AUs, presented 801 frames, 2588987 bytes in 25.1s (31.9 fps presented)
+```
+
+Host bringup for the same session:
+`first_frame+3575 first_au+4072 first_packet+4085` ms, NVENC `1920x1080@144 bit_depth=8 mbps=8`.
+
+### Earlier live attempts (before approval)
 
 ```
 slipstream-windows.exe 100.112.143.99:9777 --seconds 12 --record ...\winclient-live.h265
@@ -203,7 +218,7 @@ lane, this was attempted once and not chased.
 - [x] Files under ~500 lines (largest: `connect.rs` 411)
 - [x] `Cargo.toml` workspace member added; no change to the main checkout
 - [x] README with build + run + the StreamLight disclaimer
-- [ ] Live stream verified end to end (host silent; the Welcome read is now bounded to 15 s so this
-      fails with that message instead of hanging)
+- [x] Live stream verified end to end (after approving the pending device: 1893 AUs in, 801 frames
+      presented, 31.9 fps; host bringup `first_frame+3575 first_packet+4085`)
 - [x] Video presented in a window (`--play` proof above: 720 frames, 38.4 fps)
 - [ ] Input plane (follow-up 3)

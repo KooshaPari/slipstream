@@ -262,13 +262,19 @@ fn current_mode(device: &str) -> Result<(u32, u32, u32)> {
 /// rather than burning eight attempts against a driver that already said no.
 fn set_mode(device: &str, mode: Mode) -> Result<ModeChoice> {
     let current = read_mode(device)?;
-    match apply_mode(device, mode.width, mode.height, mode.refresh_hz, &current.devmode) {
-        Ok(()) => Ok(ModeChoice {
-            requested: mode,
-            applied: mode,
-            fallback: false,
-        }),
-        Err(first) => {
+    match test_mode(device, mode, &current.devmode) {
+        DISP_CHANGE_SUCCESSFUL => {
+            apply_mode(device, mode.width, mode.height, mode.refresh_hz, &current.devmode)?;
+            Ok(ModeChoice {
+                requested: mode,
+                applied: mode,
+                fallback: false,
+            })
+        }
+        // The panel does not list this mode: deterministic, so substitute the nearest mode it
+        // does list instead of retrying a refusal that cannot change.
+        code if is_unsupported_mode(code) => {
+            let first = format!("test: {code:?}");
             let supported = supported_modes(device);
             let choice = mode_select::choose_mode(mode, &supported).map_err(|e| {
                 anyhow::anyhow!(
@@ -323,7 +329,47 @@ fn set_mode(device: &str, mode: Mode) -> Result<ModeChoice> {
             );
             Ok(choice)
         }
+        // Everything else (`DISP_CHANGE_FAILED`, `DISP_CHANGE_NOTUPDATED`, …) can be a head
+        // caught mid-mode-switch: leave it unmarked so the session's retry budget applies, rather
+        // than forcing a substitution the driver may not have meant.
+        code => anyhow::bail!(
+            "display mode {}x{}@{} could not be applied for {device} (test: {code:?})",
+            mode.width,
+            mode.height,
+            mode.refresh_hz
+        ),
     }
+}
+
+/// `CDS_TEST` the mode without changing anything, so the verdict can be classified.
+fn test_mode(device: &str, mode: Mode, template: &DEVMODEW) -> DISP_CHANGE {
+    // SAFETY: `dm` is a live struct cloned from a valid template; the device name lives for the
+    // call; `CDS_TEST` changes nothing.
+    unsafe {
+        let name = to_wide_nul(device);
+        let mut dm = *template;
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+        dm.dmPelsWidth = mode.width;
+        dm.dmPelsHeight = mode.height;
+        dm.dmDisplayFrequency = mode.refresh_hz;
+        ChangeDisplaySettingsExW(
+            windows::core::PCWSTR(name.as_ptr()),
+            Some(&dm),
+            HWND::default(),
+            CDS_TEST,
+            None,
+        )
+    }
+}
+
+/// Verdicts that mean "this head cannot hold that mode" — deterministic, never worth retrying.
+/// `DISP_CHANGE_FAILED`/`NOTUPDATED` are excluded on purpose: they can be transient (a head
+/// mid-mode-switch) and keep the retry budget.
+fn is_unsupported_mode(code: DISP_CHANGE) -> bool {
+    matches!(
+        code,
+        DISP_CHANGE_BADMODE | DISP_CHANGE_BADFLAGS | DISP_CHANGE_BADPARAM | DISP_CHANGE_BADDUALVIEW
+    )
 }
 
 /// Every mode this head advertises, in GDI enumeration order (empty when the driver answers

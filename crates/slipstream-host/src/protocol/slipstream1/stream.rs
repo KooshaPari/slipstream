@@ -1524,6 +1524,13 @@ pub(super) struct SessionContext {
     pub(super) seconds: u32,
     /// Session stop flag (set on disconnect / reconnect-preempt).
     pub(super) stop: Arc<AtomicBool>,
+    /// Set by the session owner when this stream thread is ABANDONED — it outlived
+    /// `STREAM_STOP_GRACE` after a stop, so teardown has already released the virtual output and
+    /// its capture buffers. A submission from this thread after that copies from unmapped dmabufs,
+    /// which is the teardown SIGSEGV reported in `NvencCudaEncoder::submit`. Checked before every
+    /// submission so an abandoned thread stops touching the encoder and drops it promptly instead
+    /// of racing the driver as the process tears down.
+    pub(super) abandoned: Arc<AtomicBool>,
     /// Deliberate-quit flag (set when the client closed with `QUIT_CODE`): the display lease reads it
     /// on teardown to skip the keep-alive linger for a user "stop" (vs. an unwanted disconnect).
     pub(super) quit: Arc<AtomicBool>,
@@ -1829,6 +1836,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         mode,
         seconds,
         stop,
+        abandoned,
         quit,
         reconfig,
         keyframe,
@@ -3506,6 +3514,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // submission, so it lands `inflight.len()` AUs after the `au_seq` the loop is about to
         // assign next. The RFI backends pin their frame numbering to it.
         let wire_index = au_seq.wrapping_add(inflight.len() as u32);
+        // An abandoned thread (see `SessionContext::abandoned`) must not submit: the session's
+        // virtual output — and with it the capture buffers this frame points at — is already
+        // released by teardown, and copying from those unmapped dmabufs is the teardown SIGSEGV
+        // in `NvencCudaEncoder::submit`. Returning here drops the encoder on its owning thread,
+        // which is the ordering the fix is about (not a `catch_unwind` around the driver call).
+        if abandoned.load(Ordering::Relaxed) {
+            return Err(anyhow!(
+                "session abandoned: stream thread outlived the stop grace — dropping the encoder \
+                 instead of submitting against a released capture"
+            ));
+        }
         if let Err(e) = enc.submit_indexed(&frame, wire_index) {
             // A typed-terminal error is a deterministic configuration failure  -  the identical
             // wall on every attempt, so rebuilds can't help. End the session at once with the

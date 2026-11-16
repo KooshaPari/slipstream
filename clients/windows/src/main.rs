@@ -37,6 +37,70 @@ use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
 use slipstream_core::transport::UdpTransport;
 use slipstream_core::{CompositorPref, Session, SlipstreamError};
 
+/// Pipeline counters, printed once a second: AUs received → decoded → presented, plus the interval
+/// between consecutive presented frames. The interval distribution is the point: "steady low fps"
+/// and "mostly fast with periodic 200-400 ms hitches" are different bugs with different fixes.
+#[derive(Default)]
+struct PipeStats {
+    aus: u64,
+    decoded: u64,
+    presented: u64,
+    /// Presented-frame intervals (µs) within the current one-second window.
+    intervals: Vec<u32>,
+    last_present: Option<Instant>,
+    window: Option<Instant>,
+}
+
+impl PipeStats {
+    fn note_au(&mut self) {
+        self.aus += 1;
+    }
+
+    fn note_decoded(&mut self) {
+        self.decoded += 1;
+    }
+
+    fn note_presented(&mut self) {
+        self.presented += 1;
+        let now = Instant::now();
+        if let Some(prev) = self.last_present {
+            self.intervals
+                .push(now.duration_since(prev).as_micros().min(u32::MAX as u128) as u32);
+        }
+        self.last_present = Some(now);
+    }
+
+    /// Print and reset the one-second window. Returns nothing; the numbers are the record.
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let start = *self.window.get_or_insert(now);
+        if now.duration_since(start) < Duration::from_secs(1) {
+            return;
+        }
+        let mut iv = std::mem::take(&mut self.intervals);
+        iv.sort_unstable();
+        let pick = |q: f64| -> f64 {
+            if iv.is_empty() {
+                return 0.0;
+            }
+            let i = ((iv.len() - 1) as f64 * q) as usize;
+            iv[i] as f64 / 1000.0
+        };
+        tracing::info!(
+            received = self.aus,
+            decoded = self.decoded,
+            presented = self.presented,
+            ivl_p50_ms = format!("{:.1}", pick(0.50)),
+            ivl_p95_ms = format!("{:.1}", pick(0.95)),
+            ivl_p99_ms = format!("{:.1}", pick(0.99)),
+            ivl_max_ms = format!("{:.1}", pick(1.0)),
+            n_ivl = iv.len(),
+            "pipeline received -> decoded -> presented"
+        );
+        self.window = Some(now);
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -91,6 +155,7 @@ fn play(args: &Args) -> Result<()> {
     }
     let started = Instant::now();
     let mut presented = 0u64;
+    let mut stats = PipeStats::default();
     let frame_gap = Duration::from_micros(1_000_000 / args.mode.refresh_hz.max(1) as u64);
     for au in &aus {
         if presenter.closed() {
@@ -101,13 +166,17 @@ fn play(args: &Args) -> Result<()> {
                 break;
             }
         }
+        stats.note_au();
         match decoder.decode_one(au)? {
             Some(f) => {
+                stats.note_decoded();
                 presented += 1;
+                stats.note_presented();
                 presenter.present(Some(&f));
             }
             None => presenter.present(None),
         }
+        stats.tick();
         // Pace to the nominal refresh so the run is watchable and the counter is time-bounded.
         std::thread::sleep(frame_gap);
     }
@@ -116,6 +185,8 @@ fn play(args: &Args) -> Result<()> {
         if presenter.closed() {
             break;
         }
+        stats.note_decoded();
+        stats.note_presented();
         presented += 1;
         presenter.present(Some(&f));
     }
@@ -369,6 +440,7 @@ async fn stream_async(args: Args) -> Result<()> {
         presenter.status(&format!("receiving from {host_label}"));
         let (mut frames, mut bytes) = (0u64, 0u64);
         let mut presented = 0u64;
+        let mut stats = PipeStats::default();
         let mut last_rx = Instant::now();
         loop {
             if presenter.closed() {
@@ -393,15 +465,19 @@ async fn stream_async(args: Args) -> Result<()> {
                         continue; // speed-test filler, not video
                     }
                     frames += 1;
+                    stats.note_au();
                     bytes += frame.data.len() as u64;
                     if let Some(s) = sink.as_mut() {
                         s.write_all(&frame.data).context("write AU")?;
                     }
                     let decoded = decoder.decode(&frame.data, codec);
                     if decoded.is_some() {
+                        stats.note_decoded();
                         presented += 1;
+                        stats.note_presented();
                     }
                     presenter.present(decoded.as_ref());
+                    stats.tick();
                 }
                 Err(SlipstreamError::NoFrame) => {
                     std::thread::sleep(Duration::from_micros(300));

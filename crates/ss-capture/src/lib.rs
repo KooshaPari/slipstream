@@ -761,6 +761,20 @@ pub fn open_dxgi_desktop_for_monitor(monitor: Option<&str>) -> Result<Box<dyn Ca
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
+/// Open DXGI duplication while honoring the host's effective physical-monitor pin, holding
+/// `keepalive` for the capturer's lifetime. The mirror image of
+/// [`open_wgc_desktop_for_monitor_keepalive`]: the host passes its virtual-output guard here when
+/// the session plan names DXGI, so DXGI sessions keep the display backend's mode-set alive exactly
+/// as WGC sessions do.
+#[cfg(target_os = "windows")]
+pub fn open_dxgi_desktop_for_monitor_keepalive(
+    monitor: Option<&str>,
+    keepalive: Option<Box<dyn Send>>,
+) -> Result<Box<dyn Capturer>> {
+    platform::windows::DxgiCapturer::open_for_monitor_with_keepalive(monitor, keepalive)
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
+}
+
 /// True when Windows Graphics Capture sessions can be created on this box
 /// (`GraphicsCaptureSession::IsSupported` — needs Windows 10 1803+ with graphics capture).
 #[cfg(target_os = "windows")]

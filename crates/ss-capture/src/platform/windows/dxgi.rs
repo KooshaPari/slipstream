@@ -33,17 +33,30 @@ pub struct DxgiCapturer {
     slot: Arc<FrameSlot>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Optional lifetime guard held until the capturer drops. The host hands its virtual-output
+    /// keepalive here for the same reason the WGC capturer does: that guard owns the display
+    /// backend's mode-set, and dropping it early snaps the head back to its native mode between
+    /// capture attach and the first encoded frame.
+    _keepalive: Option<Box<dyn Send>>,
 }
 
 impl DxgiCapturer {
     /// Duplicate the primary output.
     pub fn open() -> Result<Self> {
-        Self::open_for_monitor(None)
+        Self::open_for_monitor_with_keepalive(None, None)
     }
 
     /// Duplicate the output whose GDI device name matches
     /// `SLIPSTREAM_CAPTURE_MONITOR`, else the primary head.
     pub fn open_for_monitor(monitor: Option<&str>) -> Result<Self> {
+        Self::open_for_monitor_with_keepalive(monitor, None)
+    }
+
+    /// [`Self::open_for_monitor`] while holding `keepalive` for the capturer's lifetime.
+    pub fn open_for_monitor_with_keepalive(
+        monitor: Option<&str>,
+        keepalive: Option<Box<dyn Send>>,
+    ) -> Result<Self> {
         // Factory/adapter/output enumeration takes no raw memory; every out-param is a
         // live local, and COM objects are reference-counted by the `windows` wrappers.
         let (adapter_index, output_index) = pick_output(monitor)?;
@@ -67,6 +80,7 @@ impl DxgiCapturer {
             slot,
             stop,
             worker: Some(worker),
+            _keepalive: keepalive,
         })
     }
 }

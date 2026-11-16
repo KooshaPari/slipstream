@@ -1703,7 +1703,7 @@ fn park_pointer(input_tx: &std::sync::mpsc::Sender<super::input::ClientInput>, w
 ///   This is the 60 Hz-requested-on-a-144 Hz-compositor case: the loop follows the *source* arrival
 ///   rate (frame-driven pacing) but advances the grid by the *requested* interval, so a slower
 ///   request on a faster source outruns wall clock by (requested/actual)x and would otherwise drift
-///   into the future without bound  -  which the behind-only guard can never see.
+///   into the future without bound - which the behind-only guard can never see.
 #[derive(Debug, Default)]
 pub(super) struct WireGrid {
     /// Next grid point in nanoseconds; `None` until seeded from the first plausible capture stamp.
@@ -1729,6 +1729,10 @@ impl WireGrid {
         repeat: bool,
         interval_ns: u64,
     ) -> u64 {
+        debug_assert!(
+            interval_ns > 0,
+            "a zero interval would trip both stall guards every submission"
+        );
         let fresh = !repeat && plausible;
         // This submission's grid point (pre-repair). Seeded from the first plausible capture
         // stamp; every later fresh frame takes the accumulated point (never `frame.pts_ns`, whose
@@ -1762,11 +1766,7 @@ impl WireGrid {
         // from the real capture stamp once the grid is more than ~2 periods into the future.
         if let Some(g) = self.next_ns {
             if g.saturating_sub(submit_ns) > interval_ns.saturating_mul(2) {
-                self.next_ns = Some(if plausible {
-                    frame_pts_ns.min(submit_ns)
-                } else {
-                    submit_ns
-                });
+                self.next_ns = Some(if plausible { frame_pts_ns } else { submit_ns });
             }
         }
         // Advance the grid by one session frame period for the next submission.

@@ -95,11 +95,33 @@ impl DataPump {
         // AU instead of strict FIFO (see `FrameChannel::set_all_intra`), so a slow consumer
         // caps its standing queue at ~1 frame with zero recovery cost.
         frames.set_all_intra(negotiated_codec == crate::quic::CODEC_PYROWAVE);
-        let mut abr = BitrateController::new(if bitrate_kbps == 0 && !rate_pinned {
+        // Adaptive bitrate arming. Three cases, in precedence order:
+        //  1. PyroWave pins its rate by design - controller and probe stay off (`0`).
+        //  2. Automatic (`bitrate_kbps == 0`): the host echo is the ceiling and the startup
+        //     capacity probe may raise it (unchanged).
+        //  3. An explicitly requested start rate. This used to disarm adaptation outright
+        //     (`0`), which is right for a measurement pin but wrong for an ordinary
+        //     "start at 48 Mb/s" session: the encoder then has no way back down from
+        //     congestion, and a wrong pin is unrecoverable for the whole session.
+        //     `SLIPSTREAM_ABR_WITHIN_REQUESTED=1` seeds the controller at the requested rate
+        //     instead. `BitrateController`'s climb ceiling IS its seed and `set_ceiling`
+        //     never lowers it, so this mode can descend on congestion and recover back UP TO
+        //     the requested rate, but can never climb past it. The startup capacity probe
+        //     stays Automatic-only (still guarded on `bitrate_kbps == 0` below), so a
+        //     requested-rate session never has its ceiling raised by a burst.
+        // Unset env => case 3 yields `0`, i.e. the pinned path is byte-for-byte unchanged.
+        let abr_within_requested =
+            std::env::var("SLIPSTREAM_ABR_WITHIN_REQUESTED").map_or(false, |v| v != "0");
+        let abr_start_kbps: u32 = if rate_pinned {
+            0
+        } else if bitrate_kbps == 0 {
             resolved_bitrate_kbps
+        } else if abr_within_requested {
+            bitrate_kbps
         } else {
             0
-        });
+        };
+        let mut abr = BitrateController::new(abr_start_kbps);
         // Startup link-capacity probe (Automatic sessions): the controller's ceiling is the
         // negotiated start rate — the conservative 20 Mbps default, historically a box Automatic
         // could NEVER climb out of. One speed-test burst shortly after the stream settles

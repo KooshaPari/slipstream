@@ -7977,6 +7977,12 @@
             "description": "Cumulative extra PipeWire buffers discarded while selecting the newest buffer.",
             "minimum": 0
           },
+          "capture_frames_arrived": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cumulative source-side arrival callbacks (WGC `FrameArrived`). Compare with\n`capture_frames_published` to separate a delivery ceiling from a consumer ceiling.",
+            "minimum": 0
+          },
           "capture_frames_overwritten": {
             "type": "integer",
             "format": "int64",
@@ -7998,6 +8004,18 @@
             "type": "integer",
             "format": "int64",
             "description": "Negotiated source modifier, or zero for linear/unknown.",
+            "minimum": 0
+          },
+          "capture_try_next_empty": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cumulative pool drain attempts that returned nothing.",
+            "minimum": 0
+          },
+          "capture_try_next_ok": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cumulative pool drain attempts that returned a frame.",
             "minimum": 0
           },
           "capture_width": {

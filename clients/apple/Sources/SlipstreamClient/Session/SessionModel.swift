@@ -301,9 +301,23 @@ final class SessionModel: ObservableObject {
         Task.detached(priority: .userInitiated) {
             // SlipstreamConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
-            // host recognizes this Mac (nil = anonymous, fine for hosts without
-            // --require-pairing; Keychain/generation failure must not block connecting).
-            let identity = (try? ClientIdentityStore.shared.load())?.identity
+            // host recognizes this Mac.
+            // Persistent identity: read it or fail with a clear message. It must never be
+            // replaced in memory on a read error — that is exactly what registered a new
+            // "This device" on every launch. Genuine first run returns a minted identity
+            // only after it has been written to Application Support.
+            let identity: ClientIdentity
+            do {
+                identity = try ClientIdentityStore.shared.load()
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.phase = .idle
+                    self?.errorMessage = "This Mac's saved client identity can't be read (\(error)). "
+                        + "Refusing to connect so a new device isn't registered; fix "
+                        + "~/Library/Application Support/Slipstream and retry."
+                }
+                return
+            }
             // Advertise 10-bit + HDR10 when enabled: the host upgrades to a BT.2020 PQ Main10 stream
             // only for actual HDR content (its own gate); the VideoToolbox/Metal present path is
             // HDR-capable (P010 + itur_2100_PQ + EDR). 0 keeps the 8-bit BT.709 SDR stream.

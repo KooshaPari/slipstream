@@ -76,10 +76,13 @@ pub(crate) fn client_info(der: &[u8]) -> PairedClient {
 
 /// Unpair a client
 ///
-/// Removes the client's certificate from the pairing store. Caveat: the nvhttp TLS layer
-/// does not yet reject unlisted certificates (`gamestream/tls.rs` accepts any well-formed
-/// client cert — a planned hardening step), so until that lands this removes the client
-/// from the listing without severing its ability to reconnect.
+/// Removes the client's certificate from the pairing store and persists the removal, so the
+/// GameStream/nvhttp launch surface (`nvhttp::peer_is_paired`) refuses the device's future
+/// streams and it must pair again. The nvhttp TLS layer accepts any well-formed client cert at
+/// the handshake; authorization is the per-request fingerprint check against this store, so
+/// removal here is the revocation point. A stream already running is not torn down (its RTSP
+/// media window is bound to the launch session and peer IP); revocation applies to the next
+/// launch.
 #[utoipa::path(
     delete,
     path = "/clients/{fingerprint}",
@@ -110,6 +113,10 @@ pub(crate) async fn unpair_client(
     let before = paired.len();
     paired.retain(|der| !hex::encode(Sha256::digest(der)).eq_ignore_ascii_case(&fingerprint));
     if paired.len() < before {
+        // Write through, or a host restart would reload the cert from `paired.json` and silently
+        // undo the revocation. `peer_is_paired` reads this store live, so the removal already
+        // blocks the next launch; the save is what makes it survive a restart.
+        crate::protocol::gamestream::save_paired(&paired);
         tracing::info!(fingerprint, "management API: client unpaired");
         StatusCode::NO_CONTENT.into_response()
     } else {

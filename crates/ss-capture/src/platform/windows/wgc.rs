@@ -51,6 +51,8 @@ pub struct WgcCapturer {
     slot: Arc<FrameSlot>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// The materialisation half of the split capture pipeline (see `FrameHandoff`).
+    materializer: Option<std::thread::JoinHandle<()>>,
     /// Optional lifetime guard handed in by the caller and released only when the capturer is
     /// dropped. The host passes its virtual-output `keepalive` here (the same contract the Linux
     /// virtual-output capturer has, `lib.rs::open_virtual_output`): on Windows that guard owns the
@@ -150,17 +152,31 @@ impl WgcCapturer {
             .context("wgc: FrameArrived")?;
         session.StartCapture().context("wgc: StartCapture")?;
 
+        // Two threads: the drain thread takes/releases pool frames as fast as WGC offers them, and
+        // the materialiser copies the newest one out. Fusing them made the pool's consumer look
+        // slow, which is what capped arrivals at ~48/s.
+        let handoff = FrameHandoff::new();
+        // The pool and session are COM objects; each thread holds its own reference.
+        let (pool_drain, session_drain) = (pool.clone(), session.clone());
+        let materializer = std::thread::Builder::new()
+            .name("slipstream-wgc-copy".into())
+            .spawn({
+                let (slot, stop, handoff) = (slot.clone(), stop.clone(), handoff.clone());
+                move || wgc_worker(pool, session, device, ctx, slot, stop, handoff)
+            })
+            .context("wgc: spawn materialiser")?;
         let worker = std::thread::Builder::new()
             .name("slipstream-wgc".into())
             .spawn({
-                let (slot, stop) = (slot.clone(), stop.clone());
-                move || wgc_worker(pool, session, device, ctx, slot, stop)
+                let (slot, stop, handoff) = (slot.clone(), stop.clone(), handoff.clone());
+                move || wgc_drain_worker(pool_drain, session_drain, slot, stop, handoff)
             })
             .context("wgc: spawn worker")?;
         Ok(WgcCapturer {
             slot,
             stop,
             worker: Some(worker),
+            materializer: Some(materializer),
             _keepalive: keepalive,
         })
     }
@@ -171,6 +187,9 @@ impl Drop for WgcCapturer {
         self.stop.store(true, Ordering::SeqCst);
         self.slot.note_arrival();
         if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+        if let Some(w) = self.materializer.take() {
             let _ = w.join();
         }
     }
@@ -275,18 +294,68 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     ))
 }
 
-/// The WGC worker: wait for arrivals, drain every queued frame, publish the freshest.
-/// Owns the pool/session/device (drops them on exit); any D3D failure is terminal and is
-/// reported through the slot so the session fails loudly instead of stalling.
-fn wgc_worker(
+/// One-deep, replace-newest handoff from the drain thread to the materialisation thread.
+///
+/// Why this exists: materialising a frame (D3D11 staging map plus row copies) used to run on the
+/// same thread that drains the pool, so while a frame was being copied the pool was neither
+/// drained nor released and the capture session saw a slow consumer. A slow consumer looks exactly
+/// like a slow producer at the `FrameArrived` callback -- the ambiguity the cadence counters
+/// exposed (~48 arrivals/s with no pool overflow). The drain thread now only takes and releases
+/// frames; the copy happens on another thread.
+struct FrameHandoff {
+    frame: std::sync::Mutex<Option<Direct3D11CaptureFrame>>,
+    ready: std::sync::Condvar,
+}
+
+impl FrameHandoff {
+    fn new() -> Arc<Self> {
+        Arc::new(FrameHandoff {
+            frame: std::sync::Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Replace whatever is parked (the previous frame is released right here).
+    fn put(&self, frame: Direct3D11CaptureFrame) {
+        let mut guard = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(frame);
+        self.ready.notify_one();
+    }
+
+    /// Wake a waiter without a new frame (shutdown).
+    fn wake(&self) {
+        self.ready.notify_all();
+    }
+
+    /// Take the newest parked frame, waiting until `deadline` when none is ready.
+    fn take_until(&self, deadline: std::time::Instant) -> Option<Direct3D11CaptureFrame> {
+        let mut guard = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(frame) = guard.take() {
+                return Some(frame);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (next, _) = self
+                .ready
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next;
+        }
+    }
+}
+
+/// Drain thread: wait for arrivals, take every queued frame, park the freshest and release the
+/// rest. Does no copying -- that is the point of the split.
+fn wgc_drain_worker(
     pool: Direct3D11CaptureFramePool,
     _session: GraphicsCaptureSession,
-    device: ID3D11Device,
-    ctx: ID3D11DeviceContext,
     slot: Arc<FrameSlot>,
     stop: Arc<AtomicBool>,
+    handoff: Arc<FrameHandoff>,
 ) {
-    let mut staging: Option<(ID3D11Texture2D, u32, u32)> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -295,12 +364,12 @@ fn wgc_worker(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        // Drain the pool; only the freshest materialization is published.
         let mut pending: Option<Direct3D11CaptureFrame> = None;
         loop {
             match pool.TryGetNextFrame() {
                 Ok(frame) => {
                     slot.note_try_next(true);
+                    // Assigning drops the older frame, releasing its pool slot immediately.
                     pending = Some(frame);
                 }
                 Err(_) => {
@@ -309,7 +378,32 @@ fn wgc_worker(
                 }
             }
         }
-        let Some(frame) = pending else {
+        if let Some(frame) = pending {
+            handoff.put(frame);
+        }
+    }
+    handoff.wake();
+}
+
+/// Materialisation thread: take the newest parked frame and copy it out. Owns the immediate
+/// context (not thread-safe), which is why there is exactly one of these.
+fn wgc_worker(
+    _pool: Direct3D11CaptureFramePool,
+    _session: GraphicsCaptureSession,
+    device: ID3D11Device,
+    ctx: ID3D11DeviceContext,
+    slot: Arc<FrameSlot>,
+    stop: Arc<AtomicBool>,
+    handoff: Arc<FrameHandoff>,
+) {
+    let mut staging: Option<(ID3D11Texture2D, u32, u32)> = None;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let Some(frame) =
+            handoff.take_until(std::time::Instant::now() + std::time::Duration::from_millis(500))
+        else {
             continue;
         };
         match materialize_frame(&frame, &device, &ctx, &mut staging) {

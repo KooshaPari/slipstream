@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
@@ -506,6 +506,92 @@ fn resolve_kscreen_addr(name: &str, w: u32, h: u32) -> String {
 /// in its own connect and never returns — and these calls run on the session's stream thread, whose
 /// only way to end a session is to return. Generous next to a healthy call (tens of ms).
 const KSCREEN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Budget for one KWin screencast Wayland wait — the registry handshake, the `created` node
+/// handshake, or a teardown flush.
+///
+/// KWin is a Wayland peer of the very thread that streams: `EventQueue::roundtrip` /
+/// `blocking_dispatch` read(2) with NO timeout, and `Connection::flush` is a blocking write. When
+/// the compositor's PipeWire side stalls, none of them ever return — and this runs on the session's
+/// stream thread, whose only way to end a session is to return. Generous next to a healthy
+/// handshake (single-digit ms).
+const SCREENCAST_BUDGET: Duration = Duration::from_secs(10);
+
+/// Longest single `poll(2)` inside [`pump_until`] before it re-checks its deadline and the awaited
+/// predicate. Matches the keepalive loop's 200 ms cadence (see `park_until_stopped`).
+const PUMP_POLL_MS: u64 = 200;
+
+/// `conn.flush()` with the write bounded: only flush when the socket is writable right now.
+///
+/// `flush` is a blocking `sendmsg`; a peer that has stopped reading a full socket buffer turns it
+/// into a forever-block. Sending nothing is safe — the queued requests stay queued and the next
+/// pump pass retries — and, unlike a blocking write, it always returns.
+fn flush_bounded(conn: &Connection) -> Result<()> {
+    let mut pfd = libc::pollfd {
+        fd: conn.as_fd().as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: `&mut pfd` points at a single live, fully-initialized `libc::pollfd` on the stack and
+    // the count `1` matches that one-element array, so `poll` reads `fd`/`events` and writes
+    // `revents` strictly within `pfd`. `pfd.fd` is the Wayland connection's fd, valid because
+    // `conn` is alive across the call. Timeout 0 makes it a non-blocking writability check.
+    let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if r > 0 && (pfd.revents & libc::POLLOUT) != 0 {
+        conn.flush().context("wayland flush")?;
+    }
+    Ok(())
+}
+
+/// Pump the queue until `done` reports the awaited event or `deadline` passes — the same
+/// poll-with-deadline shape as `kwin_output_mgmt::pump_until`, and the bounded replacement for
+/// `EventQueue::roundtrip`/`blocking_dispatch` on the session thread.
+///
+/// Returns `Ok(true)` when the predicate fired, `Ok(false)` on deadline. It never blocks longer
+/// than `PUMP_POLL_MS` at a time, so the caller can always unwind (release the virtual output, drop
+/// the encoder) instead of parking the whole session on a wedged compositor.
+fn pump_until(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    deadline: Instant,
+    mut done: impl FnMut(&State) -> bool,
+) -> Result<bool> {
+    loop {
+        queue
+            .dispatch_pending(state)
+            .context("wayland dispatch_pending")?;
+        if done(state) {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        flush_bounded(conn)?;
+        let Some(guard) = conn.prepare_read() else {
+            // Requests still queued (the socket was not writable): yield briefly rather than spin.
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        let mut pfd = libc::pollfd {
+            fd: conn.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(PUMP_POLL_MS as u128) as i32;
+        // SAFETY: as in `flush_bounded` — one live stack `pollfd`, count `1`; `pfd.fd` is the live
+        // connection fd, and `poll` writes only `revents` within it. The blocking bound is
+        // `remaining_ms` (<= `PUMP_POLL_MS`), so this call cannot outlive the deadline by more than
+        // one poll quantum.
+        let r = unsafe { libc::poll(&mut pfd, 1, remaining_ms) };
+        if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            let _ = guard.read();
+        } // else: timeout or signal — drop the guard, re-check the deadline
+    }
+}
 
 /// `kscreen-doctor <args>` run for its exit status, bounded by [`KSCREEN_BUDGET`]. A timeout reads
 /// as a failed apply — the same best-effort path a rejected argument already takes.
@@ -1108,7 +1194,14 @@ pub fn probe() -> Result<()> {
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
     let mut state = State::default();
-    queue.roundtrip(&mut state).context("registry roundtrip")?;
+    let _ = pump_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        Instant::now() + SCREENCAST_BUDGET,
+        |s| s.screencast.is_some(),
+    )
+    .context("KWin registry roundtrip")?;
     if state.screencast.is_none() {
         bail!(
             "KWin is up but does not expose zkde_screencast_unstable_v1 to this client — KWin gates \
@@ -1150,10 +1243,22 @@ fn run_existing(
     let mut state = State::default();
     // Two roundtrips: the first processes the globals (binding screencast + every wl_output), the
     // second drains each output's property burst — the `name` event we resolve the connector by.
-    queue.roundtrip(&mut state).context("registry roundtrip")?;
-    queue
-        .roundtrip(&mut state)
-        .context("wl_output property roundtrip")?;
+    let _ = pump_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        Instant::now() + SCREENCAST_BUDGET,
+        |s| s.screencast.is_some(),
+    )
+    .context("KWin registry roundtrip")?;
+    let _ = pump_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        Instant::now() + SCREENCAST_BUDGET,
+        |s| s.outputs.iter().any(|(_, n)| n.is_some()),
+    )
+    .context("KWin wl_output property roundtrip")?;
 
     let screencast = state.screencast.clone().ok_or_else(|| {
         anyhow!(
@@ -1203,10 +1308,19 @@ fn run_existing(
         "KWin: recording an existing output; awaiting PipeWire node"
     );
 
+    let created_deadline = Instant::now() + SCREENCAST_BUDGET;
     let node_id = loop {
-        queue
-            .blocking_dispatch(&mut state)
-            .context("wayland dispatch (awaiting created)")?;
+        let ready = pump_until(&conn, &mut queue, &mut state, created_deadline, |s| {
+            s.node_id.is_some() || s.failed.is_some() || s.closed
+        })
+        .context("wayland dispatch (awaiting created)")?;
+        if !ready {
+            bail!(
+                "KWin did not create the screencast stream within {}s — the compositor's \
+                 PipeWire side is not answering (bounded so the session can unwind)",
+                SCREENCAST_BUDGET.as_secs()
+            );
+        }
         if let Some(node) = state.node_id {
             break node;
         }
@@ -1335,11 +1449,65 @@ fn connect_wayland_diagnostic() -> std::result::Result<Connection, wayland_clien
     ) else {
         return Connection::connect_to_env();
     };
-    let stream = std::os::unix::net::UnixStream::connect(path).map_err(|error| {
-        tracing::warn!(errno = ?error.raw_os_error(), "KWin Wayland socket connect failed");
-        wayland_client::ConnectError::NoCompositor
-    })?;
-    Connection::from_socket(stream)
+    match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(stream) => Connection::from_socket(stream),
+        Err(error) => {
+            tracing::warn!(errno = ?error.raw_os_error(), path = %path.display(),
+                "KWin Wayland socket connect failed");
+            // The env-resolved socket is gone. That is not necessarily fatal: `WAYLAND_DISPLAY`
+            // is PROCESS-WIDE state that `display/session.rs::apply_session_env` rewrites on
+            // every connect and, in its `ActiveKind::None` branch (session.rs:590-592),
+            // REMOVES — and nothing puts it back at teardown. One session that takes that
+            // branch therefore poisons every later session in the process: create fails, no
+            // capture, zero frames, while the host process itself looks healthy. Scanning the
+            // runtime dir for the newest socket we own ignores the env entirely, so the next
+            // session connects anyway.
+            if std::env::var_os("SLIPSTREAM_WAYLAND_NO_FALLBACK").is_none() {
+                if let Some(alt) = fallback_wayland_socket() {
+                    if let Ok(stream) = std::os::unix::net::UnixStream::connect(&alt) {
+                        tracing::info!(socket = %alt.display(),
+                            "KWin: env-resolved Wayland socket is stale — connected via \
+                             runtime-dir scan instead");
+                        return Connection::from_socket(stream);
+                    }
+                }
+            }
+            Err(wayland_client::ConnectError::NoCompositor)
+        }
+    }
+}
+
+/// Last-resort socket resolution: the newest `wayland-*` socket this uid owns under
+/// `XDG_RUNTIME_DIR` (default `/run/user/<uid>`), skipping `.lock` sidecars.
+///
+/// Exists because the process env is not a trustworthy session input: see the call site. This is
+/// the only resolver that cannot be poisoned by a previous session's teardown.
+fn fallback_wayland_socket() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `getuid` takes no arguments, reads no memory and cannot fail; it returns this
+    // process's real uid. It is used only to (a) default the runtime dir and (b) skip sockets
+    // owned by another user, so a wrong-but-consistent value can only narrow the candidate set.
+    let uid = unsafe { libc::getuid() };
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("/run/user/{uid}")));
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(&runtime).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("wayland-") || name.ends_with(".lock") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.uid() != uid || !meta.file_type().is_socket() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map_or(true, |(m, _)| mtime > *m) {
+            best = Some((mtime, entry.path()));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 #[cfg(test)]
@@ -1350,7 +1518,7 @@ mod diagnostic_socket_tests {
 
     #[test]
     fn connection_cases_are_isolated() {
-        for case in ["missing", "live", "fd", "nonunicode"] {
+        for case in ["missing", "live", "fd", "nonunicode", "poisoned"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1358,6 +1526,10 @@ mod diagnostic_socket_tests {
                     "--nocapture",
                 ])
                 .env("SLIPSTREAM_WAYLAND_TEST_CASE", case)
+                // The fallback scans a real /run/user when XDG_RUNTIME_DIR is absent; the
+                // "missing" case asserts NoCompositor, so keep it off by default and re-enable
+                // it inside the one case that tests the fallback.
+                .env("SLIPSTREAM_WAYLAND_NO_FALLBACK", "1")
                 .env_remove("WAYLAND_SOCKET")
                 .env_remove("WAYLAND_DISPLAY")
                 .env_remove("XDG_RUNTIME_DIR")
@@ -1388,6 +1560,34 @@ mod diagnostic_socket_tests {
         let path =
             std::env::temp_dir().join(format!("slipstream-wayland-test-{}", std::process::id()));
         match case.as_str() {
+            // Regression (2026-11-16 live repro): session A ends, session B starts in the same
+            // process and receives zero frames because `apply_session_env`'s ActiveKind::None
+            // branch (session.rs:590-592) removed the process-wide `WAYLAND_DISPLAY` and no
+            // teardown restored it. Models that exactly: the env names a socket that is gone,
+            // while a live compositor socket sits in the runtime dir. Main fails this case
+            // (Err(NoCompositor) -> no output -> no capture -> no frames); the branch must
+            // succeed by scanning the runtime dir.
+            "poisoned" => {
+                let runtime = path.with_file_name(format!(
+                    "slipstream-wayland-rt-{}",
+                    std::process::id()
+                ));
+                let _ = std::fs::create_dir_all(&runtime);
+                let live = runtime.join("wayland-9");
+                let _listener = UnixListener::bind(&live).unwrap();
+                std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+                // The stale name a previous session left behind: inside the runtime dir, absent.
+                std::env::set_var("WAYLAND_DISPLAY", runtime.join("wayland-gone"));
+                std::env::remove_var("SLIPSTREAM_WAYLAND_NO_FALLBACK");
+                let result = super::connect_wayland_diagnostic();
+                assert!(
+                    result.is_ok(),
+                    "a stale WAYLAND_DISPLAY must not make the next session unable to connect"
+                );
+                drop(result);
+                let _ = std::fs::remove_file(&live);
+                let _ = std::fs::remove_dir(&runtime);
+            }
             "missing" => {
                 use std::io::Write;
                 use std::sync::{Arc, Mutex};
@@ -1494,7 +1694,14 @@ fn run(
     let _registry = conn.display().get_registry(&qh, ());
 
     let mut state = State::default();
-    queue.roundtrip(&mut state).context("registry roundtrip")?;
+    let _ = pump_until(
+        &conn,
+        &mut queue,
+        &mut state,
+        Instant::now() + SCREENCAST_BUDGET,
+        |s| s.screencast.is_some(),
+    )
+    .context("KWin registry roundtrip")?;
 
     let screencast = state.screencast.clone().ok_or_else(|| {
         anyhow!(
@@ -1522,10 +1729,19 @@ fn run(
     );
 
     // Pump events until KWin reports the node id (or an error).
+    let created_deadline = Instant::now() + SCREENCAST_BUDGET;
     let node_id = loop {
-        queue
-            .blocking_dispatch(&mut state)
-            .context("wayland dispatch (awaiting created)")?;
+        let ready = pump_until(&conn, &mut queue, &mut state, created_deadline, |s| {
+            s.node_id.is_some() || s.failed.is_some() || s.closed
+        })
+        .context("wayland dispatch (awaiting created)")?;
+        if !ready {
+            bail!(
+                "KWin did not create the virtual output within {}s — the compositor's \
+                 PipeWire side is not answering (bounded so the session can unwind)",
+                SCREENCAST_BUDGET.as_secs()
+            );
+        }
         if let Some(node) = state.node_id {
             break node;
         }
@@ -1567,7 +1783,7 @@ fn park_until_stopped(
             tracing::warn!(output = %output, node_id, "KWin closed the screencast stream");
             break;
         }
-        conn.flush().context("wayland flush")?;
+        flush_bounded(conn)?;
         let Some(guard) = conn.prepare_read() else {
             continue; // events already queued — loop dispatches them
         };

@@ -196,17 +196,19 @@ fn pick_output(monitor: Option<&str>) -> Result<(u32, u32)> {
 
 /// Default-adapter D3D11 device + immediate context for the duplication.
 fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
-    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::D3D11CreateDevice;
     use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
     let mut device = None;
     let mut ctx = None;
+    // `D3D_DRIVER_TYPE_UNKNOWN` is only legal *with* an explicit `pAdapter`; with `NULL` it is
+    // E_INVALIDARG (0x80070057). See the note in `wgc::create_d3d11_device`.
     // Out-params are live locals written synchronously; default adapter.
     // SAFETY: see above; the returned interfaces are reference-counted.
     unsafe {
         D3D11CreateDevice(
             None::<&IDXGIAdapter>,
-            D3D_DRIVER_TYPE_UNKNOWN,
+            D3D_DRIVER_TYPE_HARDWARE,
             windows::Win32::Foundation::HMODULE::default(),
             windows::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_FLAG(0),
             None,

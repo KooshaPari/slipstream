@@ -1,0 +1,27 @@
+[package]
+name = "slipstream-windows"
+description = "Native Windows session client: a slipstream/1 QUIC client with a winit window, keyboard/mouse capture, LAN discovery, and the shared PIN pairing ceremony."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "slipstream-windows"
+path = "src/main.rs"
+
+[dependencies]
+slipstream-core = { path = "../../crates/slipstream-core", features = ["quic"] }
+quinn = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# LAN discovery: the same `_slipstream._udp` browser crate (and version) the probe and the host
+# advertise with, so one TXT contract serves every platform.
+mdns-sd = "0.20"
+
+[lints]
+workspace = true

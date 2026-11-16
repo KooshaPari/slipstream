@@ -348,11 +348,46 @@ pub fn device_name() -> String {
             return s.to_string();
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        // A GUI-launched .app inherits no HOSTNAME (and macOS has no /etc/hostname), so every Mac
+        // client used to present the fallback below and the host's device list showed N distinct
+        // fingerprints as one "This device" row — a list you cannot read is one you cannot revoke
+        // from. Ask the kernel for the machine name instead; it needs no permission and no prompt.
+        if let Some(name) = kernel_hostname() {
+            return name;
+        }
+    }
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "This device".into())
+        .unwrap_or_else(|| GENERIC_DEVICE_NAME.into())
+}
+
+/// The label used when the OS reports no usable machine name. The C ABI pairs it with the
+/// identity's fingerprint prefix so two such clients never collide on one host-side row.
+pub const GENERIC_DEVICE_NAME: &str = "This device";
+
+/// The local hostname as the kernel reports it (`gethostname`), trimmed at the first NUL.
+/// `None` when the call fails, truncates to nothing, or reports the unhelpful `localhost`.
+#[cfg(target_os = "macos")]
+fn kernel_hostname() -> Option<String> {
+    // HOST_NAME_MAX is 255 on macOS; the extra byte covers the terminator.
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a valid writable 256-byte region and `gethostname` writes at most that
+    // many bytes. macOS may leave it unterminated when the name is truncated, so the NUL search
+    // below tolerates a full buffer.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() || name == "localhost" {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 impl NativeClient {

@@ -755,7 +755,12 @@ mod hyprland;
 
 #[cfg(target_os = "linux")]
 #[path = "display/linux/kwin.rs"]
-mod kwin;
+pub(crate) mod kwin;
+
+/// Pin the KWin Wayland socket at host startup, before a session handshake can rewrite the
+/// process environment and starve every later connect (see `kwin::pinned_socket`).
+#[cfg(target_os = "linux")]
+pub use kwin::warm_socket;
 
 // In-process KDE output management (kde_output_management_v2) — the topology path that used to shell
 // out to `kscreen-doctor`, driven over the compositor's own Wayland instead so it can't be wedged by

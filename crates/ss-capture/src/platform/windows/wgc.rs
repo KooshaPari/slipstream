@@ -234,10 +234,9 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None;
     let mut ctx = None;
     let mut level = D3D_FEATURE_LEVEL_11_0;
-    // Adapter/driver-type pairing: `pAdapter = NULL` selects the default adapter, and UNKNOWN
-    // is only legal *with* an explicit adapter, so UNKNOWN + NULL is E_INVALIDARG (0x80070057)
-    // SAFETY: out-params are live `Option` locals written synchronously; the feature-level param
-    // is `None` (the runtime's default array). The returned interfaces are reference-counted.
+    // All out-params are live `Option` locals written synchronously; the adapter and
+    // feature-level params are `None` (default adapter, runtime's choice).
+    // SAFETY: see above; the returned interfaces are reference-counted.
     unsafe {
         D3D11CreateDevice(
             None::<&IDXGIAdapter>,

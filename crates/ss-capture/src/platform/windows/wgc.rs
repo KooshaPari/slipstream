@@ -51,6 +51,13 @@ pub struct WgcCapturer {
     slot: Arc<FrameSlot>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Optional lifetime guard handed in by the caller and released only when the capturer is
+    /// dropped. The host passes its virtual-output `keepalive` here (the same contract the Linux
+    /// virtual-output capturer has, `lib.rs::open_virtual_output`): on Windows that guard owns the
+    /// display backend's mode-set, so holding it for the capturer's lifetime keeps the head at the
+    /// session mode for the whole session instead of restoring it the instant capture attaches.
+    /// Never dereferenced.
+    _keepalive: Option<Box<dyn Send>>,
 }
 
 impl WgcCapturer {
@@ -62,6 +69,15 @@ impl WgcCapturer {
     /// Capture the monitor named by `SLIPSTREAM_CAPTURE_MONITOR` (`\\.\DISPLAY1`), else the
     /// primary head. Fails loudly when the pin names nothing on this box.
     pub fn open_for_monitor(monitor: Option<&str>) -> Result<Self> {
+        Self::open_for_monitor_with_keepalive(monitor, None)
+    }
+
+    /// As [`Self::open_for_monitor`], additionally holding `keepalive` for the capturer's
+    /// lifetime (the caller's virtual-output guard — see the field docs).
+    pub fn open_for_monitor_with_keepalive(
+        monitor: Option<&str>,
+        keepalive: Option<Box<dyn Send>>,
+    ) -> Result<Self> {
         // WinRT init is process-wide and idempotent (`S_FALSE` when already
         // initialized); the outcome is deliberately ignored.
         // SAFETY: no pointers; process-wide init only.
@@ -127,6 +143,7 @@ impl WgcCapturer {
             slot,
             stop,
             worker: Some(worker),
+            _keepalive: keepalive,
         })
     }
 }
@@ -217,10 +234,9 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     let mut device = None;
     let mut ctx = None;
     let mut level = D3D_FEATURE_LEVEL_11_0;
-    // Adapter/driver-type pairing: `pAdapter = NULL` selects the default adapter, and UNKNOWN
-    // is only legal *with* an explicit adapter, so UNKNOWN + NULL is E_INVALIDARG (0x80070057)
-    // SAFETY: out-params are live `Option` locals written synchronously; the feature-level param
-    // is `None` (the runtime's default array). The returned interfaces are reference-counted.
+    // All out-params are live `Option` locals written synchronously; the adapter and
+    // feature-level params are `None` (default adapter, runtime's choice).
+    // SAFETY: see above; the returned interfaces are reference-counted.
     unsafe {
         D3D11CreateDevice(
             None::<&IDXGIAdapter>,

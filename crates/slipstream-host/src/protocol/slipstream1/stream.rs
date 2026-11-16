@@ -1689,6 +1689,92 @@ fn park_pointer(input_tx: &std::sync::mpsc::Sender<super::input::ClientInput>, w
     }
 }
 
+/// Steady-grid anchor for the wire capture stamp (`msg.capture_ns`, echoed as the 0xCF
+/// `pts_ns`). Extracted from the submit loop as a small pure state machine so the reseed policy
+/// is unit-testable without the streaming loop; behaviour is byte-identical to the in-line code
+/// it replaced for the native-rate (requested interval == real frame interval) path.
+///
+/// The grid is advanced by the *requested* session interval once per **submission**, never
+/// re-anchored to the wall clock mid-stream (that would re-import the source's jitter). Two stall
+/// guards stop it diverging from reality:
+/// * BEHIND: if the grid has fallen more than ~2 periods behind the submission clock (a rebuild,
+///   backoff, or capture-loss pause), re-seed it from the fresh frame's real stamp.
+/// * AHEAD: if the grid has run more than ~2 periods ahead of the submission clock, re-seed it.
+///   This is the 60 Hz-requested-on-a-144 Hz-compositor case: the loop follows the *source* arrival
+///   rate (frame-driven pacing) but advances the grid by the *requested* interval, so a slower
+///   request on a faster source outruns wall clock by (requested/actual)x and would otherwise drift
+///   into the future without bound  -  which the behind-only guard can never see.
+#[derive(Debug, Default)]
+pub(super) struct WireGrid {
+    /// Next grid point in nanoseconds; `None` until seeded from the first plausible capture stamp.
+    next_ns: Option<u64>,
+}
+
+impl WireGrid {
+    pub(super) fn new() -> Self {
+        Self { next_ns: None }
+    }
+
+    /// Return this submission's wire capture stamp and advance/repair the grid.
+    ///
+    /// `interval_ns` is the requested session frame period. `frame_pts_ns` is the real capture
+    /// stamp, trusted only when `plausible && !repeat`. `submit_ns` is the wall-clock submit
+    /// stamp. The returned stamp is always `<= submit_ns` (the grid point may legitimately sit up
+    /// to one period behind it; it is never handed out from the future).
+    pub(super) fn advance(
+        &mut self,
+        submit_ns: u64,
+        frame_pts_ns: u64,
+        plausible: bool,
+        repeat: bool,
+        interval_ns: u64,
+    ) -> u64 {
+        let fresh = !repeat && plausible;
+        // This submission's grid point (pre-repair). Seeded from the first plausible capture
+        // stamp; every later fresh frame takes the accumulated point (never `frame.pts_ns`, whose
+        // gaps carry source jitter). A repeat/non-plausible stamp falls back to "now".
+        let mut stamp = if fresh {
+            match self.next_ns {
+                Some(g) => g,
+                None => {
+                    self.next_ns = Some(frame_pts_ns);
+                    frame_pts_ns
+                }
+            }
+        } else {
+            if self.next_ns.is_none() {
+                self.next_ns = Some(submit_ns);
+            }
+            submit_ns
+        };
+        // Never hand out a future stamp: clamp to the submission clock. This is a no-op on the
+        // native-rate path, where the grid always trails `submit_ns` by the frame's queue age.
+        if stamp > submit_ns {
+            stamp = submit_ns;
+        }
+        // Behind stall guard (unchanged from the in-line code).
+        if let Some(g) = self.next_ns {
+            if submit_ns.saturating_sub(g) > interval_ns.saturating_mul(2) {
+                self.next_ns = Some(if plausible { frame_pts_ns } else { submit_ns });
+            }
+        }
+        // Ahead guard: symmetric to the behind case, and the fix for the 60-on-144 drift. Re-seed
+        // from the real capture stamp once the grid is more than ~2 periods into the future.
+        if let Some(g) = self.next_ns {
+            if g.saturating_sub(submit_ns) > interval_ns.saturating_mul(2) {
+                self.next_ns = Some(if plausible {
+                    frame_pts_ns.min(submit_ns)
+                } else {
+                    submit_ns
+                });
+            }
+        }
+        // Advance the grid by one session frame period for the next submission.
+        self.next_ns = self.next_ns.map(|g| g.saturating_add(interval_ns));
+        stamp
+    }
+}
+
 pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<()> {
     // This thread runs the capture and encode loop. Elevate it so a CPU-heavy game cannot
     // deschedule GPU submission.
@@ -2135,12 +2221,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // cadence  -  the latest buffer sampled at each even point, exactly how a real monitor behaves  -
     // which is what removes the scroll judder at every client framerate.
     //
-    // `None` = not seeded yet. Seeded from the first plausible capture stamp (or `now` on a
-    // non-plausible/repeat first frame), then advanced by `interval` per submitted frame, never
-    // re-anchored to the wall clock (which would re-import the source's jitter). A mid-stream
-    // pipeline rebuild keeps the accumulated grid; the session rate the grid advances at comes
-    // from the rebuilt `interval` (rebuilds adopt the effective rate).
-    let mut wire_grid_ns: Option<u64> = None;
+    // Steady-grid anchor for the wire capture stamp (`msg.capture_ns`, echoed as the 0xCF
+    // `pts_ns`). The `WireGrid` state machine carries the behind/ahead stall guards and the
+    // reseed/advance policy (see its doc comment); it is never re-anchored to the wall clock
+    // mid-stream, which would re-import the source's jitter. A mid-stream pipeline rebuild keeps
+    // the accumulated grid; the session rate the grid advances at comes from the rebuilt
+    // `interval` (rebuilds adopt the effective rate).
+    let mut wire_grid = WireGrid::new();
     let mut sent: u64 = 0;
     // Phase-locked capture (design/phase-locked-capture.md): the per-frame hold this loop applies
     // after a fresh capture, walked ~1 Hz toward the client's reported arrival lead. A loop local
@@ -3272,46 +3359,28 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // (SyntheticCapturer counts from 0, not the epoch) falls back to "now".
         //
         // Steady-grid pacing (virtual vsync): even a fresh frame's stamp is re-anchored onto the
-        // session-rate grid (`wire_grid_ns`, advanced by `interval` per submitted frame) so the
+        // session-rate grid (`wire_grid`, advanced by `interval` per submitted frame) so the
         // client's presentation times are EVENLY spaced. The source (a compositor with no hardware
         // vblank) can still deliver frames at irregular gaps; the grid keeps that from becoming
         // uneven on-screen spacing. The grid never re-anchors to the wall clock mid-stream, so it
         // can't re-import the jitter it exists to remove.
         let age_ns = submit_ns.saturating_sub(frame.pts_ns);
         let plausible = frame.pts_ns > 0 && frame.pts_ns <= submit_ns && age_ns < 10_000_000_000;
-        let (capture_ns, queue_us) = if !repeat && plausible {
-            // Seed the grid from the first plausible capture stamp; every later frame takes the
-            // accumulated grid point (never `frame.pts_ns`, whose gaps carry source jitter).
-            let grid = match wire_grid_ns {
-                Some(g) => g,
-                None => {
-                    let g = frame.pts_ns;
-                    wire_grid_ns = Some(g);
-                    g
-                }
-            };
-            (grid, (age_ns / 1000) as u32)
+        // Wire capture stamp for this submission plus the queue age it splits out. `WireGrid`
+        // owns the steady-grid seed/reseed/advance policy (behind AND ahead stall guards - see
+        // its doc comment); `capture_ns` is never handed out from the future of `submit_ns`.
+        let capture_ns = wire_grid.advance(
+            submit_ns,
+            frame.pts_ns,
+            plausible,
+            repeat,
+            interval.as_nanos() as u64,
+        );
+        let queue_us = if !repeat && plausible {
+            (age_ns / 1000) as u32
         } else {
-            // Repeat or non-plausible stamp: fall back to "now" (the pre-fix behavior) and, if the
-            // grid is still unseeded, anchor it here so the first fresh frame lands on a stable
-            // grid point rather than a wild offset.
-            wire_grid_ns.get_or_insert(submit_ns);
-            (submit_ns, 0)
+            0
         };
-        // Stall guard: if the grid has fallen more than ~2 frame periods behind `now` (an encoder
-        // rebuild, backoff, or capture-loss pause), RE-SEED it from the fresh frame's real stamp
-        // instead of handing the client a pts from before the stall (which would read as a latency
-        // spike). In steady operation `submit_ns - grid` is sub-frame-period, so this never trips
-        // and the cadence stays even; it only re-anchors after a genuine pause.
-        if let Some(g) = wire_grid_ns {
-            let grid_behind = submit_ns.saturating_sub(g);
-            if grid_behind > interval.as_nanos() as u64 * 2 {
-                let reseed = if plausible { frame.pts_ns } else { submit_ns };
-                wire_grid_ns = Some(reseed);
-            }
-        }
-        // Advance the grid by one session frame period for the next submission.
-        wire_grid_ns = wire_grid_ns.map(|g| g.saturating_add(interval.as_nanos() as u64));
         if perf && !repeat {
             st_queue.push(queue_us);
         }
@@ -4781,5 +4850,99 @@ mod tests {
                 || (shift - 2_000_000).rem_euclid(SIM_P) > SIM_P - 1_000,
             "a +2 ms offset must shift the next target by +2 ms mod P, got {shift}"
         );
+    }
+
+    // ---- WireGrid (wire capture-stamp steady grid) ----------------------------------------
+
+    /// 144 Hz on a 144 Hz compositor: the grid is advanced once per real arrival, so it must be
+    /// byte-identical to the old `grid = pts0 + k*interval` accumulation and the new emit clamp
+    /// must be a no-op (the grid always trails `submit_ns` by the frame's queue age here).
+    #[test]
+    fn wire_grid_is_unchanged_at_native_rate() {
+        let interval = 1_000_000_000u64 / 144;
+        let queue_age = 2_500_000u64; // submit - real capture stamp
+        let mut grid = WireGrid::new();
+        let mut submit = 7_000_000_000u64;
+        let mut expected = submit - queue_age; // pts of the seeding frame
+        for n in 0..500 {
+            let pts = submit - queue_age;
+            let stamp = grid.advance(submit, pts, true, false, interval);
+            assert_eq!(
+                stamp, expected,
+                "frame {n}: native-rate grid must be the pure accumulated grid point"
+            );
+            assert!(
+                stamp <= submit,
+                "frame {n}: native-rate grid must trail submit (the emit clamp must be a no-op)"
+            );
+            expected += interval;
+            submit += interval; // frame-driven: one arrival per requested interval
+        }
+    }
+
+    /// The bug: 60 Hz requested on a 144 Hz compositor. The loop follows the *source* arrival rate
+    /// (~2.4x the requested rate) but the grid advances by the requested interval, so the old code
+    /// (`grid += interval` with a behind-only guard) drove the wire stamp unbounded into the future.
+    #[test]
+    fn wire_grid_does_not_drift_ahead_on_fast_source() {
+        let interval = 1_000_000_000u64 / 60; // requested 60 Hz
+        let real_gap = 1_000_000_000u64 / 144; // source delivers 144 Hz (2.4x the request)
+        let queue_age = 2_000_000u64;
+        let mut grid = WireGrid::new();
+        let mut submit = 5_000_000_000u64;
+        let pts0 = submit - queue_age;
+        // First fresh frame seeds the grid at its real capture stamp.
+        assert_eq!(
+            grid.advance(submit, pts0, true, false, interval),
+            pts0,
+            "first frame anchors at its real capture stamp"
+        );
+        for n in 0..200 {
+            submit += real_gap;
+            let pts = submit - queue_age;
+            let stamp = grid.advance(submit, pts, true, false, interval);
+            assert!(
+                stamp <= submit,
+                "submission {n}: wire stamp {stamp} is in the future of submit {submit}"
+            );
+            // The ahead guard fires at >2 intervals (checked before the per-submission advance),
+            // so the internal grid may lead by at most ~3 intervals before it is repaired. The
+            // essential property is that this bound is CONSTANT  -  the pre-fix `+= interval`
+            // grew without bound.
+            let ahead = grid.next_ns.expect("seeded").saturating_sub(submit);
+            assert!(
+                ahead <= interval * 3,
+                "submission {n}: grid drifted {ahead} ns ahead (limit {} ns)",
+                interval * 3
+            );
+        }
+    }
+
+    /// The reverse mismatch (requested 144 Hz, source only 60 Hz): the grid runs *behind*, which
+    /// the existing behind guard already handles. Assert it stays bounded rather than drifting.
+    #[test]
+    fn wire_grid_stays_bounded_when_requested_interval_is_shorter() {
+        let interval = 1_000_000_000u64 / 144; // requested 144 Hz
+        let real_gap = 1_000_000_000u64 / 60; // source only delivers 60 Hz
+        let queue_age = 2_000_000u64;
+        let mut grid = WireGrid::new();
+        let mut submit = 3_000_000_000u64;
+        let pts0 = submit - queue_age;
+        let _ = grid.advance(submit, pts0, true, false, interval);
+        let limit = interval * 2 + real_gap;
+        for n in 0..200 {
+            submit += real_gap;
+            let pts = submit - queue_age;
+            let stamp = grid.advance(submit, pts, true, false, interval);
+            assert!(
+                stamp <= submit,
+                "submission {n}: wire stamp {stamp} is in the future of submit {submit}"
+            );
+            assert!(
+                submit - stamp <= limit,
+                "submission {n}: grid fell {} ns behind (limit {limit} ns)",
+                submit - stamp
+            );
+        }
     }
 }

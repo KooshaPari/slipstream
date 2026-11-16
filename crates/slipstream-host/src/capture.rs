@@ -196,7 +196,12 @@ pub fn capture_virtual_output(
     let Some(head) = vout.windows_head else {
         bail!("Windows virtual output carries no head identity (not a mirror display?)")
     };
-    ss_capture::open_wgc_desktop_for_monitor(Some(&head))
+    // The `VirtualOutput`'s keepalive is the display backend's RAII mode-restore: dropping it
+    // re-applies the pre-session head mode. It must live exactly as long as the capturer, not as
+    // long as this function — otherwise the head snaps back to its native mode between capture
+    // attach and the first encoded frame, and NVENC rejects every 2560x1440 frame against the
+    // 1920x1080 session it opened. Same contract as the Linux virtual-output capturer below.
+    ss_capture::open_wgc_desktop_for_monitor_keepalive(Some(&head), Some(vout.keepalive))
         .map(|c| c as Box<dyn Capturer>)
         .context("capture the mirrored Windows head")
 }

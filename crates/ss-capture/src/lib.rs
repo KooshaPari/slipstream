@@ -725,6 +725,19 @@ pub fn open_wgc_desktop_for_monitor(monitor: Option<&str>) -> Result<Box<dyn Cap
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 
+/// Open WGC while honoring the host's effective physical-monitor pin (`\\.\DISPLAYn`), holding
+/// `keepalive` for the capturer's lifetime. The host passes its virtual-output guard here so the
+/// display backend's mode-set outlives capture attach — the same shape as
+/// [`open_virtual_output`]'s `keepalive` on Linux.
+#[cfg(target_os = "windows")]
+pub fn open_wgc_desktop_for_monitor_keepalive(
+    monitor: Option<&str>,
+    keepalive: Option<Box<dyn Send>>,
+) -> Result<Box<dyn Capturer>> {
+    platform::windows::WgcCapturer::open_for_monitor_with_keepalive(monitor, keepalive)
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
+}
+
 /// Open the DXGI Desktop Duplication fallback capturer on the primary output. CPU `Bgra`
 /// frames, cursor included — for sessions where WGC is unavailable.
 #[cfg(target_os = "windows")]

@@ -119,20 +119,13 @@ public final class HostDiscovery: ObservableObject {
     private func resolve(_ result: NWBrowser.Result) {
         let key = Self.key(result)
         let name = Self.instanceName(result.endpoint)
-        var fp: String?
-        var pair: String?
-        var id: String?
-        var macs: [String] = []
-        var osChain = ""
+        var advert: HostAdvert?
         if case let .bonjour(txt) = result.metadata {
-            fp = Self.entry(txt, "fp")
-            pair = Self.entry(txt, "pair")
-            id = Self.entry(txt, "id")
-            macs = (Self.entry(txt, "mac") ?? "")
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-            osChain = sanitizeOsChain(Self.entry(txt, "os") ?? "")
+            var entries: [String: String] = [:]
+            for field in ["fp", "pair", "id", "mac", "os"] {
+                if let value = Self.entry(txt, field) { entries[field] = value }
+            }
+            advert = HostAdvert(instanceName: name, txt: entries)
         }
         // Resolve over IPv4 only: Network.framework prefers IPv6 (RFC 6724), and the host's OS
         // mDNS responder often answers AAAA for its hostname even though the slipstream host stack
@@ -152,12 +145,14 @@ public final class HostDiscovery: ObservableObject {
                 case .ready:
                     if case let .hostPort(host, port)? = conn.currentPath?.remoteEndpoint,
                        let address = Self.hostString(host) {
+                        // TXT interpretation lives in `HostAdvert` (pure, unit-tested).
+                        let advert = advert ?? HostAdvert(instanceName: name, txt: [:])
                         self.resolved[key] = DiscoveredHost(
-                            id: (id?.isEmpty == false) ? id! : name,
-                            name: name, host: address, port: port.rawValue,
-                            fingerprintHex: fp, requiresPairing: pair == "required",
-                            allowsTofu: pair == "optional", macAddresses: macs,
-                            osChain: osChain)
+                            id: advert.id, name: name, host: address, port: port.rawValue,
+                            fingerprintHex: advert.fingerprintHex,
+                            requiresPairing: advert.requiresPairing,
+                            allowsTofu: advert.allowsTofu, macAddresses: advert.macAddresses,
+                            osChain: advert.osChain)
                         self.publish()
                     }
                     conn.cancel()

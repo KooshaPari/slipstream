@@ -70,6 +70,24 @@ const CHANGE_COOLDOWN: Duration = Duration::from_millis(1500);
 /// Window shard loss beyond which the window counts bad even without an unrecoverable frame:
 /// 2 % sustained is congestion territory, not the random tail FEC exists for.
 const HEAVY_LOSS_PPM: u32 = 20_000;
+/// Unrecoverable frames in one window at/above which the window counts BAD as a QUALITY signal.
+/// Deliberately a COUNT, not a fabricated ppm: one dropped frame in a 750 ms window is a real
+/// quality hit, but converting it to a percentage made it collide with the loss buckets (a flat
+/// `+50_000` read as "5 % link loss" and took SEVERE x0.7 steps - 17 descents, 0 climbs on
+/// 2026-11-16). As a count it needs [`BAD_WINDOWS_TO_DECREASE`] consecutive windows, and it can
+/// never on its own skip the confirmation.
+const QUALITY_DROPS_BAD: u64 = 1;
+/// Consecutive CLEAN windows at the current rate before a probe-up (~9 s at the 750 ms cadence).
+/// Clean here means: no loss, no frame drops, no OWD/decode/encode rise - i.e. the pipeline is
+/// genuinely healthy but the utilization gate is refusing to authorize a climb.
+const PROBE_UP_WINDOWS: u32 = 12;
+/// Ceiling on the probe interval after repeated failed probes (~36 s). Each failed probe doubles
+/// the wait, so a rate the link cannot hold costs one step down and a longer silence, never a
+/// sawtooth; a successful probe resets to [`PROBE_UP_WINDOWS`].
+const PROBE_UP_WINDOWS_MAX: u32 = 48;
+/// Probe-up step divisor: +1/8 (+12.5 %) of the current rate. Small on purpose - a probe that is
+/// wrong must cost less than the x0.7 back-off it triggers (and it re-uses the same cooldown).
+const PROBE_UP_STEP_DIV: u32 = 8;
 /// Decode-recovery KEYFRAME asks in one window at/above which the window is bad: the decoder
 /// asked for a fresh picture twice inside 750 ms — it is being overdriven (or repeatedly
 /// wedged), whatever loss_ppm says. This is the signal the RX-9070 field trace exposed: 14
@@ -189,6 +207,15 @@ pub(crate) struct BitrateController {
     last_change: Option<Instant>,
     /// Requests since the last ack — reaching [`MAX_UNACKED`] disables the controller.
     unacked: u32,
+    /// A probe-up is on probation for exactly one window: the next window's verdict decides
+    /// whether the probe interval resets ([`PROBE_UP_WINDOWS`]) or doubles ([`PROBE_UP_WINDOWS_MAX`]).
+    probe_pending: bool,
+    /// Current clean-window bar for the next probe-up. Starts at [`PROBE_UP_WINDOWS`] and doubles
+    /// per failed probe, so an unreachable rate is retried less and less often.
+    probe_interval_windows: u32,
+    /// The rate the first (highest) descent left, i.e. the highest rate congestion has rejected in
+    /// this session. The probe-up may climb back toward it (never past it) after a clean run.
+    descent_from_kbps: u32,
 }
 
 impl BitrateController {
@@ -215,6 +242,9 @@ impl BitrateController {
             clean_windows: 0,
             last_change: None,
             unacked: 0,
+            probe_pending: false,
+            probe_interval_windows: PROBE_UP_WINDOWS,
+            descent_from_kbps: 0,
         }
     }
 
@@ -227,6 +257,13 @@ impl BitrateController {
         if self.enabled && kbps > self.ceiling_kbps {
             self.ceiling_kbps = kbps;
         }
+    }
+
+    /// The effective climb ceiling: the measured link ceiling folded with the host-taught cap
+    /// (whichever binds first). Both climb paths and the probe-up are bounded by this.
+    fn eff_ceiling(&self) -> u32 {
+        self.ceiling_kbps
+            .min(self.host_cap_kbps.unwrap_or(u32::MAX))
     }
 
     /// The host's [`crate::quic::BitrateChanged`] ack: its clamp is authoritative for what the
@@ -383,8 +420,11 @@ impl BitrateController {
         // any blip — one window is enough. Ordinary congestion (heavy-but-recoverable loss, an
         // OWD rise, a decode-latency rise, repeated keyframe asks) still needs two consecutive
         // windows.
-        let severe = dropped > 0
-            || flushed
+        // SEVERE = the user has already seen damage from the LINK or the pipeline. A frame drop
+        // used to be severe here; that is what turned one hiccup into an immediate x0.7. It is now
+        // the QUALITY signal below - it counts toward `bad` (two-window confirmation) and can
+        // never skip it.
+        let severe = flushed
             || loss_ppm >= SEVERE_LOSS_PPM
             || decode_severe
             || encode_severe
@@ -394,7 +434,8 @@ impl BitrateController {
             || owd_bad
             || decode_bad
             || encode_bad
-            || recovery_kf >= RECOVERY_KF_BAD;
+            || recovery_kf >= RECOVERY_KF_BAD
+            || dropped >= QUALITY_DROPS_BAD;
         if bad {
             self.bad_windows += 1;
             self.clean_windows = 0;
@@ -403,6 +444,21 @@ impl BitrateController {
         } else {
             self.clean_windows += 1;
             self.bad_windows = 0;
+        }
+        // Probe-up probation: the window AFTER a probe decides whether the probe stuck. A bad
+        // follow-up doubles the next probe interval (and the normal back-off below handles the
+        // rate); a clean follow-up resets it. This is the hysteresis that stops a probe from
+        // oscillating.
+        if self.probe_pending {
+            self.probe_pending = false;
+            if bad {
+                self.probe_interval_windows = self
+                    .probe_interval_windows
+                    .saturating_mul(2)
+                    .min(PROBE_UP_WINDOWS_MAX);
+            } else {
+                self.probe_interval_windows = PROBE_UP_WINDOWS;
+            }
         }
         // The learned host cap re-probe (see [`CAP_REPROBE_WINDOWS`]): after ~60 s of clean
         // windows parked at the cap, lift it one step (+12.5 %, ceiling-bounded) so a
@@ -438,6 +494,9 @@ impl BitrateController {
         {
             let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
             self.bad_windows = 0;
+            // Remember the highest rate congestion has rejected: the probe-up may climb back
+            // toward it after a clean run, but never past it.
+            self.descent_from_kbps = self.descent_from_kbps.max(self.current_kbps);
             return self.request(next, now);
         }
         // Climbs only fire off a UTILIZED clean window (actual delivered ≥ ¾ of the target — the
@@ -447,6 +506,40 @@ impl BitrateController {
         // utilized window after a long-enough clean run climbs immediately.
         let utilized =
             actual_kbps as u64 * UTILIZATION_DEN >= self.current_kbps as u64 * UTILIZATION_NUM;
+        // PROBE-UP (the anti-deadlock). The utilization gate above demands delivered >= 3/4 of the
+        // target before any climb. After a descent the target sits ABOVE what the link delivers,
+        // so `utilized` is false in EVERY window and no climb is ever authorized - the 2026-11-16
+        // field session sat at the 5,000 kbps floor through 17 descents and 0 climbs. So: after
+        // PROBE_UP_WINDOWS consecutive clean windows, step up anyway - a deliberate, small,
+        // evidence-based experiment (+12.5 %). It is bounded by the same effective ceiling, obeys
+        // CHANGE_COOLDOWN (this code is past the `cooled` gate above), is skipped entirely on any
+        // `bad` window so real loss/latency still holds it down, and is on probation for one
+        // window (see the probation block above).
+        // Evidence gate for the probe: only climb back toward a rate congestion already forced us
+        // DOWN from ([`descent_from_kbps`]). Calm content never descended, so it can never ratchet
+        // the target up on windows that prove nothing (the settle-calm-then-spike-overload bug) -
+        // while a session that was backed off has an explicit, bounded reason to try again.
+        let probe_evidence = self.descent_from_kbps > self.current_kbps;
+        if !bad
+            && probe_evidence
+            && self.current_kbps < self.eff_ceiling()
+            && self.clean_windows >= self.probe_interval_windows
+        {
+            let ceiling = self.eff_ceiling();
+            let step = (self.current_kbps / PROBE_UP_STEP_DIV).max(1);
+            // Never probe past the rate the descent started from: that rate was rejected by
+            // evidence, so it is the ceiling of what a probe may re-explore.
+            let next = self
+                .current_kbps
+                .saturating_add(step)
+                .min(ceiling)
+                .min(self.descent_from_kbps);
+            if next > self.current_kbps {
+                self.probe_pending = true;
+                self.clean_windows = 0;
+                return self.request(next, now);
+            }
+        }
         // The effective ceiling folds in the host-taught cap: the probe measured the LINK, but
         // the host's short acks measured the ENCODER — whichever binds first is the limit.
         let eff_ceiling = self
@@ -515,6 +608,127 @@ mod tests {
             }
         }
         out
+    }
+
+    /// 2026-11-16 field ladder: the REAL loss figures from the Mac session
+    /// (`loss_ppm` 50000 in the log was 0 measured + the old fabricated `+50_000` bump), each with
+    /// the single-frame quality hit the session actually carried.
+    ///
+    /// Before the fix every one of these took an immediate SEVERE x0.7 step - 17 descents, 0
+    /// climbs, pinned at the 5,000 kbps floor. Now none may step immediately, and two consecutive
+    /// ones cost exactly ONE step.
+    #[test]
+    fn observed_field_ladder_no_longer_takes_severe_steps() {
+        let cases: [(u32, &str); 5] = [
+            (
+                0,
+                "0 measured loss (the log's 50_000 was the fabricated bump)",
+            ),
+            (4_857, "0.49%"),
+            (1_766, "0.18%"),
+            (5_586, "0.56%"),
+            (26_444, "2.6%"),
+        ];
+        for (loss_ppm, label) in cases {
+            let start = Instant::now();
+            let mut c = BitrateController::new(20_000);
+            // First window: one dropped frame plus the window's real loss. NO immediate step.
+            let first = c.on_window(
+                start,
+                1,
+                loss_ppm,
+                Some(10_000),
+                None,
+                None,
+                1_000,
+                false,
+                0,
+            );
+            assert_eq!(first, None, "{label}: must not step on one window");
+            // Second identical window: exactly one step, x0.7.
+            let second = c.on_window(
+                ticks(start, 4),
+                1,
+                loss_ppm,
+                Some(10_000),
+                None,
+                None,
+                1_000,
+                false,
+                0,
+            );
+            assert_eq!(
+                second,
+                Some(14_000),
+                "{label}: two windows cost one x0.7 step"
+            );
+        }
+    }
+
+    /// The deadlock the probe-up exists to break: after a descent the target sits far above the
+    /// delivered rate, so `utilized` can never hold - 17 descents and 0 climbs in the field. A
+    /// clean run at the descended rate must climb back even when delivery is ~7 % of target
+    /// (1 Mbit/s delivered against 14 Mbit/s asked).
+    #[test]
+    fn descend_then_clean_windows_climb_back() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000);
+        // A genuinely severe window (a jump-to-live flush) takes one immediate step.
+        let first = c.on_window(start, 0, 900_000, Some(10_000), None, None, 1_000, true, 0);
+        assert_eq!(first, Some(14_000));
+        c.on_ack(14_000);
+        let mut fired = None;
+        for i in 1..=40u32 {
+            if let Some(kbps) = c.on_window(
+                ticks(start, i * 2),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000,
+                false,
+                0,
+            ) {
+                fired = Some(kbps);
+                break;
+            }
+        }
+        assert_eq!(
+            fired,
+            Some(15_750),
+            "probe-up must climb +12.5 % from 14_000 after a clean run"
+        );
+    }
+
+    /// The probe-up must never fire while real loss continues, and the floor must still hold.
+    #[test]
+    fn probe_up_does_not_fire_while_loss_continues() {
+        let start = Instant::now();
+        let mut c = BitrateController::new(20_000);
+        let mut prev = 20_000u32;
+        for i in 0..40u32 {
+            // 1 % sustained loss (bad, not severe) with a low delivered rate.
+            if let Some(kbps) = c.on_window(
+                ticks(start, i * 2),
+                0,
+                30_000,
+                Some(10_000),
+                None,
+                None,
+                1_000,
+                false,
+                0,
+            ) {
+                assert!(
+                    kbps < prev,
+                    "under sustained loss every decision must be a decrease ({prev} -> {kbps})"
+                );
+                c.on_ack(kbps);
+                prev = kbps;
+            }
+        }
+        assert_eq!(prev, FLOOR_KBPS, "descent must stop at the floor");
     }
 
     #[test]
@@ -606,11 +820,23 @@ mod tests {
 
     #[test]
     fn severe_window_backs_off_immediately() {
-        // An unrecoverable frame (the user SAW a freeze) skips the two-window wait…
+        // >=6 % window loss on ONE window is SEVERE: immediate x0.7, no two-window wait.
+        // (A single unrecoverable frame is deliberately NOT severe any more - see
+        // `observed_field_ladder_no_longer_takes_severe_steps`.)
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             Some(14_000)
         );
         // …and so does a jump-to-live flush.
@@ -642,18 +868,48 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             Some(14_000)
         );
         c.on_ack(14_000);
         // A severe window INSIDE the 1.5 s cooldown (tick 1 = 750 ms) → held; at the cooldown
         // boundary (tick 2 = 1.5 s) it fires.
         assert_eq!(
-            c.on_window(ticks(start, 1), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 1),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 2), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 2),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             Some(9_800)
         );
     }
@@ -664,17 +920,47 @@ mod tests {
         let start = Instant::now();
         // ×0.7 of 6000 = 4200 < floor → clamped to 5000.
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             Some(5_000)
         );
         c.on_ack(5_000);
         // At the floor, further bad windows request nothing.
         assert_eq!(
-            c.on_window(ticks(start, 6), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 6),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 7), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 7),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             None
         );
     }
@@ -684,7 +970,17 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                80_000,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0
+            ),
             Some(14_000)
         );
         c.on_ack(14_000);
@@ -749,8 +1045,8 @@ mod tests {
         assert_eq!(
             c.on_window(
                 ticks(start, 2),
-                1,
                 0,
+                80_000,
                 Some(10_000),
                 None,
                 None,

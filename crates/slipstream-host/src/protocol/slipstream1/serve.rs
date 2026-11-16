@@ -777,6 +777,12 @@ pub(super) async fn serve_session(
     // stages ride the same per-session trace; resizes write their totals into the shared slot.
     let bringup_dp = bringup.clone();
     let resize_ms_dp = resize_ms.clone();
+    // See `SessionContext::abandoned`: flipped below if the stream thread has to be abandoned so it
+    // can never submit against a torn-down capture. Hoisted above the `spawn_blocking` so BOTH the
+    // closure (which puts a clone in the session context) and the outer `tokio::select!` (which
+    // flips it on a wedged teardown) can reach the same flag.
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let abandoned_watch = abandoned.clone();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
             // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
@@ -838,6 +844,7 @@ pub(super) async fn serve_session(
                         .expect("the Virtual source resolves a compositor during the handshake");
                     let ctx = SessionContext {
                         session,
+                        abandoned,
                         mode,
                         seconds,
                         stop: stop_stream,
@@ -922,6 +929,10 @@ pub(super) async fn serve_session(
         tokio::select! {
             joined = stream_thread => joined.context("stream thread")??,
             () = stop_overdue(&stop) => {
+                // Teardown below releases the virtual output (and with it the capture buffers).
+                // Tell the still-running thread to stop submitting before that happens — that
+                // ordering is what keeps `NvencCudaEncoder::submit` off unmapped dmabufs.
+                abandoned_watch.store(true, Ordering::SeqCst);
                 tracing::error!(
                     grace_s = STREAM_STOP_GRACE.as_secs(),
                     "stream thread has not returned since the session was stopped — abandoning it so \

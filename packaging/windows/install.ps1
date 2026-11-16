@@ -212,6 +212,30 @@ goto run
 "@
   Set-Content -Path $launcher -Value $body -Encoding ASCII
   Note $launcher
+
+  # ---------------------------------------------------------------- 4b. icon + Start Menu shortcut
+  # Windows branding lives in one place the shell understands: an .ico. The repo has no .ico, so
+  # icons\slipstream.ico is generated from the tracked web/public/favicon-mark.png (64x64) with
+  # `magick favicon-mark.png -define icon:auto-resize=256,48,32,16 icons\slipstream.ico`.
+  Step 'installing the app icon and Start Menu shortcut'
+  $iconSrc = Join-Path $PSScriptRoot 'icons\slipstream.ico'
+  $iconDst = Join-Path $InstallDir 'slipstream.ico'
+  if (Test-Path $iconSrc) {
+    Copy-Item $iconSrc $iconDst -Force
+    Note "icon: $iconDst"
+  } else {
+    Note 'no icons\slipstream.ico in this checkout — the shortcut will use the default icon'
+  }
+  $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+  New-Item -ItemType Directory -Force -Path $startMenu | Out-Null
+  $lnk = Join-Path $startMenu 'Slipstream Console.lnk'
+  $shell = New-Object -ComObject WScript.Shell
+  $sc = $shell.CreateShortcut($lnk)
+  $sc.TargetPath = "https://127.0.0.1:$WebPort/"
+  $sc.Description = 'Slipstream management console (HTTPS)'
+  if (Test-Path $iconDst) { $sc.IconLocation = "$iconDst,0" }
+  $sc.Save()
+  Note "shortcut: $lnk -> https://127.0.0.1:$WebPort/"
 }
 
 # ------------------------------------------------------------------ 5. scheduled tasks
@@ -292,5 +316,6 @@ if (-not $NoWeb) {
 }
 Write-Host ''
 Write-Host '  logs       %LOCALAPPDATA%\slipstream\logs\slipstream-web.log'
+if (-not $NoWeb) { Write-Host '  shortcut   Start Menu > Slipstream Console' }
 Write-Host '  firewall   powershell -ExecutionPolicy Bypass -File packaging\windows\firewall.ps1 -Add'
 Write-Host '  uninstall  powershell -ExecutionPolicy Bypass -File packaging\windows\uninstall.ps1'

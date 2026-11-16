@@ -43,6 +43,12 @@ final class HostAdvertTests: XCTestCase {
         XCTAssertEqual(HostAdvert(instanceName: "Kube Box", txt: ["id": "abc"]).id, "abc")
     }
 
+    func testPairValueIsTrimmedBeforeMatching() {
+        let advert = HostAdvert(instanceName: "desk", txt: ["pair": " required "])
+        XCTAssertEqual(advert.pairingPolicy, .required)
+        XCTAssertFalse(advert.allowsTofu, "pair=required must never offer the TOFU path")
+    }
+
     func testFingerprintIsTrimmedLowercasedAndNilWhenBlank() {
         let hex = String(repeating: "AB", count: 32)
         XCTAssertEqual(

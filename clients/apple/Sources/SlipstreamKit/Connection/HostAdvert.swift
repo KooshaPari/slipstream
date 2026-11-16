@@ -38,7 +38,8 @@ public struct HostAdvert: Sendable, Equatable {
         let rawFP = txt["fp"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         self.fingerprintHex = rawFP.isEmpty ? nil : rawFP.lowercased()
 
-        self.pairingPolicy = HostPairingPolicy(rawValue: txt["pair"] ?? "") ?? .unspecified
+        let pairValue = txt["pair"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.pairingPolicy = HostPairingPolicy(rawValue: pairValue) ?? .unspecified
         self.macAddresses = Self.macList(txt["mac"])
         self.osChain = sanitizeOsChain(txt["os"] ?? "")
     }

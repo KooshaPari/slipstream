@@ -2029,12 +2029,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // control task: a mid-stream adaptive bitrate change (bitrate_rx below) stores the
     // encoder-APPLIED rate, so the console, pacer and climb-refusal acks all see the truth.
     // Live session mode, same pattern (H3): a mid-stream mode switch (reconfig below) updates it so
-    // a stats capture armed after a resize registers the real mode. Seeded with the refresh the
-    // initial build actually achieved (`interval_hz`), not the request  -  KWin may cap a virtual
-    // output at 60 Hz.
+    // a stats capture armed after a resize registers the real mode. Seeded from the FIRST DELIVERED
+    // FRAME and the refresh the initial build actually achieved (`interval_hz`), never from the
+    // request: KWin may cap a virtual output at 60 Hz, and a mirrored Windows head can ignore the
+    // mode change outright (a `1920x1080@144` ask on a `2560x1440@144` panel stays at 1440p). The
+    // frame's dims are the same source of truth the encoder opened at, so this is what the client
+    // is really being sent  -  seeding from `mode` advertised a stream that did not exist.
     let live_mode = Arc::new(AtomicU64::new(pack_mode(
-        mode.width,
-        mode.height,
+        frame.width,
+        frame.height,
         interval_hz(interval),
     )));
     // One-shot force-keyframe flag driven by the management API (`POST /session/idr`, the web-console
@@ -4147,6 +4150,11 @@ fn is_permanent_build_error(chain: &str) -> bool {
         "could not find output", // KWin < 6.5.6: createVirtualOutput unsupported
         "must be a node id",     // SLIPSTREAM_GAMESCOPE_NODE not an integer
         "is it installed",       // gamescope / kscreen-doctor not on PATH
+        // The head could not hold the requested mode AND its effective mode cannot be captured
+        // (zero-sized, or capture refuses it). Deterministic on this host and per-mode: retrying the
+        // same ask eight times cannot change either answer, and a silent zero-frame session is
+        // exactly what this check exists to prevent.
+        "head mode readback",
         // 4:4:4 NVENC got a CUDA frame  -  should never happen now the Linux capturer honors gpu=false,
         // but fail fast instead of 8× retry (~90 s) rather than wedge the session if it ever recurs.
         "capture/encoder negotiation mismatch",

@@ -1102,7 +1102,7 @@ impl Drop for StopOnDrop {
 /// this to gate on the compositor being *ready* (not merely the socket existing) instead of
 /// racing it with a blind sleep. `Ok(())` = ready; `Err` = not ready / no global yet.
 pub fn probe() -> Result<()> {
-    let conn = Connection::connect_to_env()
+    let conn = connect_kwin()
         .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -1141,7 +1141,7 @@ fn run_existing(
     setup_tx: &Sender<Result<u32, String>>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let conn = Connection::connect_to_env()
+    let conn = connect_kwin()
         .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -1239,11 +1239,72 @@ fn diagnostic_socket_path(
     runtime.is_absolute().then(|| runtime.join(display))
 }
 
+/// The KWin socket path, captured once from the environment the host was started with.
+///
+/// `apply_session_env()` rewrites the process environment on every session handshake and, when
+/// detection yields `ActiveKind::None`, removes `WAYLAND_DISPLAY` outright. Every later
+/// `connect_to_env()` in that process then fails with wayland-client's catch-all `Could not find
+/// wayland compositor`, while connections opened earlier keep working - the reported "video dead,
+/// input alive" asymmetry. Pinning at startup, before any session can retarget the environment,
+/// makes the virtual-output connection independent of it.
+fn pinned_socket() -> Option<std::path::PathBuf> {
+    static SOCKET: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    SOCKET
+        .get_or_init(|| {
+            let display = std::env::var_os("WAYLAND_DISPLAY")?;
+            if display.is_empty() {
+                return None;
+            }
+            let display = std::path::PathBuf::from(display);
+            if display.is_absolute() {
+                return Some(display);
+            }
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+            Some(std::path::PathBuf::from(runtime).join(display))
+        })
+        .clone()
+}
+
+/// Pin the KWin socket now, from the environment the host was started with. Called once from the
+/// host's `serve` startup so the pin is taken before a session handshake can rewrite
+/// `WAYLAND_DISPLAY`; a no-op when the environment carries no socket.
+pub fn warm_socket() {
+    if let Some(path) = pinned_socket() {
+        // INFO on purpose: this line is the evidence that the socket was captured before any
+        // session could retarget the environment (the failure mode it prevents is silent video).
+        tracing::info!(path = %path.display(), "KWin Wayland socket pinned for the process lifetime");
+    }
+}
+
+/// Connect to the pinned KWin socket, falling back to wayland-client's own resolution when the pin
+/// is absent or no longer usable (a compositor restart re-creates its socket).
+fn connect_kwin() -> Result<Connection> {
+    if let Some(path) = pinned_socket() {
+        match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(stream) => match Connection::from_socket(stream) {
+                Ok(conn) => return Ok(conn),
+                Err(error) => tracing::warn!(path = %path.display(), %error,
+                    "KWin Wayland: pinned socket unusable - falling back to the environment"),
+            },
+            Err(error) => tracing::warn!(path = %path.display(), %error,
+                "KWin Wayland: pinned socket connect failed - falling back to the environment"),
+        }
+    }
+    Ok(Connection::connect_to_env()?)
+}
 fn connect_wayland_diagnostic() -> std::result::Result<Connection, wayland_client::ConnectError> {
     if std::env::var("WAYLAND_SOCKET").is_ok() {
         return Connection::connect_to_env();
     }
-    let Some(path) = diagnostic_socket_path(
+    // Prefer the socket pinned at host startup: session bringup clears WAYLAND_DISPLAY, which
+    // would otherwise make this connect fail for the rest of the process.
+    if let Some(path) = pinned_socket() {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
+            if let Ok(conn) = Connection::from_socket(stream) {
+                return Ok(conn);
+            }
+        }
+    }    let Some(path) = diagnostic_socket_path(
         std::env::var_os("WAYLAND_DISPLAY"),
         std::env::var_os("XDG_RUNTIME_DIR"),
     ) else {

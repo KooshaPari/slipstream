@@ -54,12 +54,45 @@ pub struct FfmpegDecoder {
     height: u32,
     frame_index: u32,
     frame_bytes: usize,
+    codec: u8,
+    /// The hwaccel actually in use, `None` for software.
+    hwaccel: Option<&'static str>,
+    /// AUs fed since (re)spawn; used to detect a hwaccel that produces no frames.
+    fed: u32,
+    /// Set once we have fallen back to software, so we never retry hwaccel in a loop.
+    fell_back: bool,
+    /// AUs fed since the last (re)spawn, kept so a fallback can replay them into the new child —
+    /// without the opening keyframe's parameter sets the replacement decodes nothing.
+    replay: Vec<Vec<u8>>,
     pub decoded: u64,
     pub eof: bool,
 }
 
+/// Windows GPU decode candidates, cheapest first. Both decode on the GPU and still hand us a
+/// CPU-mappable RGBA frame on stdout, which is what our blit needs.
+const HWACCELS: [&str; 2] = ["d3d11va", "dxva2"];
+
+/// How many AUs a hwaccel gets before we conclude it is producing nothing. The GPU path buffers
+/// more than software (a d3d11va pipe run decodes fine, it just starts later), so this is generous:
+/// ~6 s at the host's ~95 AUs/s.
+const HWACCEL_GRACE_AUS: u32 = 600;
+
 impl FfmpegDecoder {
     pub fn new(width: u32, height: u32, codec_u8: u8) -> Result<Self> {
+        let requested = std::env::var("SLIPSTREAM_FFMPEG_HWACCEL").ok();
+        let hw = match requested.as_deref() {
+            None | Some("none") | Some("software") => None,
+            Some(other) => HWACCELS.iter().copied().find(|h| *h == other),
+        };
+        Self::spawn(width, height, codec_u8, hw)
+    }
+
+    fn spawn(
+        width: u32,
+        height: u32,
+        codec_u8: u8,
+        hwaccel: Option<&'static str>,
+    ) -> Result<Self> {
         use slipstream_core::quic::{CODEC_H264, CODEC_HEVC};
         let input_fmt = match codec_u8 {
             CODEC_HEVC => "hevc",
@@ -68,24 +101,38 @@ impl FfmpegDecoder {
         };
         let exe = find_ffmpeg()?;
         let mut child = Command::new(&exe)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
+            .args({
+                let mut a: Vec<String> = Vec::new();
+                a.extend(["-hide_banner".into(), "-loglevel".into(), "error".into()]);
+                if let Some(hw) = hwaccel {
+                    a.extend(["-hwaccel".into(), hw.into()]);
+                }
                 // No `-fflags nobuffer` / `-flags low_delay` here on purpose: with them the raw
                 // HEVC demuxer reads nothing from a pipe and exits with "Output file is empty".
                 // Verified by hand on this box; the added latency is ffmpeg's normal probe buffer.
-                "-f",
-                input_fmt,
-                "-i",
-                "pipe:0",
-                "-an",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgba",
-                "pipe:1",
-            ])
+                //
+                // `-probesize`/`-analyzeduration` are cut because the default probe buffer is 5 MB:
+                // on a live stream at ~1.2 KB/AU that is ~4000 AUs (~40 s) before ffmpeg emits
+                // anything, which looked exactly like "hwaccel produces no frames". We already know
+                // the codec and the exact geometry, so there is nothing to probe for.
+                a.extend([
+                    "-probesize".into(),
+                    "32k".into(),
+                    "-analyzeduration".into(),
+                    "0".into(),
+                    "-f".into(),
+                    input_fmt.into(),
+                    "-i".into(),
+                    "pipe:0".into(),
+                    "-an".into(),
+                    "-f".into(),
+                    "rawvideo".into(),
+                    "-pix_fmt".into(),
+                    "rgba".into(),
+                    "pipe:1".into(),
+                ]);
+                a
+            })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -110,7 +157,14 @@ impl FfmpegDecoder {
                 }
             })
             .context("spawn ffmpeg reader thread")?;
-        tracing::info!(exe = %exe, codec = input_fmt, width, height, "ffmpeg decoder started");
+        tracing::info!(
+            exe = %exe,
+            codec = input_fmt,
+            width,
+            height,
+            hwaccel = hwaccel.unwrap_or("none (software)"),
+            "ffmpeg decoder started"
+        );
         Ok(Self {
             child,
             stdin,
@@ -119,6 +173,11 @@ impl FfmpegDecoder {
             height,
             frame_index: 0,
             frame_bytes,
+            codec: codec_u8,
+            hwaccel,
+            fed: 0,
+            fell_back: false,
+            replay: Vec::new(),
             decoded: 0,
             eof: false,
         })
@@ -136,11 +195,50 @@ impl FfmpegDecoder {
             si.write_all(au).context("write AU to ffmpeg")?;
             si.flush().ok();
         }
-        let mut newest = None;
-        while let Some(f) = self.try_next() {
-            newest = Some(f);
+        self.fed += 1;
+        if self.replay.len() < HWACCEL_GRACE_AUS as usize * 2 {
+            self.replay.push(au.to_vec());
         }
-        Ok(newest)
+        // A hwaccel that never produces a frame (unsupported profile, no free GPU session) must not
+        // silently look like a dead stream: fall back to software once and keep going.
+        if self.decoded == 0 && self.fed > HWACCEL_GRACE_AUS && self.hwaccel.is_some() && !self.fell_back
+        {
+            let hw = self.hwaccel;
+            self.fell_back = true;
+            let next = HWACCELS
+                .iter()
+                .copied()
+                .skip_while(|h| Some(*h) != hw)
+                .nth(1);
+            tracing::warn!(
+                from = hw.unwrap_or("none"),
+                to = next.unwrap_or("software"),
+                aus = self.fed,
+                "hwaccel produced no frames — switching and replaying"
+            );
+            if let Ok(mut d) = Self::spawn(self.width, self.height, self.codec, next) {
+                d.fell_back = next.is_none();
+                d.hwaccel = next;
+                // Replay the buffered AUs so the replacement sees the opening parameter sets.
+                let buffered = std::mem::take(&mut self.replay);
+                for au in &buffered {
+                    if let Some(si) = d.stdin.as_mut() {
+                        if si.write_all(au).is_err() {
+                            break;
+                        }
+                    }
+                }
+                d.fed = buffered.len() as u32;
+                d.replay = buffered;
+                *self = d;
+            }
+            return Ok(None);
+        }
+        // Pop one frame per AU rather than draining to the newest: newest-wins silently discards
+        // frames ffmpeg already decoded, which looks like "the decoder cannot keep up" in the
+        // counters even when it can. Software HEVC here decodes ~213 fps (measured, `-benchmark`),
+        // far above the ~98 AUs/s the host publishes, so the queue stays shallow.
+        Ok(self.try_next())
     }
 
     /// Close the input pipe and drain the frames ffmpeg still holds (end of a `--play` file).

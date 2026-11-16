@@ -53,6 +53,12 @@ if (Test-Path $InstallDir) {
   Write-Host '    (not present)'
 }
 
+$lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Slipstream Console.lnk'
+if (Test-Path $lnk) {
+  Remove-Item $lnk -Force
+  Write-Host "    removed Start Menu shortcut"
+}
+
 if ($PurgeConfig) {
   $cfg = Join-Path $env:APPDATA 'slipstream'
   Step "purging config $cfg"

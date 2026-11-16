@@ -15,6 +15,26 @@ once from an elevated PowerShell.
 | `systemd --user` units `slipstream-host` / `slipstream-web` | scheduled tasks `SlipstreamHost` / `SlipstreamWeb` (at logon, highest available) |
 | `/usr/lib/firewalld/services/*.xml`, `slipstream.ufw` | `firewall.ps1` rules (opt-in, never automatic) |
 | `apt remove slipstream-web` | `uninstall.ps1` |
+| `/usr/share/icons/hicolor/*/apps/*` | `icons\slipstream.ico` -> Start Menu shortcut |
+
+## Icons and branding
+
+Windows takes one image for an app: an `.ico` (16/32/48/256 frames). The repo ships no `.ico`; the
+only square raster is the web console's `web/public/favicon-mark.png` (64x64, tracked), so
+`icons/slipstream.ico` is generated from it:
+
+```powershell
+magick web\public\favicon-mark.png -define icon:auto-resize=256,48,32,16 packaging\windows\icons\slipstream.ico
+```
+
+The 16/32/48 frames are native resolution; the 256 frame is upscaled from 64 and is soft at that
+size. A 256+ master (or the SVG mark drawn at 1024) would fix that without changing this script.
+`install.ps1` copies the icon to `C:\Program Files\Slipstream\slipstream.ico` and points the
+`Slipstream Console` Start Menu shortcut at it.
+
+The tray icon is NOT branded: the Windows tray backend uses the shared system application icon
+(`crates/slipstream-tray/src/platform/windows.rs`, `LoadIconW`), so it renders as a generic
+Windows icon rather than the slipstream mark. That is a Rust change, out of scope here.
 
 ## Ports (identical to every Linux package)
 

@@ -1,5 +1,5 @@
-//! Decode through `ffmpeg.exe` as a child process: Annex-B access units in on stdin, raw RGBA
-//! frames out on stdout.
+//! Decode through `ffmpeg.exe` as a child process: Annex-B access units in on stdin, raw 32-bit
+//! BGRA frames out on stdout (GDI's DIB byte order, so the presenter can copy straight to screen).
 //!
 //! This exists because the two "native" options on this box do not close the loop:
 //!   * the Media Foundation HEVC MFT (see [`crate::mf`]) accepts every AU but produces no output —
@@ -9,7 +9,7 @@
 //!     have (only `ffmpeg.exe`, shipped with ImageMagick).
 //!
 //! So the child process is the thin, verifiable path: the exact same bitstream the session already
-//! receives, decoded by the ffmpeg build that is already installed, delivered as tight RGBA. The
+//! receives, decoded by the ffmpeg build that is already installed, delivered as tight BGRA (DIB order). The
 //! pipe is a real dependency and it is named in the PR: resolution order is `SLIPSTREAM_FFMPEG`,
 //! then `ffmpeg` on `PATH`, then the ImageMagick location.
 #![allow(dead_code)]
@@ -77,7 +77,7 @@ pub struct FfmpegDecoder {
 }
 
 /// Windows GPU decode candidates, cheapest first. Both decode on the GPU and still hand us a
-/// CPU-mappable RGBA frame on stdout, which is what our blit needs.
+/// CPU-mappable BGRA frame on stdout, which is what our blit needs.
 const HWACCELS: [&str; 2] = ["d3d11va", "dxva2"];
 
 /// How many AUs a hwaccel gets before we conclude it is producing nothing. The GPU path buffers
@@ -139,8 +139,10 @@ impl FfmpegDecoder {
                     "-an".into(),
                     "-f".into(),
                     "rawvideo".into(),
+                    // BGRA, not RGBA: it is what the GDI DIB wants, so nothing has to swizzle
+                    // 2 M pixels per frame on the client thread (measured ~10-70 ms/frame here).
                     "-pix_fmt".into(),
-                    "rgba".into(),
+                    "bgra".into(),
                     "pipe:1".into(),
                 ]);
                 a
@@ -152,7 +154,7 @@ impl FfmpegDecoder {
             .with_context(|| format!("spawn {exe}"))?;
         let stdin = child.stdin.take();
         let mut stdout: ChildStdout = child.stdout.take().ok_or_else(|| anyhow!("ffmpeg stdout"))?;
-        // Reader thread: one raw RGBA frame per message until ffmpeg's stdout closes.
+        // Reader thread: one raw BGRA frame per message until ffmpeg's stdout closes.
         let (tx, frames) = mpsc::sync_channel::<Vec<u8>>(QUEUE_BOUND);
         let queued = std::sync::Arc::new(AtomicUsize::new(0));
         let queued_reader = queued.clone();
@@ -283,7 +285,7 @@ impl FfmpegDecoder {
             out.push(DecodedFrame {
                 width: self.width,
                 height: self.height,
-                rgba: frame,
+                pixels: frame,
                 frame_index: self.frame_index,
                 pts_ns: 0,
             });
@@ -302,7 +304,7 @@ impl FfmpegDecoder {
                 Some(DecodedFrame {
                     width: self.width,
                     height: self.height,
-                    rgba: frame,
+                    pixels: frame,
                     frame_index: self.frame_index,
                     pts_ns: 0,
                 })

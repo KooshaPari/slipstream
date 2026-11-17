@@ -5,7 +5,7 @@
 //! H.264 resolves to the always-present `msmpeg2vdec`. No FFmpeg development SDK, no extra codec
 //! crate — the same Windows codec stack that plays these files in the OS player.
 //!
-//! It is a *synchronous* MFT: one AU in, zero or one NV12 frame out, converted here to tight RGBA
+//! It is a *synchronous* MFT: one AU in, zero or one NV12 frame out, converted here to tight BGRA
 //! (the [`DecodedFrame`] contract). Pixels on screen is the bar, not zero-copy.
 #![allow(unsafe_code)]
 
@@ -42,7 +42,7 @@ pub struct MfDecoder {
     frame_index: u32,
     /// Sample data format currently accepted by `ProcessInput`.
     input_fmt: InputFmt,
-    /// Reused RGBA output buffer (one allocation for the session, not one per frame).
+    /// Reused BGRA output buffer (one allocation for the session, not one per frame).
     scratch: Vec<u8>,
     pub decoded: u64,
     pub failed_aus: u64,
@@ -293,25 +293,26 @@ impl MfDecoder {
             return None;
         }
         let n = (self.out_w as usize) * (self.out_h as usize) * 4;
-        let mut rgba = std::mem::take(&mut self.scratch);
-        rgba.resize(n, 0);
+        let mut pixels = std::mem::take(&mut self.scratch);
+        pixels.resize(n, 0);
         unsafe {
-            nv12_to_rgba(
-                ptr, pitch, self.out_w as usize, self.out_h as usize, &mut rgba,
+            nv12_to_bgra(
+                ptr, pitch, self.out_w as usize, self.out_h as usize, &mut pixels,
             );
         }
         self.frame_index = self.frame_index.wrapping_add(1);
         Some(DecodedFrame {
             width: self.out_w,
             height: self.out_h,
-            rgba,
+            pixels,
             frame_index: self.frame_index,
             pts_ns: 0,
         })
     }
 }
 
-/// NV12 (BT.709 limited range, what the host signals for SDR) → tightly packed RGBA8.
+/// NV12 (BT.709 limited range, what the host signals for SDR) → tightly packed 32-bit BGRA, the
+/// DIB byte order the presenter expects.
 ///
 /// `pitch` is the luma scanline stride in bytes; the interleaved UV plane sits `pitch * height`
 /// bytes after the Y plane (same stride). Pure and unsafe-free at the edges: callers hand it a
@@ -320,7 +321,7 @@ impl MfDecoder {
 /// # Safety
 /// `yuv` must point at `pitch * height * 3 / 2` readable bytes, and `out` must be
 /// `width * height * 4` bytes.
-unsafe fn nv12_to_rgba(yuv: *const u8, pitch: i32, width: usize, height: usize, out: &mut [u8]) {
+unsafe fn nv12_to_bgra(yuv: *const u8, pitch: i32, width: usize, height: usize, out: &mut [u8]) {
     let stride = pitch.unsigned_abs() as usize;
     // A negative stride means the buffer is bottom-up: its first row is the image's last row.
     let base = if pitch < 0 {
@@ -343,9 +344,9 @@ unsafe fn nv12_to_rgba(yuv: *const u8, pitch: i32, width: usize, height: usize, 
             let g = (298 * c - 100 * u - 208 * v + 128) >> 8;
             let b = (298 * c + 516 * u + 128) >> 8;
             let o = (y * width + x) * 4;
-            out[o] = r.clamp(0, 255) as u8;
+            out[o] = b.clamp(0, 255) as u8;
             out[o + 1] = g.clamp(0, 255) as u8;
-            out[o + 2] = b.clamp(0, 255) as u8;
+            out[o + 2] = r.clamp(0, 255) as u8;
             out[o + 3] = 255;
         }
     }
@@ -370,14 +371,14 @@ mod tests {
         // 2x2 black (Y=16, UV=128) then 2x2 white (Y=235).
         let mut nv12 = vec![16u8; 4];
         nv12.extend_from_slice(&[128, 128]);
-        let mut rgba = vec![0u8; 2 * 2 * 4];
-        unsafe { nv12_to_rgba(nv12.as_ptr(), 2, 2, 2, &mut rgba) };
-        assert_eq!(&rgba[..4], &[0, 0, 0, 255]);
+        let mut pixels = vec![0u8; 2 * 2 * 4];
+        unsafe { nv12_to_bgra(nv12.as_ptr(), 2, 2, 2, &mut pixels) };
+        assert_eq!(&pixels[..4], &[0, 0, 0, 255]);
 
         let mut nv12 = vec![235u8; 4];
         nv12.extend_from_slice(&[128, 128]);
-        unsafe { nv12_to_rgba(nv12.as_ptr(), 2, 2, 2, &mut rgba) };
-        assert_eq!(&rgba[..4], &[255, 255, 255, 255]);
+        unsafe { nv12_to_bgra(nv12.as_ptr(), 2, 2, 2, &mut pixels) };
+        assert_eq!(&pixels[..4], &[255, 255, 255, 255]);
     }
 
     #[test]
@@ -390,10 +391,10 @@ mod tests {
             }
         }
         buf.extend_from_slice(&[128, 128, 128, 128]);
-        let mut rgba = vec![0u8; 2 * 2 * 4];
-        unsafe { nv12_to_rgba(buf.as_ptr(), 4, 2, 2, &mut rgba) };
-        assert_eq!(&rgba[..4], &[255, 255, 255, 255]);
-        assert_eq!(&rgba[4..8], &[255, 255, 255, 255]);
+        let mut pixels = vec![0u8; 2 * 2 * 4];
+        unsafe { nv12_to_bgra(buf.as_ptr(), 4, 2, 2, &mut pixels) };
+        assert_eq!(&pixels[..4], &[255, 255, 255, 255]);
+        assert_eq!(&pixels[4..8], &[255, 255, 255, 255]);
     }
 }
 

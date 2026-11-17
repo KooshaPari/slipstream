@@ -89,6 +89,12 @@ pub struct StatsSample {
     /// Cumulative extra PipeWire buffers discarded while selecting the newest buffer.
     #[serde(default)]
     pub capture_buffers_drained: u64,
+    /// Wall-clock microseconds the capture producer's per-frame path took for the most recent
+    /// produced frame (WGC: staging copy + `Map` + row materialisation). The per-frame COST:
+    /// read it next to `capture_frames_arrived` to separate a source delivery ceiling from a
+    /// per-frame cost ceiling. Zero means no frame has been produced yet.
+    #[serde(default)]
+    pub capture_producer_us: u32,
     /// Negotiated source modifier, or zero for linear/unknown.
     #[serde(default)]
     pub capture_modifier: u64,
@@ -567,6 +573,10 @@ mod tests {
             capture_age_us: 0,
             capture_age_over_limit: false,
             capture_backend: String::new(),
+            capture_frames_arrived: 0,
+            capture_try_next_ok: 0,
+            capture_try_next_empty: 0,
+            capture_producer_us: 0,
             capture_frames_published: 0,
             capture_frames_overwritten: 0,
             capture_buffers_drained: 0,

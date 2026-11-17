@@ -113,6 +113,16 @@ public final class VideoDecoder: @unchecked Sendable {
     /// depth / HDR). Read inside `createSessionLocked` under `lock`.
     private var chroma444 = false
 
+    /// Why the last `VTDecompressionSessionCreate` failed, if it did.
+    ///
+    /// Exists so that "black screen at 0 fps" can be told apart from "no frames arrived": until
+    /// 2026-11-17 a refused session returned `false` and nothing anywhere recorded the `OSStatus`
+    /// or the decode contract, so a field report could not distinguish a decoder that rejected the
+    /// stream from a stream that never came. Written on the VT/decoder thread; read for logging and
+    /// diagnostics only, so the unsynchronised static is acceptable (last writer wins).
+    public private(set) static var lastCreateStatus: OSStatus = noErr
+    public private(set) static var lastCreateContract: String?
+
     /// The negotiated codec (`connection.videoCodec`), set once at session start. Drives the
     /// bitstream framing (H.264/HEVC NAL parsing vs AV1 OBU repack). Read under `lock`.
     private var codec: VideoCodec = .hevc
@@ -272,14 +282,62 @@ public final class VideoDecoder: @unchecked Sendable {
             ? [kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true] as CFDictionary
             : nil
         var newSession: VTDecompressionSession?
-        let status = VTDecompressionSessionCreate(
+        var status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: newFormat,
             decoderSpecification: spec,
             imageBufferAttributes: imageAttrs as CFDictionary,
             outputCallback: &callback,
             decompressionSessionOut: &newSession)
-        guard status == noErr, let newSession else { return false }
+        if status != noErr || newSession == nil {
+            // Silent failure is the worst possible outcome here: the client advertises 4:4:4 on the
+            // strength of a 256x256 probe, and a real 2560x1440@120 hardware-required session can
+            // still refuse to be created. Before 2026-11-17 that produced a black screen at 0 fps
+            // with nothing anywhere saying "frames arrived and were rejected", which is
+            // indistinguishable from "no frames arrived" and cost hours of host-side investigation.
+            //
+            // So: always log the decode contract and the OSStatus. Then, only behind an explicit
+            // hatch, retry the same 4:4:4 format with the hardware requirement removed — not as a
+            // shipping path (software 4:4:4 is far too slow for real time) but as a one-flag
+            // diagnostic that separates "this GPU cannot create the session" from "the bitstream
+            // itself is undecodable" on the actual machine.
+            let subType = CMFormatDescriptionGetMediaSubType(newFormat)
+            let dims = CMVideoFormatDescriptionGetDimensions(newFormat)
+            let profile = CMFormatDescriptionGetExtension(
+                newFormat, extensionKey: kCMFormatDescriptionExtension_ProfileLevel)
+            Self.lastCreateStatus = status
+            Self.lastCreateContract = "subtype=\(subType) dims=\(dims.width)x\(dims.height) "
+                + "chroma444=\(chroma444) hdr=\(hdr) pixelFormat=\(pixelFormat) "
+                + "hardwareRequired=\(spec != nil) profile=\(String(describing: profile))"
+            NSLog("[slipstream] VTDecompressionSessionCreate failed status=%d contract=%@",
+                  Int(status), Self.lastCreateContract ?? "")
+
+            let allowSoftware = ProcessInfo.processInfo
+                .environment["SLIPSTREAM_ALLOW_SOFTWARE_444"] == "1"
+            if chroma444, allowSoftware {
+                var softSession: VTDecompressionSession?
+                let softStatus = VTDecompressionSessionCreate(
+                    allocator: kCFAllocatorDefault,
+                    formatDescription: newFormat,
+                    decoderSpecification: nil,
+                    imageBufferAttributes: imageAttrs as CFDictionary,
+                    outputCallback: &callback,
+                    decompressionSessionOut: &softSession)
+                if softStatus == noErr, let softSession {
+                    NSLog("[slipstream] 4:4:4 hardware decode refused (%d); SOFTWARE 4:4:4 session "
+                          + "created because SLIPSTREAM_ALLOW_SOFTWARE_444=1 — expect it to be far "
+                          + "too slow; this is a diagnostic, not a fix", Int(status))
+                    VTSessionSetProperty(
+                        softSession, key: kVTDecompressionPropertyKey_RealTime,
+                        value: kCFBooleanTrue)
+                    session = softSession
+                    format = newFormat
+                    return true
+                }
+                NSLog("[slipstream] software 4:4:4 fallback also failed status=%d", Int(softStatus))
+            }
+            return false
+        }
         // Real-time hint: schedule this session for live-streaming latency rather than
         // throughput/efficiency. Best-effort — decoders that don't support the property
         // return an error, which is fine to ignore.

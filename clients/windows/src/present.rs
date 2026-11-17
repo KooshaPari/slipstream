@@ -1,4 +1,5 @@
-//! The present seam. Two traits — [`Decoder`] (bitstream AU → RGBA) and [`Presenter`] (RGBA →
+//! The present seam. Two traits — [`Decoder`] (bitstream AU → 32-bit BGRA) and [`Presenter`]
+//! (BGRA →
 //! screen) — so the Windows shell can land in stages without the session loop changing shape:
 //! today `PassthroughDecoder` counts AUs and `ConsolePresenter` reports them; the D3D11VA decode
 //! backend and the winit/softbuffer window attach at the same two points (see PR.md).
@@ -14,13 +15,15 @@
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    /// Tightly packed RGBA8, `width * height * 4` bytes.
-    pub rgba: Vec<u8>,
+    /// Tightly packed 32-bit pixels in GDI's 32-bpp `BI_RGB` byte order (B, G, R, X), which is also
+    /// what `ffmpeg -pix_fmt bgra` emits: `width * height * 4` bytes, row 0 first. Choosing this
+    /// order at the decoder means the presenter never has to swizzle 2 M pixels per frame.
+    pub pixels: Vec<u8>,
     pub frame_index: u32,
     pub pts_ns: u64,
 }
 
-/// Bitstream access unit in, RGBA out.
+/// Bitstream access unit in, 32-bit BGRA out.
 pub trait Decoder {
     /// `codec` is the host's negotiated `CODEC_*` byte (`welcome.codec`). `None` means "this
     /// backend cannot decode this codec" — the session keeps receiving, it just presents nothing.
@@ -36,6 +39,11 @@ pub trait Decoder {
 pub trait Presenter {
     fn present(&mut self, frame: Option<&DecodedFrame>);
     fn status(&mut self, message: &str);
+    /// Diagnostic split of the last present's cost: `(convert_ns, blit_ns)`. Backends that do
+    /// neither report zeros.
+    fn stage_ns(&self) -> (u64, u64) {
+        (0, 0)
+    }
     /// True once the user closed the window (the session loop treats it as "stop").
     fn closed(&self) -> bool {
         false
@@ -84,7 +92,7 @@ impl TestPattern {
     /// stalled.
     pub fn render(&mut self) -> DecodedFrame {
         let (w, h) = (self.width as usize, self.height as usize);
-        let mut rgba = vec![0u8; w * h * 4];
+        let mut pixels = vec![0u8; w * h * 4];
         let bar = (w / 9).max(1);
         let moving = (self.phase as usize * bar) % w;
         for y in 0..h {
@@ -102,17 +110,18 @@ impl TestPattern {
                 } else {
                     (r, g, b)
                 };
-                rgba[i] = r.saturating_sub(tint / 4);
-                rgba[i + 1] = g.saturating_sub(tint / 4);
-                rgba[i + 2] = b.saturating_sub(tint / 4);
-                rgba[i + 3] = 255;
+                // B, G, R, X — the DIB byte order.
+                pixels[i] = b.saturating_sub(tint / 4);
+                pixels[i + 1] = g.saturating_sub(tint / 4);
+                pixels[i + 2] = r.saturating_sub(tint / 4);
+                pixels[i + 3] = 255;
             }
         }
         self.phase = self.phase.wrapping_add(1);
         DecodedFrame {
             width: self.width,
             height: self.height,
-            rgba,
+            pixels,
             frame_index: self.phase,
             pts_ns: 0,
         }
@@ -141,7 +150,7 @@ impl Presenter for ConsolePresenter {
     fn present(&mut self, frame: Option<&DecodedFrame>) {
         if let Some(f) = frame {
             self.frames += 1;
-            self.bytes += f.rgba.len() as u64;
+            self.bytes += f.pixels.len() as u64;
         }
         if self.last_log.elapsed() >= std::time::Duration::from_secs(2) {
             tracing::info!(
@@ -172,12 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_is_rgba_and_opaque() {
+    fn test_pattern_is_bgra_and_opaque() {
         let f = TestPattern::new(64, 32).render();
         assert_eq!(f.width, 64);
         assert_eq!(f.height, 32);
-        assert_eq!(f.rgba.len(), 64 * 32 * 4);
-        assert!(f.rgba.chunks_exact(4).all(|px| px[3] == 255));
+        assert_eq!(f.pixels.len(), 64 * 32 * 4);
+        assert!(f.pixels.chunks_exact(4).all(|px| px[3] == 255));
     }
 
     #[test]
@@ -185,14 +194,14 @@ mod tests {
         let mut p = TestPattern::new(90, 10);
         let a = p.render();
         let b = p.render();
-        assert_ne!(a.rgba, b.rgba, "the moving bar must change position");
+        assert_ne!(a.pixels, b.pixels, "the moving bar must change position");
         assert_eq!(b.frame_index, a.frame_index.wrapping_add(1));
     }
 
     #[test]
     fn tiny_and_degenerate_modes_do_not_panic() {
         let f = TestPattern::new(0, 0).render();
-        assert_eq!(f.rgba.len(), 2 * 2 * 4);
+        assert_eq!(f.pixels.len(), 2 * 2 * 4);
     }
 
     #[test]

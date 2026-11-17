@@ -53,6 +53,19 @@ struct PipeStats {
     queue_max: usize,
     /// Milliseconds blocked writing an AU because the queue was full.
     blocked_ms: u64,
+    /// Diagnostic stage totals for the current window (nanoseconds) and the number of frames
+    /// they were accumulated over.
+    poll_ns: u64,
+    spin_ns: u64,
+    spins: u64,
+    decode_ns: u64,
+    present_ns: u64,
+    convert_ns: u64,
+    blit_ns: u64,
+    /// Last cumulative values of the presenter's own counters (they are cumulative).
+    seen_convert_ns: u64,
+    seen_blit_ns: u64,
+    timed: u64,
 }
 
 impl PipeStats {
@@ -62,6 +75,26 @@ impl PipeStats {
 
     fn note_decoded(&mut self) {
         self.decoded += 1;
+    }
+
+    /// Fold one loop iteration's stage costs in. `presenter_stage` is the presenter's cumulative
+    /// `(convert_ns, blit_ns)`.
+    fn note_costs(
+        &mut self,
+        poll_ns: u64,
+        spin_ns: u64,
+        decode_ns: u64,
+        present_ns: u64,
+        presenter_stage: (u64, u64),
+    ) {
+        self.poll_ns += poll_ns;
+        self.spin_ns += spin_ns;
+        self.decode_ns += decode_ns;
+        self.present_ns += present_ns;
+        self.convert_ns += presenter_stage.0.saturating_sub(self.seen_convert_ns);
+        self.blit_ns += presenter_stage.1.saturating_sub(self.seen_blit_ns);
+        self.seen_convert_ns = presenter_stage.0;
+        self.seen_blit_ns = presenter_stage.1;
     }
 
     fn note_presented(&mut self) {
@@ -103,6 +136,30 @@ impl PipeStats {
             blocked_ms = self.blocked_ms,
             "pipeline received -> decoded -> presented"
         );
+        // Stage split for the same window, in milliseconds per frame. `poll` is the whole
+        // `Session::poll_frame` call (including its NoFrame sleep, also shown as `spin`),
+        // `decode` is the decoder call (ffmpeg stdin write + queue pop), `present` the whole
+        // presenter call, and `convert`/`blit` the presenter's own two stages.
+        let n = self.timed.max(1) as f64; // per-frame denominator
+        tracing::info!(
+            frames = self.timed,
+            poll_ms = format!("{:.2}", self.poll_ns as f64 / 1e6 / n),
+            spin_ms = format!("{:.2}", self.spin_ns as f64 / 1e6 / n),
+            spins = self.spins,
+            decode_ms = format!("{:.2}", self.decode_ns as f64 / 1e6 / n),
+            present_ms = format!("{:.2}", self.present_ns as f64 / 1e6 / n),
+            convert_ms = format!("{:.2}", self.convert_ns as f64 / 1e6 / n),
+            blit_ms = format!("{:.2}", self.blit_ns as f64 / 1e6 / n),
+            "stage cost per frame"
+        );
+        self.poll_ns = 0;
+        self.spin_ns = 0;
+        self.spins = 0;
+        self.decode_ns = 0;
+        self.present_ns = 0;
+        self.convert_ns = 0;
+        self.blit_ns = 0;
+        self.timed = 0;
         self.window = Some(now);
     }
 }
@@ -162,7 +219,14 @@ fn play(args: &Args) -> Result<()> {
     let started = Instant::now();
     let mut presented = 0u64;
     let mut stats = PipeStats::default();
-    let frame_gap = Duration::from_micros(1_000_000 / args.mode.refresh_hz.max(1) as u64);
+    // Paced to the nominal refresh so the run is watchable; `SLIPSTREAM_PLAY_UNPACED=1` runs the
+    // decode+present stack as fast as it can, which is how its cost (not the pacer's) is measured.
+    let unpaced = std::env::var_os("SLIPSTREAM_PLAY_UNPACED").is_some();
+    let frame_gap = if unpaced {
+        Duration::ZERO
+    } else {
+        Duration::from_micros(1_000_000 / args.mode.refresh_hz.max(1) as u64)
+    };
     for au in &aus {
         if presenter.closed() {
             break;
@@ -173,7 +237,12 @@ fn play(args: &Args) -> Result<()> {
             }
         }
         stats.note_au();
-        match decoder.decode_one(au)? {
+        let t_dec = Instant::now();
+        let decoded = decoder.decode_one(au)?;
+        let decode_ns = t_dec.elapsed().as_nanos() as u64;
+        let t_pres = Instant::now();
+        stats.timed += 1;
+        match decoded {
             Some(f) => {
                 stats.note_decoded();
                 presented += 1;
@@ -182,9 +251,12 @@ fn play(args: &Args) -> Result<()> {
             }
             None => presenter.present(None),
         }
+        let present_ns = t_pres.elapsed().as_nanos() as u64;
+        stats.note_costs(0, 0, decode_ns, present_ns, presenter.stage_ns());
         stats.tick();
-        // Pace to the nominal refresh so the run is watchable and the counter is time-bounded.
-        std::thread::sleep(frame_gap);
+        if !frame_gap.is_zero() {
+            std::thread::sleep(frame_gap);
+        }
     }
     // Drain what the decoder still holds once its input closes.
     for f in decoder.finish() {
@@ -464,7 +536,11 @@ async fn stream_async(args: Args) -> Result<()> {
             if expected > 0 && frames >= expected as u64 {
                 break;
             }
-            match session.poll_frame() {
+            let t_poll = Instant::now();
+            let polled = session.poll_frame();
+            let poll_ns = t_poll.elapsed().as_nanos() as u64;
+            let mut spin_ns = 0u64;
+            match polled {
                 Ok(frame) => {
                     last_rx = Instant::now();
                     if frame.flags & FLAG_PROBE as u32 != 0 {
@@ -476,20 +552,39 @@ async fn stream_async(args: Args) -> Result<()> {
                     if let Some(s) = sink.as_mut() {
                         s.write_all(&frame.data).context("write AU")?;
                     }
+                    let t_dec = Instant::now();
                     let decoded = decoder.decode(&frame.data, codec);
+                    let decode_ns = t_dec.elapsed().as_nanos() as u64;
                     if decoded.is_some() {
                         stats.note_decoded();
                         presented += 1;
                         stats.note_presented();
                     }
+                    let t_pres = Instant::now();
                     presenter.present(decoded.as_ref());
+                    let present_ns = t_pres.elapsed().as_nanos() as u64;
                     let (qm, bm) = decoder.flow_stats();
                     stats.queue_max = qm;
                     stats.blocked_ms = bm;
+                    stats.timed += 1;
+                    stats.note_costs(
+                        poll_ns,
+                        spin_ns,
+                        decode_ns,
+                        present_ns,
+                        presenter.stage_ns(),
+                    );
                     stats.tick();
                 }
                 Err(SlipstreamError::NoFrame) => {
+                    let t_spin = Instant::now();
                     std::thread::sleep(Duration::from_micros(300));
+                    spin_ns = t_spin.elapsed().as_nanos() as u64;
+                    stats.spins += 1;
+                    // Poll+spin without a frame still costs the same wall time; attribute it to
+                    // the next frame's window so the split stays per-frame.
+                    stats.poll_ns += poll_ns;
+                    stats.spin_ns += spin_ns;
                 }
                 Err(e) => return Err(anyhow!("poll_frame: {e:?}")),
             }

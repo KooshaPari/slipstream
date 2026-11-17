@@ -922,6 +922,14 @@ pub(crate) async fn session(args: Args) -> Result<()> {
         let mut enc_us_v: Vec<u64> = Vec::new();
         let mut xfer_us_v: Vec<u64> = Vec::new();
         let mut pace_us_v: Vec<u64> = Vec::new();
+        // L-16 capture-cadence instrument: 1 ms buckets over DELIVERED video-frame inter-arrival
+        // gaps. Index 0..=50 are gaps of [0,1) .. [50,∞) ms, so a compositor-paced stream shows a
+        // spike at 6-7 ms (144 Hz) while a ~45/s cap shows a cluster near 22 ms. Additive only.
+        const ARRIVAL_BUCKETS: usize = 51;
+        let mut arr_hist = [0u64; ARRIVAL_BUCKETS];
+        let mut arr_total = 0u64;
+        let mut arr_sum_us = 0u64;
+        let mut last_arrival: Option<std::time::Instant> = None;
         let mut last_rx = std::time::Instant::now();
         let started = std::time::Instant::now();
         // Stream-duration cap: `--seconds N`, else the 120s default. Ending the loop here reaches the
@@ -978,6 +986,16 @@ pub(crate) async fn session(args: Args) -> Result<()> {
                     if frame.flags & FLAG_PROBE as u32 != 0 {
                         continue;
                     }
+                    // Inter-arrival gap of consecutive delivered video frames (see ARRIVAL_BUCKETS).
+                    let now_arr = std::time::Instant::now();
+                    if let Some(prev) = last_arrival {
+                        let d_us = now_arr.duration_since(prev).as_micros() as u64;
+                        arr_total += 1;
+                        arr_sum_us += d_us;
+                        let idx = ((d_us / 1000) as usize).min(ARRIVAL_BUCKETS - 1);
+                        arr_hist[idx] += 1;
+                    }
+                    last_arrival = Some(now_arr);
                     bytes += frame.data.len() as u64;
                     // capture→received: the frame's own reassembly-completion stamp in the
                     // host clock (received_ns + offset) minus the host's capture pts. offset
@@ -1101,6 +1119,32 @@ pub(crate) async fn session(args: Args) -> Result<()> {
             "slipstream/1 stream complete (capture→received latency; skew_corrected=true ⇒ \
              cross-machine valid, false ⇒ same-host clock)"
         );
+        if arr_total > 0 {
+            // Compact 1 ms-bucket dump: only non-empty buckets, oldest-first. Index 50 is ">=50 ms".
+            let mut buckets = String::new();
+            for (i, c) in arr_hist.iter().enumerate() {
+                if *c > 0 {
+                    if !buckets.is_empty() {
+                        buckets.push(',');
+                    }
+                    buckets.push_str(&format!("{i}ms:{c}"));
+                }
+            }
+            let p = |lo: usize, hi: usize| -> u64 { arr_hist[lo..=hi].iter().sum() };
+            tracing::info!(
+                arrivals = arr_total,
+                mean_gap_us = arr_sum_us / arr_total,
+                under_2ms = p(0, 1),
+                ms_2_6 = p(2, 6),
+                ms_6_8 = p(6, 8),
+                ms_8_16 = p(8, 16),
+                ms_16_24 = p(16, 24),
+                ms_24_50 = p(24, 49),
+                ge_50ms = arr_hist[50],
+                "frame inter-arrival histogram (1 ms buckets over delivered video frames)"
+            );
+            tracing::info!(hist_1ms = %buckets, "frame inter-arrival buckets (index = ms)");
+        }
         if !host_us_v.is_empty() {
             // The host/network split from the per-AU 0xCF timings (design/stats-unification.md
             // Phase 2): host = the host's own capture→sent, network = capture→received minus it.

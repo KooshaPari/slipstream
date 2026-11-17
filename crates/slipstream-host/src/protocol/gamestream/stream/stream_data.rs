@@ -836,6 +836,7 @@ pub(super) fn stream_body(
                     capture_frames_arrived: capture_telemetry.frames_arrived,
                     capture_try_next_ok: capture_telemetry.try_next_ok,
                     capture_try_next_empty: capture_telemetry.try_next_empty,
+                    capture_producer_us: capture_telemetry.producer_us,
                     capture_buffers_drained: capture_telemetry.buffers_drained,
                     capture_modifier: capture_telemetry.modifier,
                     capture_width: capture_telemetry.width,

@@ -43,6 +43,12 @@ pub struct CaptureTelemetry {
     pub try_next_empty: u64,
     /// Extra PipeWire buffers discarded while selecting the newest buffer in a callback.
     pub buffers_drained: u64,
+    /// Wall-clock microseconds the producer's frame-production path took to turn one source
+    /// frame into a published frame (WGC: staging copy + `Map` + row materialisation). This is
+    /// the per-frame COST of producing a frame, from the most recent produced frame; compare it
+    /// with the arrival rate to tell "the source delivered few frames" apart from "each frame
+    /// cost us ~40 ms". Zero means no frame has been produced yet on this backend.
+    pub producer_us: u32,
     /// Negotiated frame width and height. Zero means negotiation has not completed.
     pub width: u32,
     pub height: u32,

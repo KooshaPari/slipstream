@@ -325,6 +325,8 @@ fn dxgi_worker(
             }
             continue;
         }
+        // Producer-cost probe: staging copy + `Map` + row materialisation for this frame.
+        let produced_at = std::time::Instant::now();
         let frame = (|| -> Result<CapturedFrame> {
             let texture: ID3D11Texture2D = resource
                 .as_ref()
@@ -364,7 +366,12 @@ fn dxgi_worker(
             Ok(out)
         })();
         match frame {
-            Ok(f) => slot.publish(f),
+            Ok(f) => {
+                slot.note_producer_cost(
+                    produced_at.elapsed().as_micros().min(u32::MAX as u128) as u32
+                );
+                slot.publish(f)
+            }
             Err(e) => {
                 // The closure releases only on success (its release is the last step
                 // before `Ok`), so an `Err` means the frame is still held — release it

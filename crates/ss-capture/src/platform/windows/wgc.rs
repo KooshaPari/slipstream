@@ -295,8 +295,18 @@ fn wgc_worker(
         let Some(frame) = pending else {
             continue;
         };
+        // Producer-cost probe: the whole per-frame production path (surface → texture →
+        // staging `CopyResource` → `Map` → row materialisation) is the thing that decides how
+        // many frames this worker can emit. Timing it here separates a source delivery ceiling
+        // from a per-frame cost ceiling.
+        let produced_at = std::time::Instant::now();
         match materialize_frame(&frame, &device, &ctx, &mut staging) {
-            Ok(captured) => slot.publish(captured),
+            Ok(captured) => {
+                slot.note_producer_cost(
+                    produced_at.elapsed().as_micros().min(u32::MAX as u128) as u32
+                );
+                slot.publish(captured);
+            }
             Err(e) => {
                 slot.fail(format!("{e:#}"));
                 break;

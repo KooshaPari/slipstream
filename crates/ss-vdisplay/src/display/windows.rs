@@ -134,7 +134,26 @@ impl VirtualDisplay for WindowsMirrorDisplay {
                 to_hz = mode.refresh_hz,
                 "windows: setting head to the client mode (restored on session end)"
             );
-            set_mode(&self.device, mode.width, mode.height, mode.refresh_hz)?;
+            // A refusal is not fatal. Clients ask for their own window geometry — a MacBook at
+            // 1512x982@120, for instance — and a TV or fixed-mode panel simply has no such mode.
+            // Propagating the error aborts the pipeline build, and the client sees a black screen
+            // with no frames (observed 2026-11-17: `display mode 1512x982@120 refused for
+            // \\.\DISPLAY1 (test: DISP_CHANGE(-2))`, session dropped after one attempt).
+            //
+            // The readback below already exists to make the head's *actual* mode the source of
+            // truth, precisely because a panel may ignore or refuse an ask. So the honest path is
+            // to leave the head where it is, warn, and let the readback pick the real dimensions;
+            // the client scales to its window. Changing the operator's display to a mode they did
+            // not ask for would be worse than streaming at the mode it is already in.
+            if let Err(e) = set_mode(&self.device, mode.width, mode.height, mode.refresh_hz) {
+                tracing::warn!(
+                    device = %self.device,
+                    requested = %fmt_mode((mode.width, mode.height, mode.refresh_hz)),
+                    error = %format!("{e:#}"),
+                    "windows: the head refused the client mode  -  leaving it as it is and \
+                     capturing where the display actually is (the client scales)"
+                );
+            }
         } else {
             tracing::info!(
                 device = %self.device,

@@ -1908,12 +1908,31 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         mut cur_display_gen,
         built_bitrate,
     ) = pipe;
+    // The geometry the CURRENT encoder is open at. `build_pipeline` opens it at the first
+    // delivered frame's dims, so this starts there and is updated by every in-place encoder
+    // rebuild. The loop re-reads it against each fresh frame: capture, encoder and the
+    // client's mode slot must stay ONE value (see the geometry guard on a fresh frame).
+    let mut enc_dims = (frame.width, frame.height);
     let capture_diag = Arc::new(SharedCaptureTelemetry::default());
     capture_diag.update(capturer.backend_name(), capturer.telemetry());
     // The encoder may have opened at a re-resolved rate (a mirrored head delivering a size this
     // session never negotiated). Adopt it before anything downstream reads `bitrate_kbps`.
     adopt_built_bitrate(&mut bitrate_kbps, built_bitrate, &live_bitrate);
 
+    // Bring-up can also land on an effective mode the Welcome never promised (a mirrored Windows
+    // head that refused the ask, a compositor that capped the refresh). `build_pipeline` opened
+    // the encoder at the frame's real dims, so the client's mode slot is the only side still
+    // holding the request. Correct it here, before the first AU, so capture, encoder and what the
+    // client believes are ONE value for the whole life of the session.
+    {
+        let actual = delivered_mode(frame.width, frame.height, interval);
+        if actual != mode {
+            let _ = reconfig_result_tx.send(Reconfigured {
+                accepted: true,
+                mode: actual,
+            });
+        }
+    }
     // Capture is live, so launch the requested title into the active session. Gamescope may have
     // nested the command already, in which case launching again would start it twice. A failure
     // leaves the stream running on the current desktop.
@@ -2358,6 +2377,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         capturer = new_cap;
                         enc = new_enc;
                         frame = new_frame;
+                        enc_dims = (frame.width, frame.height);
                         interval = new_interval;
                         cur_node_id = new_node_id;
                         cur_display_gen = new_gen;
@@ -2449,6 +2469,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         cur_display_gen,
                         built_bitrate,
                     ) = next_pipe;
+                    enc_dims = (frame.width, frame.height);
                     // H4: the old display's lease drop above is indistinguishable from a
                     // disconnect to the keep-alive machinery  -  under linger/forever policies
                     // every resize would ACCUMULATE kept monitors at stale modes. Retire the
@@ -2790,6 +2811,95 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             Ok(Some(f)) => {
                 frame = f;
                 diag_new += 1;
+                // ONE geometry, re-read from the live source. `build_pipeline` makes capture,
+                // encoder and the Welcome agree at build time, but a Windows mirror is
+                // display-wide and last-writer-wins across sessions: another session's
+                // create()/restore (or the operator) can re-program the head under this live
+                // session. WGC follows the head on the very next frame while the encoder stays
+                // at its open size, and NVENC then rejects every submit ("frame WxH does not
+                // match the open session WxH") and the stream dies black with zero frames. So
+                // the invariant is enforced continuously, not assumed: when the delivered size
+                // differs from the encoder's open size, reopen the encoder at the delivered
+                // size and correct the client's mode slot - exactly what a mode switch does.
+                if (frame.width, frame.height) != enc_dims {
+                    let (old_w, old_h) = enc_dims;
+                    let new_kbps = if bitrate_auto {
+                        resolve_bitrate_kbps_for(
+                            plan.codec,
+                            0,
+                            &delivered_mode(frame.width, frame.height, interval),
+                            plan.chroma,
+                            bit_depth,
+                        )
+                    } else {
+                        bitrate_kbps
+                    };
+                    let reopened = crate::encode::open_video(
+                        plan.codec,
+                        frame.format,
+                        frame.width,
+                        frame.height,
+                        interval_hz(interval),
+                        new_kbps as u64 * 1000,
+                        frame.is_cuda(),
+                        bit_depth,
+                        plan.chroma,
+                        plan.cursor_blend,
+                        plan.max_slices,
+                    );
+                    match reopened {
+                        Ok(mut new_enc) => {
+                            let applied_kbps = new_enc
+                                .applied_bitrate_bps()
+                                .map(|b| (b / 1000) as u32)
+                                .filter(|&k| k > 0)
+                                .unwrap_or(new_kbps);
+                            if let Some(c) = plan.wire_chunk {
+                                new_enc.set_wire_chunking(c);
+                            }
+                            new_enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+                            new_enc.request_keyframe();
+                            enc = new_enc;
+                            enc_dims = (frame.width, frame.height);
+                            bitrate_kbps = applied_kbps;
+                            live_bitrate.store(applied_kbps, Ordering::Relaxed);
+                            // Tell the client the truth: the mode it decodes is now this one.
+                            let actual = delivered_mode(frame.width, frame.height, interval);
+                            cur_mode = actual;
+                            live_mode.store(
+                                pack_mode(actual.width, actual.height, actual.refresh_hz),
+                                Ordering::Relaxed,
+                            );
+                            let _ = reconfig_result_tx.send(Reconfigured {
+                                accepted: true,
+                                mode: actual,
+                            });
+                            // The owed AUs died with the old encoder.
+                            inflight.clear();
+                            last_au_at = std::time::Instant::now();
+                            encoder_resets = 0;
+                            last_forced_idr = Some(std::time::Instant::now());
+                            behind_score = 0;
+                            depth_frames = 0;
+                            ahead_run = 0;
+                            tracing::warn!(
+                                from_w = old_w,
+                                from_h = old_h,
+                                to_w = frame.width,
+                                to_h = frame.height,
+                                hz = actual.refresh_hz,
+                                "capture geometry changed under the live session  -  encoder \
+                                 reopened at the delivered size and the client's mode corrected"
+                            );
+                        }
+                        Err(e) => {
+                            // No usable geometry agreement: fail loudly rather than feed the
+                            // encoder a frame it will reject forever.
+                            return Err(e)
+                                .context("reopen encoder for the changed capture geometry");
+                        }
+                    }
+                }
                 // Phase-locked capture: hold the fresh frame so its ARRIVAL at the client lands a
                 // constant small lead before the client's display latch (§3 hold-then-submit; the
                 // capture slot is newest-wins, so a long hold samples fresher content next tick,

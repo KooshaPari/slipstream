@@ -160,7 +160,66 @@ use encode::Codec;
 use spike::{Options, Source};
 use std::path::PathBuf;
 
+/// Windows timer resolution, held for the lifetime of the process.
+///
+/// The video pacer (`send_pacing.rs`) deliberately spreads a frame over several chunks with
+/// sub-millisecond sleeps (`sleep_floor` defaults to 500 µs), and the capture loop sleeps toward
+/// cadence deadlines measured in single-digit milliseconds. Windows only honours sleeps at the
+/// current system timer resolution, and an unpromoted process gets ~15.6 ms.
+///
+/// Measured on this host: `Thread.Sleep(5)` returns after **15.44 ms** with the default resolution
+/// and **5.33 ms** after `timeBeginPeriod(1)` — a 10.4 ms overshoot that applies to every short
+/// sleep in the pipeline. With clients reporting a 13-14 ms p50 residual (`xfer`, derived as
+/// `host_total − queue − encode − pace`) that is invariant to frame rate and frame size, timer
+/// quantisation is the leading explanation for it.
+///
+/// Dropping the guard restores the previous resolution.
+#[cfg(target_os = "windows")]
+mod timer_resolution {
+    // Declared directly against `winmm` rather than through the `windows` crate: the pinned 0.58
+    // surface does not expose these two symbols under `Win32::Media::Multimedia`, and two externs
+    // are cheaper than a feature audit across every crate in the workspace.
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn timeBeginPeriod(period_ms: u32) -> u32;
+        fn timeEndPeriod(period_ms: u32) -> u32;
+    }
+
+    /// Best-effort: a failure is reported but never fatal, because a coarse timer degrades
+    /// smoothness rather than correctness.
+    pub(crate) struct TimerResolution;
+
+    impl TimerResolution {
+        pub(crate) fn acquire() -> Self {
+            // 1 ms is the finest period the API accepts.
+            let rc = unsafe { timeBeginPeriod(1) };
+            if rc != 0 {
+                tracing::warn!(
+                    timer_period_ms = 1,
+                    rc,
+                    "timeBeginPeriod failed; short sleeps will quantise to the system tick (~15.6 ms)"
+                );
+            } else {
+                tracing::debug!(timer_period_ms = 1, "raised Windows timer resolution");
+            }
+            Self
+        }
+    }
+
+    impl Drop for TimerResolution {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = timeEndPeriod(1);
+            }
+        }
+    }
+}
+
 fn main() {
+    // Must outlive every thread that paces or sleeps; held for the whole of `main`.
+    #[cfg(target_os = "windows")]
+    let _timer_resolution = timer_resolution::TimerResolution::acquire();
+
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     // Logs go to stderr so stdout stays machine-readable (`slipstream-host openapi > spec.json`).

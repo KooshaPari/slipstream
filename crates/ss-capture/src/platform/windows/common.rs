@@ -127,6 +127,8 @@ struct SlotState {
     /// Pool drain attempts that returned a frame / returned nothing.
     try_ok: u64,
     try_empty: u64,
+    /// Microseconds the most recent produced frame spent in the production path.
+    producer_us: u32,
     width: u32,
     height: u32,
     /// Terminal failure: the worker thread died; every consumer call after this is an `Err`.
@@ -144,6 +146,7 @@ impl FrameSlot {
                 arrived: 0,
                 try_ok: 0,
                 try_empty: 0,
+                producer_us: 0,
                 width: 0,
                 height: 0,
                 dead: None,
@@ -189,6 +192,14 @@ impl FrameSlot {
         } else {
             st.try_empty += 1;
         }
+    }
+
+    /// Record the wall-clock microseconds the production path spent on one frame.
+    pub fn note_producer_cost(&self, us: u32) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .producer_us = us;
     }
 
     /// Take the freshest frame, if any.
@@ -265,6 +276,7 @@ impl FrameSlot {
             frames_arrived: st.arrived,
             try_next_ok: st.try_ok,
             try_next_empty: st.try_empty,
+            producer_us: st.producer_us,
             width: st.width,
             height: st.height,
             zerocopy: false,
@@ -285,17 +297,30 @@ pub fn materialize_bgra_frame(
     height: u32,
 ) -> CapturedFrame {
     let (w, h) = (width as usize, height as usize);
-    let mut buf = vec![0u8; w * h * 4];
+    let row_bytes = w * 4;
+    let total = row_bytes * h;
+    // Reserve the exact footprint but do NOT zero-fill it: the copy below writes every byte of
+    // the frame, so the old `vec![0u8; w * h * 4]` zeroed 14.7 MB per frame (2560x1440x4). `len`
+    // stays zero until that copy has filled the whole allocation, so uninitialised bytes are
+    // never exposed as initialised `u8`s.
+    let mut buf: Vec<u8> = Vec::with_capacity(total);
     // SAFETY: `data` points to a live mapped staging texture with at least `row_pitch` bytes
-    // per row for `height` rows (guaranteed by the D3D11 `Map` contract while mapped); each
-    // row copies `w * 4 <= row_pitch` bytes into the disjoint `buf` row. The caller unmaps
-    // after this returns; nothing outlives the call.
+    // per row for `height` rows (guaranteed by the D3D11 `Map` contract while mapped), and
+    // `row_pitch >= row_bytes`, so the writes stay inside `buf`'s `total`-byte allocation; the
+    // contiguous fast path copies exactly `total` bytes. Every byte is written before
+    // `set_len(total)` marks the Vec initialised, so no uninitialised byte is ever readable.
+    // The caller unmaps after this returns; nothing outlives the call.
     unsafe {
-        for y in 0..h {
-            let src = data.add(y * row_pitch);
-            let dst = buf.as_mut_ptr().add(y * w * 4);
-            std::ptr::copy_nonoverlapping(src, dst, w * 4);
+        let dst = buf.as_mut_ptr();
+        if row_pitch == row_bytes {
+            std::ptr::copy_nonoverlapping(data, dst, total);
+        } else {
+            for y in 0..h {
+                let src = data.add(y * row_pitch);
+                std::ptr::copy_nonoverlapping(src, dst.add(y * row_bytes), row_bytes);
+            }
         }
+        buf.set_len(total);
     }
     CapturedFrame {
         width,
@@ -396,6 +421,15 @@ mod tests {
         slot.fail("boom".into());
         assert!(!slot.is_alive());
         assert!(slot.take_blocking().is_err());
+    }
+
+    #[test]
+    fn materialize_contiguous_pitch_copies_the_whole_frame() {
+        // Unpadded mapping: the fast path copies `w * h * 4` bytes in one shot.
+        let mapped: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let f = materialize_bgra_frame(mapped.as_ptr(), 8, 2, 2);
+        let FramePayload::Cpu(buf) = f.payload;
+        assert_eq!(buf, mapped);
     }
 
     #[test]

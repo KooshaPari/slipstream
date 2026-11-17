@@ -19,19 +19,37 @@ mod connect;
 mod discovery;
 mod ff;
 mod identity;
-mod input;
 mod mf;
 mod present;
-mod session;
 mod window;
 
 use anyhow::{anyhow, Context, Result};
 use args::{hex, Action, Args, Target};
-use present::Presenter;
+use connect::{Admission, Machine};
+use present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use session::{run_stream, SessionConfig, SessionOutcome};
+use slipstream_core::config::Role;
+use slipstream_core::packet::FLAG_PROBE;
+use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
+use slipstream_core::transport::UdpTransport;
+use slipstream_core::{CompositorPref, Session, SlipstreamError};
+
+/// How long the client tolerates post-handshake silence before it says WHY it is still waiting.
+/// An unpaired device's first knock is parked host-side for delegated approval (host:
+/// `PENDING_APPROVAL_WAIT = 180 s`, `crates/slipstream-host/src/protocol/slipstream1.rs:757`),
+/// and the host holds the connection open and silent for that whole window before it sends
+/// `Welcome`. Silence past this point is therefore expected for a first pairing, not a fault.
+const FIRST_OFFER_WAIT: Duration = Duration::from_secs(15);
+
+/// Extra wait after [`FIRST_OFFER_WAIT`], bringing the total ceiling to 210 s. Strictly greater
+/// than the host's 180 s park plus room for the approval round trip, so a human who sees the
+/// console row and clicks Approve is admitted on the SAME connection with no reconnect. A
+/// genuinely wedged capture/encode pipeline still fails, just later (the Mac client's shipped
+/// equivalent is 185 s, `SessionModel.swift:365`).
+const APPROVAL_WAIT: Duration = Duration::from_secs(195);
 
 /// Pipeline counters, printed once a second: AUs received → decoded → presented, plus the interval
 /// between consecutive presented frames. The interval distribution is the point: "steady low fps"
@@ -205,13 +223,9 @@ fn play(args: &Args) -> Result<()> {
         args.preferred_codec
     };
     let mut decoder = ff::FfmpegDecoder::new(args.mode.width, args.mode.height, codec)?;
-    let mut presenter = window::GdiPresenter::new(
-        &format!("slipstream — {path}"),
-        args.mode.width,
-        args.mode.height,
-        None,
-    )
-    .context("create window")?;
+    let mut presenter =
+        window::GdiPresenter::new(&format!("slipstream — {path}"), args.mode.width, args.mode.height)
+            .context("create window")?;
     let aus = split_aus(&data);
     if aus.is_empty() {
         return Err(anyhow!("{path}: no Annex-B access units found"));
@@ -292,7 +306,9 @@ fn split_aus(data: &[u8]) -> Vec<Vec<u8>> {
             i += 1;
         }
     }
-    let nal_type = |body: usize| -> u8 { data.get(body).map(|b| (b >> 1) & 0x3F).unwrap_or(0) };
+    let nal_type = |body: usize| -> u8 {
+        data.get(body).map(|b| (b >> 1) & 0x3F).unwrap_or(0)
+    };
     let auds: Vec<usize> = (0..starts.len())
         .filter(|&k| nal_type(starts[k].1) == 35)
         .collect();
@@ -364,31 +380,332 @@ fn stream(args: Args) -> Result<()> {
 
 async fn stream_async(args: Args) -> Result<()> {
     let remote = resolve(&target_of(&args)?)?;
-    let headless = std::env::var_os("SLIPSTREAM_WINDOWS_HEADLESS").is_some();
-    let (input, input_rx) = if headless {
-        (None, None)
-    } else {
-        let (sender, rx) = input::InputSender::channel();
-        (Some(sender), Some(rx))
-    };
-    match run_stream(SessionConfig {
-        remote,
-        args,
-        input,
-        input_rx,
-    })
-    .await?
-    {
-        SessionOutcome::ZeroFrames => {
-            tracing::warn!(
-                "zero frames: the host accepted the session but published none \
-                 (a wedged host capture thread does this — it is a host-side bug, not a client one)"
-            );
-            std::process::exit(3);
+    let (cert, key) = identity::load_or_create()?;
+    let (ep, observed) =
+        endpoint::client_pinned_with_identity(args.pin, Some((cert.as_str(), key.as_str())));
+    let ep = ep.map_err(|e| anyhow!("QUIC client endpoint: {e}"))?;
+    let conn = ep
+        .connect(remote, "slipstream")
+        .context("connect")?
+        .await
+        .context("QUIC handshake (a pin mismatch fails here)")?;
+    match (args.pin, *observed.lock().unwrap()) {
+        (Some(_), _) => tracing::info!(%remote, "connected — host fingerprint pinned"),
+        (None, Some(fp)) => tracing::info!(
+            %remote,
+            fingerprint = %hex(&fp),
+            "connected (trust-on-first-use) — pass --pin to verify this host from now on"
+        ),
+        (None, None) => tracing::info!(%remote, "connected"),
+    }
+
+    let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
+    let mut recv = io::MsgReader::new(recv);
+    io::write_msg(
+        &mut send,
+        &Hello {
+            abi_version: slipstream_core::WIRE_VERSION,
+            mode: args.mode,
+            compositor: CompositorPref::Auto,
+            gamepad: slipstream_core::config::GamepadPref::Auto,
+            bitrate_kbps: args.bitrate_kbps,
+            name: Some(args.name.clone()),
+            launch: None,
+            // No decode backend yet: advertise no codec capability bits rather than claiming
+            // 10-bit/4:4:4 we cannot render.
+            video_caps: 0,
+            audio_channels: args.audio_channels,
+            video_codecs: slipstream_core::quic::CODEC_H264
+                | slipstream_core::quic::CODEC_HEVC
+                | slipstream_core::quic::CODEC_AV1,
+            preferred_codec: args.preferred_codec,
+            display_hdr: slipstream_core::client::display_hdr_env_override(),
+            client_caps: 0,
         }
-        SessionOutcome::Ended
-        | SessionOutcome::ConnectFailed
-        | SessionOutcome::WindowClosed
-        | SessionOutcome::TimedOut => Ok(()),
+        .encode(),
+    )
+    .await?;
+    // Tell the truth while waiting: 15 s of silence usually means the host parked this device for
+    // approval, so name that likely cause and keep waiting past the host's own park window. A
+    // genuinely stalled capture/encode pipeline still surfaces the same diagnosis, just later.
+    let welcome_msg = match tokio::time::timeout(FIRST_OFFER_WAIT, recv.read_msg()).await {
+        Ok(msg) => msg?,
+        Err(_) => {
+            tracing::warn!(
+                host = %remote,
+                wait_secs = APPROVAL_WAIT.as_secs(),
+                "no session offer after 15 s - the host has parked this device for approval; \
+                 approve it in the host console - still waiting"
+            );
+            tokio::time::timeout(APPROVAL_WAIT, recv.read_msg())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "host {remote} accepted the QUIC handshake but sent no session offer \
+                         within 210 s (the host's capture/encode pipeline is stalled, or this \
+                        device's pairing request was never approved in the host console)"
+                    )
+                })??
+        }
+    };
+    let welcome =
+        Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
+    tracing::info!(
+        mode = ?welcome.mode,
+        frames = welcome.frames,
+        codec = welcome.codec,
+        bit_depth = welcome.bit_depth,
+        encrypt = welcome.encrypt,
+        udp_port = welcome.udp_port,
+        "session offer"
+    );
+
+    // Admission, before a single byte of video is consumed.
+    let mut machine = Machine::new();
+    machine
+        .connect(&remote.to_string())
+        .map_err(|e| anyhow!(e))?;
+    let admission = if args.pin.is_some() {
+        Admission::Stream
+    } else {
+        // Manual `ip:port` entry has no advert to consult, so the user decides by confirming the
+        // fingerprint the host just presented (the probe's TOFU behaviour).
+        Admission::ConfirmTrust
+    };
+    let host_label = remote.to_string();
+    match machine.admitted(admission) {
+        connect::Transition::Stay(_, msg) => tracing::info!(%msg, "admission"),
+        connect::Transition::DropAndIdle(msg) => {
+            conn.close(0u32.into(), b"refused");
+            return Err(anyhow!(msg));
+        }
+    }
+
+    // Reserve our data-plane port, then let the host start.
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let udp_port = probe.local_addr()?.port();
+    drop(probe);
+    io::write_msg(&mut send, &Start { client_udp_port: udp_port }.encode()).await?;
+
+    let host_udp = SocketAddr::new(remote.ip(), welcome.udp_port);
+    let cfg = welcome.session_config(Role::Client);
+    let expected = welcome.frames;
+    let codec = welcome.codec;
+    let mode = welcome.mode;
+    let record = args.record.clone();
+    let seconds = args.seconds;
+
+    // The host may refuse the mode we asked for (a head that cannot honour it) and, before the
+    // first AU, send `Reconfigured { accepted: true, mode: <actually live> }` to correct our mode
+    // slot. Nothing downstream may keep assuming the *requested* size: the decoder, the DIB and
+    // the window all have to follow what is actually delivered, or every frame is the wrong size
+    // and the session sits on a black window. This task keeps reading the control stream so that
+    // correction is not lost (it is otherwise a one-shot read of `Welcome`).
+    let delivered: std::sync::Arc<std::sync::Mutex<Option<slipstream_core::config::Mode>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let delivered = delivered.clone();
+        let mut ctl = recv;
+        tokio::spawn(async move {
+            while let Ok(msg) = ctl.read_msg().await {
+                match slipstream_core::quic::Reconfigured::decode(&msg) {
+                    Ok(rc) => {
+                        tracing::info!(
+                            accepted = rc.accepted,
+                            width = rc.mode.width,
+                            height = rc.mode.height,
+                            refresh_hz = rc.mode.refresh_hz,
+                            "host corrected the session mode"
+                        );
+                        *delivered.lock().unwrap() = Some(rc.mode);
+                    }
+                    Err(_) => tracing::debug!(len = msg.len(), "control message (not a mode ack)"),
+                }
+            }
+        });
+    }
+
+    let started = Instant::now();
+    let (frames, bytes, _aus, presented) =
+        tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, u64)> {
+        let transport = UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
+            .context("bind data plane")?;
+        let mut session =
+            Session::new(cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;
+        let mut sink = match &record {
+            Some(p) => Some(std::io::BufWriter::new(
+                std::fs::File::create(p).with_context(|| format!("create {p}"))?,
+            )),
+            None => None,
+        };
+
+        // Decode + present. `SLIPSTREAM_WINDOWS_HEADLESS=1` keeps the old counting path (CI, and
+        // `--record`-only runs). Otherwise: Media Foundation → Win32 window. A window that cannot
+        // be created is reported and the session still runs headless — never a silent black frame.
+        let headless = std::env::var_os("SLIPSTREAM_WINDOWS_HEADLESS").is_some();
+        let (mut decoder, mut presenter): (Box<dyn Decoder>, Box<dyn Presenter>) = if headless {
+            (
+                Box::new(PassthroughDecoder::default()),
+                Box::new(ConsolePresenter::default()),
+            )
+        } else {
+            // Default decode is the `ffmpeg.exe` child (see [`ff`]); the Media Foundation MFT is
+            // opt-in because the Microsoft HEVC decoder is an async DXVA MFT that needs a D3D11
+            // device manager before it emits anything.
+            let use_mf = std::env::var_os("SLIPSTREAM_WINDOWS_DECODER_MF").is_some();
+            let dec: Box<dyn Decoder> = if use_mf {
+                Box::new(mf::MfDecoder::new(mode.width, mode.height, codec)?)
+            } else {
+                Box::new(ff::FfmpegDecoder::new(mode.width, mode.height, codec)?)
+            };
+            let pres: Box<dyn Presenter> = match window::GdiPresenter::new(
+                &format!("slipstream — {host_label}"),
+                mode.width,
+                mode.height,
+            ) {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "no window — presenting headless");
+                    Box::new(ConsolePresenter::default())
+                }
+            };
+            (dec, pres)
+        };
+        presenter.status(&format!("receiving from {host_label}"));
+        let (mut frames, mut bytes) = (0u64, 0u64);
+        let mut presented = 0u64;
+        let mut stats = PipeStats::default();
+        let mut last_rx = Instant::now();
+        // The geometry we are currently sized for; starts at what the Welcome promised and moves
+        // to whatever the host says it is actually delivering.
+        let mut sized = (mode.width, mode.height);
+        loop {
+            if presenter.closed() {
+                tracing::info!("window closed — ending the session");
+                break;
+            }
+            if let Some(m) = delivered.lock().unwrap().take() {
+                if (m.width, m.height) != sized {
+                    tracing::info!(
+                        from_w = sized.0,
+                        from_h = sized.1,
+                        to_w = m.width,
+                        to_h = m.height,
+                        refresh_hz = m.refresh_hz,
+                        "adopting the delivered mode (requested mode was refused)"
+                    );
+                    sized = (m.width, m.height);
+                    decoder.resize(m.width, m.height);
+                    presenter.resize(m.width, m.height);
+                }
+            }
+            if let Some(secs) = seconds {
+                if started.elapsed() > Duration::from_secs(secs) {
+                    break;
+                }
+            } else if last_rx.elapsed() > Duration::from_secs(45) {
+                tracing::warn!("no frames for 45 s — ending the session");
+                break;
+            }
+            if expected > 0 && frames >= expected as u64 {
+                break;
+            }
+            let t_poll = Instant::now();
+            let polled = session.poll_frame();
+            let poll_ns = t_poll.elapsed().as_nanos() as u64;
+            let mut spin_ns = 0u64;
+            match polled {
+                Ok(frame) => {
+                    last_rx = Instant::now();
+                    if frame.flags & FLAG_PROBE as u32 != 0 {
+                        continue; // speed-test filler, not video
+                    }
+                    frames += 1;
+                    stats.note_au();
+                    bytes += frame.data.len() as u64;
+                    if let Some(s) = sink.as_mut() {
+                        s.write_all(&frame.data).context("write AU")?;
+                    }
+                    let t_dec = Instant::now();
+                    let decoded = decoder.decode(&frame.data, codec);
+                    let decode_ns = t_dec.elapsed().as_nanos() as u64;
+                    if decoded.is_some() {
+                        stats.note_decoded();
+                        presented += 1;
+                        stats.note_presented();
+                    }
+                    let t_pres = Instant::now();
+                    presenter.present(decoded.as_ref());
+                    let present_ns = t_pres.elapsed().as_nanos() as u64;
+                    let (qm, bm) = decoder.flow_stats();
+                    stats.queue_max = qm;
+                    stats.blocked_ms = bm;
+                    stats.timed += 1;
+                    stats.note_costs(
+                        poll_ns,
+                        spin_ns,
+                        decode_ns,
+                        present_ns,
+                        presenter.stage_ns(),
+                    );
+                    stats.tick();
+                }
+                Err(SlipstreamError::NoFrame) => {
+                    let t_spin = Instant::now();
+                    std::thread::sleep(Duration::from_micros(300));
+                    spin_ns = t_spin.elapsed().as_nanos() as u64;
+                    stats.spins += 1;
+                    // Poll+spin without a frame still costs the same wall time; attribute it to
+                    // the next frame's window so the split stays per-frame.
+                    stats.poll_ns += poll_ns;
+                    stats.spin_ns += spin_ns;
+                }
+                Err(e) => return Err(anyhow!("poll_frame: {e:?}")),
+            }
+        }
+        if let Some(mut s) = sink {
+            s.flush().ok();
+        }
+        Ok((frames, bytes, 0, presented))
+    })
+    .await??;
+
+    conn.close(0u32.into(), b"quit");
+    println!(
+        "session ended: received {frames} video AUs, presented {presented} frames, {bytes} bytes in {:.1}s ({:.1} fps presented)",
+        started.elapsed().as_secs_f64(),
+        presented as f64 / started.elapsed().as_secs_f64().max(0.001),
+    );
+    if frames == 0 {
+        tracing::warn!(
+            "zero frames: the host accepted the session but published none \
+             (a wedged host capture thread does this — it is a host-side bug, not a client one)"
+        );
+        std::process::exit(3);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{APPROVAL_WAIT, FIRST_OFFER_WAIT};
+    use std::time::Duration;
+
+    /// Mirrors the host's park window (`PENDING_APPROVAL_WAIT`,
+    /// `crates/slipstream-host/src/protocol/slipstream1.rs:757`). If the host widens its park, the
+    /// client ceiling must move with it or a first pairing becomes unapprovable by hand again.
+    const HOST_PENDING_APPROVAL_WAIT: Duration = Duration::from_secs(180);
+
+    #[test]
+    fn offer_wait_outlasts_the_hosts_pairing_park() {
+        let total = FIRST_OFFER_WAIT + APPROVAL_WAIT;
+        assert!(
+            total > HOST_PENDING_APPROVAL_WAIT + Duration::from_secs(15),
+            "client gives up at {total:?}, not comfortably past the host's {HOST_PENDING_APPROVAL_WAIT:?} park"
+        );
+        assert!(
+            FIRST_OFFER_WAIT < APPROVAL_WAIT,
+            "the narrated wait must be shorter than the extra grace it announces"
+        );
     }
 }

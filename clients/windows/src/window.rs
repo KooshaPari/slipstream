@@ -297,6 +297,49 @@ impl Presenter for GdiPresenter {
         tracing::info!(%message, "status");
     }
 
+    fn resize(&mut self, width: u32, height: u32) {
+        let (width, height) = (width.max(2), height.max(2));
+        if width == self.width && height == self.height {
+            return;
+        }
+        // Reallocate the DIB at the delivered size and make the client area match it, so the
+        // 1:1 blit path survives the resize instead of silently refusing every frame.
+        let bmi = Self::bitmap_info(width, height);
+        let mut bits = std::ptr::null_mut();
+        let dib = match unsafe { CreateDIBSection(self.hdc_mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) } {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not resize the DIB — keeping the old surface");
+                return;
+            }
+        };
+        let old = unsafe { SelectObject(self.hdc_mem, HGDIOBJ(dib.0)) };
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.dib.0));
+        }
+        self.dib = dib;
+        self.bits = bits;
+        self._old = old;
+        self.width = width;
+        self.height = height;
+        let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+        let mut outer = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
+        unsafe { AdjustWindowRect(&mut outer, style, false) }.ok();
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                outer.right - outer.left,
+                outer.bottom - outer.top,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+            );
+        }
+        tracing::info!(width, height, "window resized to the delivered mode");
+    }
+
     fn stage_ns(&self) -> (u64, u64) {
         (self.convert_ns, self.blit_ns)
     }

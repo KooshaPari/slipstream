@@ -28,6 +28,9 @@ pub trait Decoder {
     /// `codec` is the host's negotiated `CODEC_*` byte (`welcome.codec`). `None` means "this
     /// backend cannot decode this codec" — the session keeps receiving, it just presents nothing.
     fn decode(&mut self, au: &[u8], codec: u8) -> Option<DecodedFrame>;
+    /// The delivered geometry changed (the host corrected the requested mode to what it can
+    /// actually encode). Backends that size their output from it rebuild here.
+    fn resize(&mut self, _width: u32, _height: u32) {}
     /// Flow-control instrumentation: `(max frame-queue depth seen, milliseconds blocked writing an
     /// AU)`. Backends without a queue report zeros.
     fn flow_stats(&self) -> (usize, u64) {
@@ -44,6 +47,10 @@ pub trait Presenter {
     fn stage_ns(&self) -> (u64, u64) {
         (0, 0)
     }
+    /// The delivered geometry changed (the host corrected the requested mode to what it can
+    /// actually encode). Backends that own a surface reallocate it here; the next frame is
+    /// expected at the new size.
+    fn resize(&mut self, _width: u32, _height: u32) {}
     /// True once the user closed the window (the session loop treats it as "stop").
     fn closed(&self) -> bool {
         false

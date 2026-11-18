@@ -469,6 +469,36 @@ async fn stream_async(args: Args) -> Result<()> {
     let record = args.record.clone();
     let seconds = args.seconds;
 
+    // The host may refuse the mode we asked for (a head that cannot honour it) and, before the
+    // first AU, send `Reconfigured { accepted: true, mode: <actually live> }` to correct our mode
+    // slot. Nothing downstream may keep assuming the *requested* size: the decoder, the DIB and
+    // the window all have to follow what is actually delivered, or every frame is the wrong size
+    // and the session sits on a black window. This task keeps reading the control stream so that
+    // correction is not lost (it is otherwise a one-shot read of `Welcome`).
+    let delivered: std::sync::Arc<std::sync::Mutex<Option<slipstream_core::config::Mode>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let delivered = delivered.clone();
+        let mut ctl = recv;
+        tokio::spawn(async move {
+            while let Ok(msg) = ctl.read_msg().await {
+                match slipstream_core::quic::Reconfigured::decode(&msg) {
+                    Ok(rc) => {
+                        tracing::info!(
+                            accepted = rc.accepted,
+                            width = rc.mode.width,
+                            height = rc.mode.height,
+                            refresh_hz = rc.mode.refresh_hz,
+                            "host corrected the session mode"
+                        );
+                        *delivered.lock().unwrap() = Some(rc.mode);
+                    }
+                    Err(_) => tracing::debug!(len = msg.len(), "control message (not a mode ack)"),
+                }
+            }
+        });
+    }
+
     let started = Instant::now();
     let (frames, bytes, _aus, presented) =
         tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, u64)> {
@@ -520,10 +550,28 @@ async fn stream_async(args: Args) -> Result<()> {
         let mut presented = 0u64;
         let mut stats = PipeStats::default();
         let mut last_rx = Instant::now();
+        // The geometry we are currently sized for; starts at what the Welcome promised and moves
+        // to whatever the host says it is actually delivering.
+        let mut sized = (mode.width, mode.height);
         loop {
             if presenter.closed() {
                 tracing::info!("window closed — ending the session");
                 break;
+            }
+            if let Some(m) = delivered.lock().unwrap().take() {
+                if (m.width, m.height) != sized {
+                    tracing::info!(
+                        from_w = sized.0,
+                        from_h = sized.1,
+                        to_w = m.width,
+                        to_h = m.height,
+                        refresh_hz = m.refresh_hz,
+                        "adopting the delivered mode (requested mode was refused)"
+                    );
+                    sized = (m.width, m.height);
+                    decoder.resize(m.width, m.height);
+                    presenter.resize(m.width, m.height);
+                }
             }
             if let Some(secs) = seconds {
                 if started.elapsed() > Duration::from_secs(secs) {

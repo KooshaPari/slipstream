@@ -298,16 +298,36 @@ fn default_bus(env: &EnvProbe, runtime: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn is_kwin_compositor_comm(comm: &str, cmdline: Option<&[u8]>) -> bool {
+    // NixOS wraps KWin in `kwin_wayland_wrapper`; Linux `comm` truncates that name to
+    // `.kwin_wayland-w` or `.kwin_wayland_w`. PipeWire has also observed `.kwin_wayland-wrapped`.
+    // Those names are not proof on their own, so require argv0 to name a real KWin executable.
+    const WRAPPED_COMMS: &[&str] = &[
+        ".kwin_wayland-w",
+        ".kwin_wayland_w",
+        ".kwin_wayland-wrapped",
+    ];
     match comm {
         "kwin_wayland" => true,
-        ".kwin_wayland-w" => {
-            cmdline
-                .and_then(|args| args.split(|b| *b == 0).next())
-                .and_then(|arg| arg.rsplit(|b| *b == b'/').next())
-                == Some(b"kwin_wayland".as_slice())
-        }
+        ".kwin_wayland-w" => argv0_is(cmdline, &[b"kwin_wayland", b"kwin_wayland-wrapped"]),
+        ".kwin_wayland_w" => argv0_is(cmdline, &[b"kwin_wayland_wrapper"]),
+        ".kwin_wayland-wrapped" => argv0_is(
+            cmdline,
+            &[
+                b"kwin_wayland",
+                b"kwin_wayland_wrapper",
+                b"kwin_wayland-wrapped",
+            ],
+        ),
         _ => false,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn argv0_is(cmdline: Option<&[u8]>, names: &[&[u8]]) -> bool {
+    cmdline
+        .and_then(|args| args.split(|b| *b == 0).next())
+        .and_then(|arg| arg.rsplit(|b| *b == b'/').next())
+        .is_some_and(|arg| names.contains(&arg))
 }
 
 /// Detect the graphical session live for our uid right now (cheap, side-effect-free: a `/proc`
@@ -325,8 +345,9 @@ pub fn detect_active_session() -> ActiveSession {
     let dbus = default_bus(&env, &xdg_runtime_dir);
 
     // Process probe: the running graphical compositor of THIS uid decides the kind. Priority lets
-    // a real desktop (kwin/gnome/sway) win over a leftover gamescope child. comm names mirror the
-    // `pkill -x` discipline (exact, ≤15 chars so untruncated).
+    // a real desktop (kwin/gnome/sway) win over a leftover gamescope child. `comm` is a truncated
+    // Linux task name: NixOS can report `.kwin_wayland-w`, `.kwin_wayland_w`, or
+    // `.kwin_wayland-wrapped`, so those cases are confirmed against argv0 and inode below.
     let mut kind = ActiveKind::None;
     let mut best = 0u8;
     // The winning compositor's PID — kept so a same-kind compositor RESTART (a new PID) bumps the
@@ -350,7 +371,8 @@ pub fn detect_active_session() -> ActiveSession {
                 continue;
             };
             let comm = comm.trim();
-            let kwin_cmdline = (comm == ".kwin_wayland-w")
+            let kwin_cmdline = WRAPPED_COMMS
+                .contains(&comm)
                 .then(|| {
                     let args = std::fs::read(pid_path.join("cmdline")).ok()?;
                     let after = std::fs::metadata(&pid_path).ok()?;
@@ -734,6 +756,18 @@ mod tests {
             ".kwin_wayland-w",
             Some(b"/usr/bin/kwin_wayland\0")
         ));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland_w",
+            Some(b"/nix/store/abc/kwin_wayland_wrapper\0--xwayland\0")
+        ));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-wrapped",
+            Some(b"/nix/store/abc/kwin_wayland-wrapped\0")
+        ));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-wrapped",
+            Some(b"/nix/store/abc/kwin_wayland_wrapper\0")
+        ));
         assert!(!is_kwin_compositor_comm(
             ".kwin_wayland-w",
             Some(b".kwin_wayland-wrong\0")
@@ -742,6 +776,10 @@ mod tests {
         assert!(!is_kwin_compositor_comm(
             ".kwin_wayland_w",
             Some(b"kwin_wayland\0")
+        ));
+        assert!(!is_kwin_compositor_comm(
+            ".kwin_wayland-wrapped",
+            Some(b"not_kwin_wayland\0")
         ));
         assert!(!is_kwin_compositor_comm("kwin_wayland_x", None));
         assert!(!is_kwin_compositor_comm(".kwin_wayland_x", None));

@@ -1361,20 +1361,36 @@ fn diagnostic_socket_path(
 /// wayland compositor`, while connections opened earlier keep working - the reported "video dead,
 /// input alive" asymmetry. Pinning at startup, before any session can retarget the environment,
 /// makes the virtual-output connection independent of it.
+/// Resolve the KWin socket path from a (WAYLAND_DISPLAY, XDG_RUNTIME_DIR) pair, without
+/// touching the process environment. Absolute displays win outright; relative ones join onto
+/// the runtime dir. Kept pure so the resolution logic is unit-testable without the OnceLock.
+fn resolve_pinned_socket(
+    display: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let display = std::path::PathBuf::from(display?);
+    if display.as_os_str().is_empty() {
+        return None;
+    }
+    if display.is_absolute() {
+        return Some(display);
+    }
+    let runtime = std::path::PathBuf::from(runtime?);
+    Some(runtime.join(display))
+}
+
 fn pinned_socket() -> Option<std::path::PathBuf> {
     static SOCKET: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     SOCKET
         .get_or_init(|| {
-            let display = std::env::var_os("WAYLAND_DISPLAY")?;
-            if display.is_empty() {
-                return None;
-            }
-            let display = std::path::PathBuf::from(display);
-            if display.is_absolute() {
-                return Some(display);
-            }
-            let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-            Some(std::path::PathBuf::from(runtime).join(display))
+            // NOTE: this reads the environment without holding ENV_LOCK, so it is only correct
+            // because warm_socket() runs at host startup before any session handshake can
+            // rewrite WAYLAND_DISPLAY. Any other entry point that connects first would pin an
+            // already-rewritten environment.
+            resolve_pinned_socket(
+                std::env::var_os("WAYLAND_DISPLAY"),
+                std::env::var_os("XDG_RUNTIME_DIR"),
+            )
         })
         .clone()
 }
@@ -1391,8 +1407,16 @@ pub fn warm_socket() {
 }
 
 /// Connect to the pinned KWin socket, falling back to wayland-client's own resolution when the pin
-/// is absent or no longer usable (a compositor restart re-creates its socket).
-fn connect_kwin() -> Result<Connection> {
+/// is absent or no longer usable (a compositor restart re-creates its socket). Also used by
+/// output management (`kwin_output_mgmt::Session::open`) so display configuration survives
+/// WAYLAND_DISPLAY being cleared, not just virtual-output creation.
+pub(crate) fn connect_kwin() -> Result<Connection> {
+    // WAYLAND_SOCKET (fd inheritance, e.g. sandboxed launch) selects the compositor directly
+    // and outranks the pinned path: probing and virtual-output creation must agree on which
+    // compositor they target, and connect_wayland_diagnostic already prioritizes it the same way.
+    if std::env::var("WAYLAND_SOCKET").is_ok() {
+        return Ok(Connection::connect_to_env()?);
+    }
     if let Some(path) = pinned_socket() {
         match std::os::unix::net::UnixStream::connect(&path) {
             Ok(stream) => match Connection::from_socket(stream) {
@@ -1418,7 +1442,8 @@ fn connect_wayland_diagnostic() -> std::result::Result<Connection, wayland_clien
                 return Ok(conn);
             }
         }
-    }    let Some(path) = diagnostic_socket_path(
+    }
+    let Some(path) = diagnostic_socket_path(
         std::env::var_os("WAYLAND_DISPLAY"),
         std::env::var_os("XDG_RUNTIME_DIR"),
     ) else {
@@ -1882,5 +1907,57 @@ mod tests {
             .filter(|n| !n.starts_with(MANAGED_PREFIX))
             .collect();
         assert_eq!(to_disable, vec!["eDP-1"]);
+    }
+}
+
+#[cfg(test)]
+mod resolve_pinned_socket_tests {
+    use super::resolve_pinned_socket;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn absolute_display_wins_outright() {
+        assert_eq!(
+            resolve_pinned_socket(
+                Some(OsString::from("/run/user/1000/wayland-1")),
+                Some(OsString::from("/run/user/1000"))
+            ),
+            Some(PathBuf::from("/run/user/1000/wayland-1"))
+        );
+    }
+
+    #[test]
+    fn relative_display_joins_runtime_dir() {
+        assert_eq!(
+            resolve_pinned_socket(
+                Some(OsString::from("wayland-1")),
+                Some(OsString::from("/run/user/1000"))
+            ),
+            Some(PathBuf::from("/run/user/1000/wayland-1"))
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_display_is_none() {
+        assert_eq!(
+            resolve_pinned_socket(
+                Some(OsString::from("")),
+                Some(OsString::from("/run/user/1000"))
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_pinned_socket(None, Some(OsString::from("/run/user/1000"))),
+            None
+        );
+    }
+
+    #[test]
+    fn relative_display_without_runtime_dir_is_none() {
+        assert_eq!(
+            resolve_pinned_socket(Some(OsString::from("wayland-1")), None),
+            None
+        );
     }
 }

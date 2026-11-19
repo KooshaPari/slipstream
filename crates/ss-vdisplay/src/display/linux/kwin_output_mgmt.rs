@@ -393,7 +393,10 @@ impl Session {
     /// we can't connect, the management global isn't advertised, or the compositor doesn't answer in
     /// budget (the wedge case — the caller then falls back to `kscreen-doctor`).
     fn open() -> Option<Session> {
-        let conn = Connection::connect_to_env().ok()?;
+        // Route through the pinned connect, not connect_to_env directly: after a session
+        // handshake clears WAYLAND_DISPLAY this would otherwise fail and the caller would fall
+        // back to kscreen-doctor, which inherits the same cleared environment.
+        let conn = crate::kwin::connect_kwin().ok()?;
         let queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());

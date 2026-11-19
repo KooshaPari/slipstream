@@ -755,7 +755,7 @@ mod hyprland;
 
 #[cfg(target_os = "linux")]
 #[path = "display/linux/kwin.rs"]
-pub mod kwin;
+pub(crate) mod kwin;
 
 /// Pin the KWin Wayland socket at host startup, before a session handshake can rewrite the
 /// process environment and starve every later connect (see `kwin::pinned_socket`).

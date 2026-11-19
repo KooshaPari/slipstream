@@ -436,8 +436,8 @@ fn real_main() -> Result<()> {
             #[cfg(target_os = "linux")]
             ss_vdisplay::drm_force::startup_recover();
             #[cfg(target_os = "linux")]
-    ss_vdisplay::warm_socket();
-    gamestream::serve(mgmt_opts, native, gamestream)
+            ss_vdisplay::warm_socket();
+            gamestream::serve(mgmt_opts, native, gamestream)
         }
         // Report other Moonlight-compatible hosts (Sunshine/Apollo/…) installed or running on this
         // machine — side-by-side use is unsupported. Exit 1 if any are found (so the installers and

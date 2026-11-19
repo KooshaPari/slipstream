@@ -628,7 +628,6 @@ fn real_main() -> Result<()> {
         // List the host's physical monitors — the connector names `SLIPSTREAM_CAPTURE_MONITOR`
         // takes. An operator configuring an unattended host has to learn those names from
         // somewhere, and "curl the management API before the host is configured" is not it.
-        #[cfg(target_os = "linux")]
         Some("list-monitors") => {
             let compositor = vdisplay::detect()?;
             let monitors = vdisplay::monitors::list(compositor)
@@ -1008,8 +1007,7 @@ USAGE:
     slipstream-host slipstream1-host [OPTIONS]  native slipstream/1 host (QUIC control + UDP data plane)
      slipstream-host probe-compositor           exit 0 iff the compositor is up + ready (bringup gate)
      slipstream-host probe-capture              show the compositor-aware Linux capture pipeline
-     slipstream-host list-monitors              list the host's physical monitors (Linux) — the
-                                              connector names SLIPSTREAM_CAPTURE_MONITOR takes
+     slipstream-host list-monitors              list the host's physical heads and the names SLIPSTREAM_CAPTURE_MONITOR takes
     slipstream-host spike [OPTIONS]            capture→encode→file pipeline spike (dev tool)
 
 SERVE OPTIONS:

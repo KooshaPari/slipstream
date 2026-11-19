@@ -587,6 +587,40 @@ pub(crate) fn list_monitors() -> anyhow::Result<Vec<crate::monitors::PhysicalMon
     Ok(out)
 }
 
+/// True for a KWin connector that represents a real physical head, as opposed to a compositor-
+/// created virtual output. KWin names DRM heads `HDMI-A-2`, `DP-1`, `eDP-1`, … and prefixes
+/// synthesized outputs with `Virtual-` (including our own `Virtual-slipstream…`). We deliberately
+/// treat `Virtual-*` as non-physical: a dedicated headless host is allowed to use `Exclusive` and
+/// disable its bootstrap virtual output, but no desktop monitor may ever be taken off-line.
+fn looks_like_physical_connector(name: &str) -> bool {
+    !name.starts_with("Virtual-") && !name.starts_with(MANAGED_PREFIX)
+}
+
+/// Count enabled physical heads KWin currently reports. `None` means "could not enumerate", which
+/// callers must treat as unsafe for `Exclusive` (see `topology_preserving_physical_heads`).
+pub(crate) fn enabled_physical_heads() -> Option<usize> {
+    let session = Session::open()?;
+    Some(
+        session
+            .state
+            .devices
+            .values()
+            .filter(|d| {
+                d.seen_done
+                    && d.enabled
+                    && d.name.as_deref().is_some_and(looks_like_physical_connector)
+            })
+            .count(),
+    )
+}
+
+/// `true` when a proposed disable set would take every currently enabled head off-line. Callers
+/// must clear such a set: even on a headless host, configuration application races output creation,
+/// and KWin must never be offered a config with zero enabled outputs.
+fn would_leave_zero_enabled_heads(enabled_before: usize, disable_count: usize) -> bool {
+    disable_count >= enabled_before
+}
+
 /// Make the streamed output (name starts with `our_prefix`, current size `our_w`×`our_h`) the
 /// primary — and, for `Exclusive`, disable every other enabled output — over `kde_output_management_v2`.
 /// See the module docs for why this is done in-process instead of via `kscreen-doctor`.
@@ -664,6 +698,15 @@ pub(crate) fn apply_topology(
                 }
             }
         }
+    }
+    let enabled_before = sess.state.devices.values().filter(|d| d.enabled).count();
+    if would_leave_zero_enabled_heads(enabled_before, to_disable.len()) {
+        tracing::warn!(
+            enabled_before,
+            disable_count = to_disable.len(),
+            "KWin output management: refusing an Exclusive apply that would leave zero enabled outputs"
+        );
+        to_disable.clear();
     }
 
     // Build one configuration: ensure ours is enabled, take primary (unless a sibling holds it),
@@ -1019,6 +1062,23 @@ mod tests {
         assert_eq!(mode_spec((2560, 1440, 59940)), "2560x1440@60");
         assert_eq!(mode_spec((1920, 1080, 60000)), "1920x1080@60");
         assert_eq!(mode_spec((3840, 2160, 119880)), "3840x2160@120");
+    }
+
+    #[test]
+    fn physical_connector_detection_excludes_virtual_outputs() {
+        for name in ["HDMI-A-2", "DP-1", "eDP-1", "LVDS-1", "VGA-1"] {
+            assert!(looks_like_physical_connector(name), "{name}");
+        }
+        for name in ["Virtual-1", "Virtual-slipstream", "Virtual-slipstream-7"] {
+            assert!(!looks_like_physical_connector(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn zero_enabled_head_guard_keeps_at_least_one_output() {
+        assert!(!would_leave_zero_enabled_heads(2, 1));
+        assert!(would_leave_zero_enabled_heads(2, 2));
+        assert!(would_leave_zero_enabled_heads(0, 0));
     }
 
     /// The vendored device XML must keep `mode` at the opcode the `event_created_child!` macro

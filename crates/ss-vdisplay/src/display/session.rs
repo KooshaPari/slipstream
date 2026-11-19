@@ -297,15 +297,17 @@ fn default_bus(env: &EnvProbe, runtime: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
+const WRAPPED_KWIN_COMMS: &[&str] = &[
+    ".kwin_wayland-w",
+    ".kwin_wayland_w",
+    ".kwin_wayland-wrapped",
+];
+
+#[cfg(target_os = "linux")]
 fn is_kwin_compositor_comm(comm: &str, cmdline: Option<&[u8]>) -> bool {
     // NixOS wraps KWin in `kwin_wayland_wrapper`; Linux `comm` truncates that name to
     // `.kwin_wayland-w` or `.kwin_wayland_w`. PipeWire has also observed `.kwin_wayland-wrapped`.
     // Those names are not proof on their own, so require argv0 to name a real KWin executable.
-    const WRAPPED_COMMS: &[&str] = &[
-        ".kwin_wayland-w",
-        ".kwin_wayland_w",
-        ".kwin_wayland-wrapped",
-    ];
     match comm {
         "kwin_wayland" => true,
         ".kwin_wayland-w" => argv0_is(cmdline, &[b"kwin_wayland", b"kwin_wayland-wrapped"]),
@@ -371,7 +373,7 @@ pub fn detect_active_session() -> ActiveSession {
                 continue;
             };
             let comm = comm.trim();
-            let kwin_cmdline = WRAPPED_COMMS
+            let kwin_cmdline = WRAPPED_KWIN_COMMS
                 .contains(&comm)
                 .then(|| {
                     let args = std::fs::read(pid_path.join("cmdline")).ok()?;

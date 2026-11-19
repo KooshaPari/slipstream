@@ -146,10 +146,10 @@ impl KwinDisplay {
         name: &str,
         our_prefix: &str,
         dims: (u32, u32),
+        topology: crate::policy::Topology,
     ) -> Vec<(String, String)> {
         use crate::kwin_output_mgmt::TopologyKind;
         use crate::policy::Topology;
-        let topology = crate::effective_topology();
         let kind = match topology {
             Topology::Exclusive => TopologyKind::Exclusive,
             Topology::Primary => TopologyKind::Primary,
@@ -380,14 +380,20 @@ impl VirtualDisplay for KwinDisplay {
         // bootstrap output. Applied over kde_output_management_v2 in-process (immune to a wedged
         // kscreen-doctor backend; see `apply_topology`), with a kscreen-doctor fallback. `disabled`
         // is the physical/bootstrap outputs, each `(name, "WxH@Hz")`, to restore on teardown.
-        let exclusive = matches!(
+        // Safety gate before ANY topology side effect (topology disable, DDC DPMS-off, DRM force-
+        // off, monitor_hold). If KWin reports an enabled physical head (or we cannot enumerate),
+        // `Exclusive` is downgraded to `Primary`: ours still becomes primary, but the desktop's
+        // physical monitor is never disabled. A true headless host (zero physical heads) keeps the
+        // old `Exclusive` behavior.
+        let topology = crate::topology_preserving_physical_heads(
             crate::effective_topology(),
-            crate::policy::Topology::Exclusive
+            crate::kwin_output_mgmt::enabled_physical_heads().map(|n| n > 0),
         );
+        let exclusive = matches!(topology, crate::policy::Topology::Exclusive);
         if self.first_in_group && exclusive {
             crate::monitor_hold::arm_before_topology(true);
         }
-        let disabled = self.apply_topology(&name, &our_prefix, final_dims);
+        let disabled = self.apply_topology(&name, &our_prefix, final_dims, topology);
         let mut hold = crate::monitor_hold::Hold::default();
         if self.first_in_group {
             crate::monitor_hold::arm_after_topology(&mut hold, exclusive);

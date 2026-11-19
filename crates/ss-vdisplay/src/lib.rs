@@ -627,6 +627,24 @@ pub fn resolve_topology(t: policy::Topology) -> policy::Topology {
     }
 }
 
+/// A client session must never take the host's last real monitor off-line. `Exclusive` disables
+/// every physical head so the virtual output becomes the sole desktop; that is safe on a dedicated
+/// headless box but wrong on a desktop someone also uses. KWin auto-detection on this host resolves
+/// to `Exclusive`, and a connect disabled HDMI-A-2. Downgrade `Exclusive` to `Primary` when the
+/// compositor reports an enabled physical head: ours becomes primary and the physical stays enabled.
+/// Headless boxes (`physical_heads_enabled == false`) keep `Exclusive` unchanged; an unknown answer
+/// gets the same conservative treatment as a live head.
+pub fn topology_preserving_physical_heads(
+    topology: policy::Topology,
+    physical_heads_enabled: Option<bool>,
+) -> policy::Topology {
+    if topology == policy::Topology::Exclusive && physical_heads_enabled != Some(false) {
+        policy::Topology::Primary
+    } else {
+        topology
+    }
+}
+
 /// The concrete display topology for the current session - what the per-compositor backends apply
 /// at create time. Precedence, mirroring the rest of the policy surface:
 /// the **console policy** when configured, else the legacy **`SLIPSTREAM_{KWIN,MUTTER}_VIRTUAL_PRIMARY`**
@@ -814,6 +832,32 @@ pub use headless::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusive_is_downgraded_when_a_physical_head_is_present_or_unknown() {
+        let t = policy::Topology::Exclusive;
+        assert_eq!(
+            topology_preserving_physical_heads(t, Some(true)),
+            policy::Topology::Primary
+        );
+        assert_eq!(
+            topology_preserving_physical_heads(t, None),
+            policy::Topology::Primary
+        );
+        // Real headless hosts may still use Exclusive: ours is the only head once created.
+        assert_eq!(
+            topology_preserving_physical_heads(t, Some(false)),
+            policy::Topology::Exclusive
+        );
+        assert_eq!(
+            topology_preserving_physical_heads(policy::Topology::Primary, Some(true)),
+            policy::Topology::Primary
+        );
+        assert_eq!(
+            topology_preserving_physical_heads(policy::Topology::Extend, Some(true)),
+            policy::Topology::Extend
+        );
+    }
 
     #[test]
     fn active_kind_maps_to_its_backend() {

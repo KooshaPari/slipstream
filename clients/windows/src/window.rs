@@ -270,6 +270,20 @@ impl GdiPresenter {
 }
 
 impl Presenter for GdiPresenter {
+    /// Drain messages while `wait` elapses. The `NoFrame` path never calls `present`, so without
+    /// this the X button or Esc cannot be observed while no video is arriving.
+    fn pump_for(&mut self, wait: std::time::Duration) {
+        let msg = MSG::default();
+        let deadline = Instant::now() + wait;
+        loop {
+            self.pump(msg);
+            if self.closed() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(300));
+        }
+    }
+
     fn present(&mut self, frame: Option<&DecodedFrame>) {
         let mut msg = MSG::default();
         self.pump(msg);

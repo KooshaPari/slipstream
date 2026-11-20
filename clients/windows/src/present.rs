@@ -51,6 +51,11 @@ pub trait Presenter {
     /// actually encode). Backends that own a surface reallocate it here; the next frame is
     /// expected at the new size.
     fn resize(&mut self, _width: u32, _height: u32) {}
+    /// Wait without a frame while still servicing backend events. Win32 needs this so X/Esc can
+    /// close the window during a no-frame period; headless presenters keep the sleep default.
+    fn pump_for(&mut self, wait: std::time::Duration) {
+        std::thread::sleep(wait);
+    }
     /// True once the user closed the window (the session loop treats it as "stop").
     fn closed(&self) -> bool {
         false

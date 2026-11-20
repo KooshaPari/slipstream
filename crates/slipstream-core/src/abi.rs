@@ -2011,9 +2011,10 @@ unsafe fn connect_ex_impl(
         let device_label = {
             let name = crate::client::device_name();
             if name == crate::client::GENERIC_DEVICE_NAME {
-                match identity.as_ref().and_then(|(cert, _)| {
-                    crate::quic::endpoint::fingerprint_of_pem(cert).ok()
-                }) {
+                match identity
+                    .as_ref()
+                    .and_then(|(cert, _)| crate::quic::endpoint::fingerprint_of_pem(cert).ok())
+                {
                     Some(fp) => {
                         let prefix: String =
                             fp.iter().take(4).map(|b| format!("{b:02x}")).collect();

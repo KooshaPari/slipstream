@@ -574,6 +574,14 @@ impl Capturer for PortalCapturer {
             last_frame_ns: self.signals.last_frame_ns.load(Ordering::Relaxed),
             frames_published: self.signals.frames_published.load(Ordering::Relaxed),
             frames_overwritten: self.signals.frames_overwritten.load(Ordering::Relaxed),
+            // PipeWire has no separate arrival callback: every published buffer is both the
+            // arrival and the produced frame. The one-deep slot's take is the pool-drain
+            // analogue; buffers discarded while selecting the newest are the empty attempts.
+            // No per-frame production timer exists on this backend, so producer_us stays 0.
+            frames_arrived: self.signals.frames_published.load(Ordering::Relaxed),
+            try_next_ok: self.signals.frames_taken.load(Ordering::Relaxed),
+            try_next_empty: self.signals.buffers_drained.load(Ordering::Relaxed),
+            producer_us: 0,
             buffers_drained: self.signals.buffers_drained.load(Ordering::Relaxed),
             width: self.signals.negotiated_width.load(Ordering::Relaxed) as u32,
             height: self.signals.negotiated_height.load(Ordering::Relaxed) as u32,

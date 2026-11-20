@@ -347,12 +347,19 @@ impl FfmpegDecoder {
     pub fn finish(&mut self) -> Vec<DecodedFrame> {
         // Closing the sender ends the writer thread once it has written everything queued; joining
         // it guarantees ffmpeg saw every AU before stdin closes.
+        // Close stdin and drain stdout CONCURRENTLY with the writer join. The 3-frame queue can
+        // be full at finish time: joining first blocks the writer on ffmpeg's stdin while ffmpeg
+        // blocks writing stdout, because nobody is draining our frames. The drain thread keeps
+        // stdout moving until the reader closes the channel.
         drop(self.au_tx.take());
+        let frames = std::mem::replace(&mut self.frames, mpsc::channel::<Vec<u8>>().1);
+        let drain = std::thread::spawn(move || frames.into_iter().collect::<Vec<_>>());
         if let Some(w) = self.writer.take() {
             let _ = w.join();
         }
+        let drained = drain.join().unwrap_or_default();
         let mut out = Vec::new();
-        while let Ok(frame) = self.frames.recv() {
+        for frame in drained {
             self.frame_index = self.frame_index.wrapping_add(1);
             self.decoded += 1;
             out.push(DecodedFrame {

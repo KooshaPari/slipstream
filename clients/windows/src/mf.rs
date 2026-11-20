@@ -57,6 +57,35 @@ enum InputFmt {
     LengthPrefixed,
 }
 
+/// RAII wrapper for the FFI output descriptor. `windows` models its COM pointer fields with
+/// `ManuallyDrop` so the struct stays layout-compatible with C; dropping the struct itself would
+/// leak both references. This guard gives the descriptor normal Rust drop semantics, including on
+/// `NEED_MORE_INPUT`, `STREAM_CHANGE`, and error paths.
+struct OutputDescriptor(MFT_OUTPUT_DATA_BUFFER);
+
+impl OutputDescriptor {
+    fn new(sample: &IMFSample) -> Self {
+        Self(MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: std::mem::ManuallyDrop::new(Some(sample.clone())),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        })
+    }
+
+    fn as_mut(&mut self) -> &mut MFT_OUTPUT_DATA_BUFFER {
+        &mut self.0
+    }
+}
+
+impl Drop for OutputDescriptor {
+    fn drop(&mut self) {
+        // Take into temporaries so the ManuallyDrop fields release their COM references.
+        let _sample = unsafe { std::mem::ManuallyDrop::take(&mut self.0.pSample) };
+        let _events = unsafe { std::mem::ManuallyDrop::take(&mut self.0.pEvents) };
+    }
+}
+
 impl MfDecoder {
     /// Build a decoder for `codec` at the negotiated `width`x`height`. Fails (never silently) when
     /// this Windows install has no decoder MFT for the codec.
@@ -244,29 +273,32 @@ impl MfDecoder {
             if unsafe { osample.AddBuffer(&obuf) }.is_err() {
                 break;
             }
-            let mut data = MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: 0,
-                pSample: std::mem::ManuallyDrop::new(Some(osample.clone())),
-                dwStatus: 0,
-                pEvents: std::mem::ManuallyDrop::new(None),
-            };
-            let mut status = 0u32;
-            match unsafe {
-                self.transform
-                    .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status)
-            } {
-                Ok(()) => {}
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
-                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    self.stream_changes += 1;
-                    if self.select_output_type().is_err() {
+            // Release the caller's cloned sample reference on EVERY ProcessOutput path.
+            // Without RAII a `break` or `continue` leaks one IMFSample and its buffer.
+            {
+                let mut data = OutputDescriptor::new(&osample);
+                let mut status = 0u32;
+                let outcome = unsafe {
+                    self.transform.ProcessOutput(
+                        0,
+                        std::slice::from_mut(data.as_mut()),
+                        &mut status,
+                    )
+                };
+                match outcome {
+                    Ok(()) => {}
+                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                    Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                        self.stream_changes += 1;
+                        if self.select_output_type().is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "ProcessOutput");
                         break;
                     }
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "ProcessOutput");
-                    break;
                 }
             }
             if let Some(frame) = self.convert(&osample) {

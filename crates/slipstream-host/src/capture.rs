@@ -266,11 +266,11 @@ mod windows_virtual_output_backend_tests {
     fn opener_agrees_with_the_resolved_plan_for_every_spelling() {
         // (operator value, plan backend, opener accepts it)
         let cases: [(Option<&str>, CaptureBackend, bool); 6] = [
-            (None, CaptureBackend::Wgc, true),              // unset -> auto -> WGC
-            (Some("auto"), CaptureBackend::Wgc, true),      // auto -> WGC
-            (Some("wgc"), CaptureBackend::Wgc, true),       // explicit primary
-            (Some("DXGI"), CaptureBackend::Dxgi, true),     // explicit, case-insensitive
-            (Some("nonsense"), CaptureBackend::Wgc, true),  // unknown -> auto -> WGC
+            (None, CaptureBackend::Wgc, true),          // unset -> auto -> WGC
+            (Some("auto"), CaptureBackend::Wgc, true),  // auto -> WGC
+            (Some("wgc"), CaptureBackend::Wgc, true),   // explicit primary
+            (Some("DXGI"), CaptureBackend::Dxgi, true), // explicit, case-insensitive
+            (Some("nonsense"), CaptureBackend::Wgc, true), // unknown -> auto -> WGC
             (Some("portal"), CaptureBackend::Portal, false), // Linux backend: loud refusal
         ];
         for (value, expected_plan, accepts) in cases {
@@ -282,7 +282,10 @@ mod windows_virtual_output_backend_tests {
             match super::virtual_output_backend(planned) {
                 Ok(opened) => {
                     assert!(accepts, "opener should have refused {value:?}");
-                    assert_eq!(opened, planned, "opened backend != planned backend for {value:?}");
+                    assert_eq!(
+                        opened, planned,
+                        "opened backend != planned backend for {value:?}"
+                    );
                 }
                 Err(_) => assert!(!accepts, "opener should have accepted {value:?}"),
             }

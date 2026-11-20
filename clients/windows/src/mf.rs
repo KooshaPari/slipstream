@@ -100,11 +100,15 @@ impl MfDecoder {
             anyhow!(
                 "no Media Foundation {} decoder on this Windows install (is the HEVC Video \
                  Extension installed?)",
-                if sub == MFVideoFormat_HEVC { "HEVC" } else { "H.264" }
+                if sub == MFVideoFormat_HEVC {
+                    "HEVC"
+                } else {
+                    "H.264"
+                }
             )
         })?;
-        let transform: IMFTransform = unsafe { activate.ActivateObject() }
-            .context("activate the decoder MFT")?;
+        let transform: IMFTransform =
+            unsafe { activate.ActivateObject() }.context("activate the decoder MFT")?;
 
         let itype = unsafe { MFCreateMediaType() }?;
         unsafe {
@@ -297,7 +301,11 @@ impl MfDecoder {
         pixels.resize(n, 0);
         unsafe {
             nv12_to_bgra(
-                ptr, pitch, self.out_w as usize, self.out_h as usize, &mut pixels,
+                ptr,
+                pitch,
+                self.out_w as usize,
+                self.out_h as usize,
+                &mut pixels,
             );
         }
         self.frame_index = self.frame_index.wrapping_add(1);
@@ -330,7 +338,11 @@ unsafe fn nv12_to_bgra(yuv: *const u8, pitch: i32, width: usize, height: usize, 
         yuv
     };
     let nv12 = unsafe { std::slice::from_raw_parts(base, stride * height * 3 / 2) };
-    let step: isize = if pitch < 0 { -(stride as isize) } else { stride as isize };
+    let step: isize = if pitch < 0 {
+        -(stride as isize)
+    } else {
+        stride as isize
+    };
     for y in 0..height {
         let yrow = (y as isize * step) as usize;
         let uvrow = (stride * height) as isize + ((y / 2) as isize * step);

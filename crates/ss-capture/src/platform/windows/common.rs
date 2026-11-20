@@ -178,10 +178,7 @@ impl FrameSlot {
 
     /// Count a source-side arrival callback (`FrameArrived`), separate from the wakeup itself.
     pub fn note_frame_arrived(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .arrived += 1;
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).arrived += 1;
     }
 
     /// Count one pool drain attempt and its outcome.

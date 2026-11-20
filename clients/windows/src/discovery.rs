@@ -100,11 +100,7 @@ pub fn browse(secs: u64) -> Result<Vec<DiscoveredHost>> {
                 };
                 let fullname = info.get_fullname().to_string();
                 let name = fullname.split('.').next().unwrap_or("?").to_string();
-                let host = DiscoveredHost {
-                    name,
-                    addr,
-                    advert,
-                };
+                let host = DiscoveredHost { name, addr, advert };
                 hosts.insert(host.key(&fullname), host);
             }
             Ok(_) => {}
@@ -117,7 +113,10 @@ pub fn browse(secs: u64) -> Result<Vec<DiscoveredHost>> {
 
 /// `--discover`: print what is on the LAN and exit without connecting.
 pub fn run(secs: u64) -> Result<()> {
-    tracing::info!(secs, "browsing for native slipstream/1 hosts (_slipstream._udp)…");
+    tracing::info!(
+        secs,
+        "browsing for native slipstream/1 hosts (_slipstream._udp)…"
+    );
     let hosts = browse(secs)?;
     if hosts.is_empty() {
         println!("no native slipstream/1 hosts found on the LAN ({secs}s)");
@@ -148,10 +147,7 @@ mod tests {
     fn ipv4_is_preferred_over_ipv6() {
         let v6: IpAddr = "fd00::5".parse().unwrap();
         let v4: IpAddr = Ipv4Addr::new(192, 168, 1, 9).into();
-        assert_eq!(
-            pick_addr(&[v6, v4], 9777),
-            Some(SocketAddr::new(v4, 9777))
-        );
+        assert_eq!(pick_addr(&[v6, v4], 9777), Some(SocketAddr::new(v4, 9777)));
         assert_eq!(pick_addr(&[], 9777), None);
         assert_eq!(pick_addr(&[v6], 9777), Some(SocketAddr::new(v6, 9777)));
     }
@@ -159,7 +155,10 @@ mod tests {
     #[test]
     fn key_falls_back_to_fullname_without_an_id() {
         let h = host("10.0.0.5", 9777);
-        assert_eq!(h.key("box._slipstream._udp.local."), "box._slipstream._udp.local.");
+        assert_eq!(
+            h.key("box._slipstream._udp.local."),
+            "box._slipstream._udp.local."
+        );
         let mut known = h.clone();
         known.advert.id = "8c1f".into();
         assert_eq!(known.key("ignored"), "8c1f");
@@ -176,6 +175,9 @@ mod tests {
         optional.advert.fp = "0123456789abcdefdeadbeef".into();
         let row = optional.row();
         assert!(row.contains("pair=optional"), "{row}");
-        assert!(row.contains("fp=0123456789abcdef…"), "fp is truncated to 16 chars: {row}");
+        assert!(
+            row.contains("fp=0123456789abcdef…"),
+            "fp is truncated to 16 chars: {row}"
+        );
     }
 }

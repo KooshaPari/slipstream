@@ -18,11 +18,10 @@ use crate::present::{DecodedFrame, Decoder};
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-const IMAGEMAGICK_FFMPEG: &str =
-    r"C:\Program Files\ImageMagick-7.1.0-Q16-HDRI\ffmpeg.exe";
+const IMAGEMAGICK_FFMPEG: &str = r"C:\Program Files\ImageMagick-7.1.0-Q16-HDRI\ffmpeg.exe";
 
 fn find_ffmpeg() -> Result<String> {
     if let Some(p) = std::env::var_os("SLIPSTREAM_FFMPEG") {
@@ -119,12 +118,7 @@ impl FfmpegDecoder {
         Self::spawn(width, height, codec_u8, hw)
     }
 
-    fn spawn(
-        width: u32,
-        height: u32,
-        codec_u8: u8,
-        hwaccel: Option<&'static str>,
-    ) -> Result<Self> {
+    fn spawn(width: u32, height: u32, codec_u8: u8, hwaccel: Option<&'static str>) -> Result<Self> {
         use slipstream_core::quic::{CODEC_H264, CODEC_HEVC};
         let input_fmt = match codec_u8 {
             CODEC_HEVC => "hevc",
@@ -173,7 +167,10 @@ impl FfmpegDecoder {
             .spawn()
             .with_context(|| format!("spawn {exe}"))?;
         let stdin = child.stdin.take();
-        let mut stdout: ChildStdout = child.stdout.take().ok_or_else(|| anyhow!("ffmpeg stdout"))?;
+        let mut stdout: ChildStdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("ffmpeg stdout"))?;
         // Reader thread: one raw BGRA frame per message until ffmpeg's stdout closes.
         let (tx, frames) = mpsc::sync_channel::<Vec<u8>>(QUEUE_BOUND);
         let queued = std::sync::Arc::new(AtomicUsize::new(0));
@@ -299,7 +296,10 @@ impl FfmpegDecoder {
         }
         // A hwaccel that never produces a frame (unsupported profile, no free GPU session) must not
         // silently look like a dead stream: fall back to software once and keep going.
-        if self.decoded == 0 && self.fed > HWACCEL_GRACE_AUS && self.hwaccel.is_some() && !self.fell_back
+        if self.decoded == 0
+            && self.fed > HWACCEL_GRACE_AUS
+            && self.hwaccel.is_some()
+            && !self.fell_back
         {
             let hw = self.hwaccel;
             self.fell_back = true;
@@ -370,7 +370,10 @@ impl FfmpegDecoder {
     pub fn try_next(&mut self) -> Option<DecodedFrame> {
         match self.frames.try_recv() {
             Ok(frame) => {
-                let d = self.queued.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                let d = self
+                    .queued
+                    .fetch_sub(1, Ordering::Relaxed)
+                    .saturating_sub(1);
                 self.max_queued = self.max_queued.max(d + 1);
                 self.frame_index = self.frame_index.wrapping_add(1);
                 self.decoded += 1;

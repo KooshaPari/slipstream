@@ -223,9 +223,12 @@ fn play(args: &Args) -> Result<()> {
         args.preferred_codec
     };
     let mut decoder = ff::FfmpegDecoder::new(args.mode.width, args.mode.height, codec)?;
-    let mut presenter =
-        window::GdiPresenter::new(&format!("slipstream — {path}"), args.mode.width, args.mode.height)
-            .context("create window")?;
+    let mut presenter = window::GdiPresenter::new(
+        &format!("slipstream — {path}"),
+        args.mode.width,
+        args.mode.height,
+    )
+    .context("create window")?;
     let aus = split_aus(&data);
     if aus.is_empty() {
         return Err(anyhow!("{path}: no Annex-B access units found"));
@@ -306,9 +309,7 @@ fn split_aus(data: &[u8]) -> Vec<Vec<u8>> {
             i += 1;
         }
     }
-    let nal_type = |body: usize| -> u8 {
-        data.get(body).map(|b| (b >> 1) & 0x3F).unwrap_or(0)
-    };
+    let nal_type = |body: usize| -> u8 { data.get(body).map(|b| (b >> 1) & 0x3F).unwrap_or(0) };
     let auds: Vec<usize> = (0..starts.len())
         .filter(|&k| nal_type(starts[k].1) == 35)
         .collect();
@@ -448,8 +449,7 @@ async fn stream_async(args: Args) -> Result<()> {
                 })??
         }
     };
-    let welcome =
-        Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
+    let welcome = Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
     tracing::info!(
         mode = ?welcome.mode,
         frames = welcome.frames,
@@ -485,7 +485,14 @@ async fn stream_async(args: Args) -> Result<()> {
     let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
     let udp_port = probe.local_addr()?.port();
     drop(probe);
-    io::write_msg(&mut send, &Start { client_udp_port: udp_port }.encode()).await?;
+    io::write_msg(
+        &mut send,
+        &Start {
+            client_udp_port: udp_port,
+        }
+        .encode(),
+    )
+    .await?;
 
     let host_udp = SocketAddr::new(remote.ip(), welcome.udp_port);
     let cfg = welcome.session_config(Role::Client);

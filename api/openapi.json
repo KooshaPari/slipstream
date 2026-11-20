@@ -88,7 +88,7 @@
           "clients"
         ],
         "summary": "Unpair a client",
-        "description": "Removes the client's certificate from the pairing store and persists the removal, so the\nGameStream/nvhttp launch surface (`nvhttp::peer_is_paired`) refuses the device's future\nstreams and it must pair again. The nvhttp TLS layer accepts any well-formed client cert at\nthe handshake; authorization is the per-request fingerprint check against this store, so\nremoval here is the revocation point. A stream already running is not torn down (its RTSP\nmedia window is bound to the launch session and peer IP); revocation applies to the next\nlaunch.",
+        "description": "Removes the client's certificate from the pairing store and persists the removal, so the\nGameStream/nvhttp launch surface (`nvhttp::peer_is_paired`) refuses the device's future\nstreams and it must pair again. The nvhttp TLS layer accepts any well-formed client cert at\nthe handshake; authorization is the per-request fingerprint check against this store, so\nremoval here is the revocation point. The removal is written to disk before the in-memory\nentry is dropped; if persisting fails the entry is restored and the API returns 503, so a\nreported 204 is always durable. A stream already running is not torn down (its RTSP media\nwindow is bound to the launch session and peer IP); revocation applies to the next launch.",
         "operationId": "unpairClient",
         "parameters": [
           {
@@ -127,6 +127,16 @@
           },
           "404": {
             "description": "No paired client with that fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Pairing store could not be persisted; the client is still paired",
             "content": {
               "application/json": {
                 "schema": {

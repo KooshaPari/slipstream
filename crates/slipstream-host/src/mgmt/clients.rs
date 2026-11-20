@@ -80,9 +80,10 @@ pub(crate) fn client_info(der: &[u8]) -> PairedClient {
 /// GameStream/nvhttp launch surface (`nvhttp::peer_is_paired`) refuses the device's future
 /// streams and it must pair again. The nvhttp TLS layer accepts any well-formed client cert at
 /// the handshake; authorization is the per-request fingerprint check against this store, so
-/// removal here is the revocation point. A stream already running is not torn down (its RTSP
-/// media window is bound to the launch session and peer IP); revocation applies to the next
-/// launch.
+/// removal here is the revocation point. The removal is written to disk before the in-memory
+/// entry is dropped; if persisting fails the entry is restored and the API returns 503, so a
+/// reported 204 is always durable. A stream already running is not torn down (its RTSP media
+/// window is bound to the launch session and peer IP); revocation applies to the next launch.
 #[utoipa::path(
     delete,
     path = "/clients/{fingerprint}",

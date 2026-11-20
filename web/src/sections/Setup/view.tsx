@@ -42,7 +42,7 @@ export const SetupView: FC<{
 				: error === "unavailable"
 					? m.setup_error_unavailable()
 					: error === "setup-token"
-						? "That setup token is missing or wrong. It is the contents of web-setup-token in the host's slipstream config directory (%APPDATA%\\slipstream on Windows, ~/.config/slipstream on Linux)."
+? "That setup token is missing or wrong. It is the contents of web-setup-token in the host's slipstream config directory (~/.config/slipstream on both Windows and Linux, or the host's config-dir override)."
 						: null;
 
 	return (
@@ -118,12 +118,14 @@ export const SetupView: FC<{
 									<OptionLabel
 										htmlFor="setup-token"
 										label="Setup token"
-										help="From web-setup-token in the host's slipstream config directory (%APPDATA%\slipstream on Windows, ~/.config/slipstream on Linux)."
+										help="From web-setup-token in the host's slipstream config directory (~/.config/slipstream on both Windows and Linux, or the host's config-dir override)."
 									/>
 									<Input
 										id="setup-token"
 										name="setupToken"
 										type="text"
+										required
+										aria-required="true"
 										autoComplete="off"
 										spellCheck={false}
 										value={setupToken}

@@ -286,6 +286,8 @@ export type UnpairClient401 = ApiError
 export const UnpairClient401 = ApiError
 export type UnpairClient404 = ApiError
 export const UnpairClient404 = ApiError
+export type UnpairClient503 = ApiError
+export const UnpairClient503 = ApiError
 export type ListCompositors200 = ReadonlyArray<AvailableCompositor>
 export const ListCompositors200 = Schema.Array(AvailableCompositor)
 export type ListCompositors401 = ApiError
@@ -913,7 +915,8 @@ export const make = (
     withResponse(options?.config)(HttpClientResponse.matchStatus({
       "400": decodeError("UnpairClient400", UnpairClient400),
       "401": decodeError("UnpairClient401", UnpairClient401),
-      "404": decodeError("UnpairClient404", UnpairClient404),
+"404": decodeError("UnpairClient404", UnpairClient404),
+"503": decodeError("UnpairClient503", UnpairClient503),
       "204": () => Effect.void,
       orElse: unexpectedStatus
     }))
@@ -1629,11 +1632,12 @@ readonly "listPairedClients": <Config extends OperationConfig>(options: { readon
 * GameStream/nvhttp launch surface (`nvhttp::peer_is_paired`) refuses the device's future
 * streams and it must pair again. The nvhttp TLS layer accepts any well-formed client cert at
 * the handshake; authorization is the per-request fingerprint check against this store, so
-* removal here is the revocation point. A stream already running is not torn down (its RTSP
-* media window is bound to the launch session and peer IP); revocation applies to the next
-* launch.
+ * removal here is the revocation point. The removal is written to disk before the in-memory
+ * entry is dropped; if persisting fails the entry is restored and the API returns 503, so a
+ * reported 204 is always durable. A stream already running is not torn down (its RTSP media
+ * window is bound to the launch session and peer IP); revocation applies to the next launch.
 */
-readonly "unpairClient": <Config extends OperationConfig>(fingerprint: string, options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | SlipstreamError<"UnpairClient400", typeof UnpairClient400.Type> | SlipstreamError<"UnpairClient401", typeof UnpairClient401.Type> | SlipstreamError<"UnpairClient404", typeof UnpairClient404.Type>>
+readonly "unpairClient": <Config extends OperationConfig>(fingerprint: string, options: { readonly config?: Config | undefined } | undefined) => Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | SlipstreamError<"UnpairClient400", typeof UnpairClient400.Type> | SlipstreamError<"UnpairClient401", typeof UnpairClient401.Type> | SlipstreamError<"UnpairClient404", typeof UnpairClient404.Type> | SlipstreamError<"UnpairClient503", typeof UnpairClient503.Type>>
   /**
 * Lists every backend the host knows how to drive, flags which are usable right now, and marks
 * the one an unspecified (`Auto`) client request resolves to. Clients pass an `id` to their

@@ -936,6 +936,11 @@ pub(super) async fn serve_session(
         }
         // Give the client a moment to drain before the close.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The stream thread has returned, so its capturer and virtual-output guards have unwound
+        // on that thread before `spawn_blocking` reported completion. It is now safe to clear the
+        // abandonment marker; the wedged path above left it set precisely so no late submission
+        // could touch a released dmabuf.
+        abandoned_watch.store(false, Ordering::SeqCst);
         Ok(())
     }
     .await;

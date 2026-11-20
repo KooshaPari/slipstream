@@ -4167,7 +4167,7 @@ fn build_pipeline_with_retry(
         // box for a session no one is watching  -  on a Bazzite takeover that means SIGKILLing and
         // relaunching the box's Steam session once per attempt for minutes (the .181 storm
         // 2026-07-07). One in-flight attempt can still overhang; this bounds the damage to it.
-        if attempt > 1 && stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
             anyhow::bail!(
                 "session ended (client disconnected) during pipeline build  -  aborting retries \
                  after {} attempt(s)",

@@ -579,21 +579,15 @@ pub(crate) fn save_paired(paired: &[Vec<u8>]) -> anyhow::Result<()> {
     // Write to a sibling temp file (owner-only, so a local user can't tamper the allow-list), then
     // rename over the target atomically. Never write `path` in place.
     let tmp = path.with_extension("json.tmp");
-    ss_paths::write_secret_file(&tmp, &bytes).with_context(|| {
-        format!(
-            "persisting pairings to temporary file {}",
-            tmp.display()
-        )
-    })?;
+    ss_paths::write_secret_file(&tmp, &bytes)
+        .with_context(|| format!("persisting pairings to temporary file {}", tmp.display()))?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::new(e).with_context(|| {
-            format!(
-                "persisting pairings: renaming {} to {}",
-                tmp.display(),
-                path.display()
-            )
-        }));
+        return Err(anyhow::Error::new(e).context(format!(
+            "persisting pairings: renaming {} to {}",
+            tmp.display(),
+            path.display()
+        )));
     }
     Ok(())
 }

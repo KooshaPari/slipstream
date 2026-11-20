@@ -182,7 +182,7 @@ mod timer_resolution {
     #[link(name = "winmm")]
     unsafe extern "system" {
         fn timeBeginPeriod(period_ms: u32) -> u32;
-        fn timeEndPeriod(period_ms: u32) -> u32;
+        pub(crate) fn timeEndPeriod(period_ms: u32) -> u32;
     }
 
     /// Best-effort: a failure is reported but never fatal, because a coarse timer degrades
@@ -282,6 +282,20 @@ fn main() {
     #[cfg(target_os = "windows")]
     timer_resolution.release();
 }
+
+/// Release the Windows timer guard before an early `process::exit` inside argument parsing.
+///
+/// These paths run under `main`'s guard, but `process::exit` never unwinds `main`'s stack.
+#[cfg(target_os = "windows")]
+fn release_timer_resolution_before_exit() {
+    // SAFETY: no Windows timer was acquired on non-Windows targets.
+    unsafe {
+        timer_resolution::timeEndPeriod(1);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn release_timer_resolution_before_exit() {}
 
 /// A lightweight management/CLI subcommand, such as a plugin or API operation, skips streaming
 /// startup work.
@@ -464,6 +478,7 @@ fn real_main() -> Result<()> {
                 Ok(())
             } else {
                 print!("{}", detect::render_report(&found));
+                release_timer_resolution_before_exit();
                 std::process::exit(1);
             }
         }
@@ -858,6 +873,7 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
             "--no-mdns" => no_mdns = true,
             "-h" | "--help" => {
                 print_usage();
+                release_timer_resolution_before_exit();
                 std::process::exit(0);
             }
             other => bail!("unknown argument '{other}' (try --help)"),
@@ -971,6 +987,7 @@ fn parse_spike(args: &[String]) -> Result<Options> {
             "--no-loopback" => loopback = false,
             "-h" | "--help" => {
                 print_usage();
+                release_timer_resolution_before_exit();
                 std::process::exit(0);
             }
             other => bail!("unknown argument '{other}' (try --help)"),

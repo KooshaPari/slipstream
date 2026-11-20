@@ -702,59 +702,23 @@ time — the certificate fingerprint is available at `handshake.rs:131` — it i
 *entry* is: two Hellos in one burst both read zero rows, both get `Separate`, and each
 builds its own output. That is exactly the observed 3-displays-for-one-client run.
 
-**Fix (chosen): one atomic claim.** `admission::claim(conflict, identity, mode, stop,
-label)` takes the table mutex **once**, computes `decide(..)` against the rows already
-present, copies this identity's own prior stop flags (the reconnect zombies), and pushes
-this session's entry before releasing. It returns `Claimed { decision, own_zombies,
-guard }`. The native handshake calls it where `preempt_same_identity` + `admit` used to
-run, before the Welcome; the returned `LiveGuard` rides out of `negotiate` and is held by
-`serve_session` as `let _live_guard = claim_guard;`, so the entry lives exactly as long
-as the session.
+### Current implementation: two-step native handshake
 
-Why this is true by construction and not by timing: a concurrent Hello either takes the
-mutex before this one (and is therefore in the table when `decide` reads it) or after
-(and therefore sees this claim). There is no interleaving in which two same-identity
-Hellos both observe an empty table. It also does not serialise startup: the critical
-section is a scan of a table holding one row per live session plus one push; the 1500 ms
-preemption grace, the Welcome, and every pipeline step happen after the lock is dropped.
+The live native path calls `preempt_same_identity(peer_fp)` and then `admit(..)` as two separate operations in `crates/slipstream-host/src/protocol/slipstream1/handshake.rs:130-145`; `preempt_same_identity` reads live rows, and `admit` pushes a new row later. `crates/ss-vdisplay/src/display/admission.rs` has the pure `decide` helper and the same-identity preemption helper, but no `claim`, `Claimed`, or `LiveGuard` entry point exists in this tree and the handshake does not use a guard. The earlier description of an atomic claim therefore described a proposed fix, not current code.
 
-**Preemption is preserved, not disabled.** `own_zombies` is still returned and still
-signalled, and `Admission::Steal` still collects victims' stop flags — the difference is
-that the claim is now in the table when a *later* Hello looks, so the normal sequential
-reconnect still displaces the prior session instead of racing it. The old
-`preempt_same_identity` + `admit` pair remains for the GameStream plane and for tests.
+**Concurrency consequence.** The live table is keyed by session `id`, not by identity, so two Hellos in one burst can both read zero rows, both choose `Separate`, and each build its own output. The certificate fingerprint is available at `handshake.rs:131`; what is missing is an atomic operation that decides and inserts while holding the table lock. That is the observed 3-displays-for-one-client failure mode.
 
-**Failure path.** The guard is the cleanup mechanism (the existing `LiveGuard`, not the
-registry lease): it is dropped on every exit of `serve_session`, including a handshake
-that fails after the claim (dimension validation, compositor resolve, data-plane bind)
-and a pipeline that never comes up. `failed_claim_is_reclaimable` pins that a dropped
-claim leaves no zombie and the next Hello is a clean primary.
+**Proposed fix (not yet implemented): one atomic claim.** `admission::claim(conflict, identity, mode, stop, label)` would take the table mutex once, compute `decide(..)` against rows already present, copy this identity's prior stop flags (reconnect zombies), and push this session's entry before releasing. It would return `Claimed { decision, own_zombies, guard }`; the native handshake would call it where `preempt_same_identity` + `admit` run now, before the Welcome, and `serve_session` would hold the guard exactly as long as the session.
 
-**Tests** (`crates/ss-vdisplay/src/display/admission.rs`, `cargo test -p ss-vdisplay --lib admission`):
+Why this would be true by construction: a concurrent Hello either takes the mutex before this one and is visible to `decide`, or after and sees this claim. There is no interleaving in which two same-identity Hellos both observe an empty table. The critical section would remain a scan plus a push; the 1500 ms preemption grace, the Welcome, and pipeline setup happen after the lock is dropped.
 
-- `simultaneous_claims_admit_one_primary` — two threads claim the same identity behind a
-  start barrier and hand their guards back to the test thread, which asserts both rows are
-  live at once, that one claim had zero zombies and the other one, and that the table is
-  empty after both guards drop.
-- `failed_claim_is_reclaimable` — claim, drop, re-claim as a primary.
-- `pre_fix_ordering_admits_two_same_identity_hellos` — pins the old two-access ordering
-  as the thing that was wrong: `admit` twice and `preempt_same_identity` still empty.
+**Preemption would be preserved, not disabled.** `own_zombies` would still be returned and signalled, and `Admission::Steal` would still collect victims' stop flags. The old `preempt_same_identity` + `admit` pair remains for the GameStream plane and tests.
 
-The first test cannot compile against the old tree because the atomic entry point did
-not exist; that is the honest statement of "fails before". The third test is the
-executable description of the pre-fix behaviour and passes both before and after, which
-is why it is documentation rather than a regression gate.
+**Failure path must be designed, not assumed.** A real guard would be the cleanup mechanism on every exit of `serve_session`, including a handshake that fails after the claim. A test such as `failed_claim_is_reclaimable` would be needed to pin that a dropped claim leaves no zombie. None of that exists today.
 
-**Still racy: the GameStream plane.** `protocol/gamestream/stream.rs:272` still registers
-late, after its own admission at `protocol/gamestream/nvhttp.rs:176`. Two GameStream
-sessions from one identity can still race. It is the same fix (claim at admission, hold
-the guard for the launch) but it was out of scope here and is not proven by these tests.
+**Tests still to write** in `crates/ss-vdisplay/src/display/admission.rs` (`cargo test -p ss-vdisplay --lib admission`): `simultaneous_claims_admit_one_primary` (two threads, one primary, one zombie, table empty after guards drop) and `failed_claim_is_reclaimable`. A `pre_fix_ordering_admits_two_same_identity_hellos` test pins the old two-access ordering as documentation, not as a regression gate.
 
-**Capability 1 depends on this.** The multi-host switcher holds a session per host and
-brings the previous one back warm; if a switch-away and a switch-back overlap, or a UI
-opens a preview while the main session is live, they are exactly the "simultaneous
-Hellos from one identity" case. Without the claim, that manifests as duplicate virtual
-displays on a host the operator thought was idle. The sequencing in section 4 is only
-honest if this holds first, which is why the ordering note above puts the fix ahead of
-capability 1 rather than behind it.
+**Still racy: the GameStream plane.** `protocol/gamestream/stream.rs:272` still registers late, after its own admission at `protocol/gamestream/nvhttp.rs:176`. Two GameStream sessions from one identity can still race; the same fix would need to claim at admission and hold a guard for the launch, but it is out of scope here.
+
+**Capability 1 depends on this fix.** The multi-host switcher holds a session per host and brings the previous one back warm; if a switch-away and a switch-back overlap, or a UI opens a preview while the main session is live, they are exactly the simultaneous-Hellos case. Without an atomic claim this manifests as duplicate virtual displays on a host the operator thought was idle, so the fix belongs ahead of capability 1 rather than behind it.
 

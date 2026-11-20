@@ -65,16 +65,18 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 `
 
 What it does:
 
-1. resolves `slipstream-host.exe` (`-HostExe`, else `target\release\`, else `cargo build --release -p slipstream-host`)
-2. vendors bun — the installed bun if present, else the pinned `bun-v1.3.14-windows-x64.zip`
-   downloaded from GitHub and verified against its published SHA-256
-3. builds the console: `bun install --frozen-lockfile --ignore-scripts && bun run build`, then
+1. resolves `slipstream-host.exe` (`-HostExe`, else `target\release\`, else
+   `cargo build --release -p slipstream-host`, including under `-NoStart`)
+2. stops any current `SlipstreamHost` / `SlipstreamWeb` tasks before copying locked executables
+3. vendors bun only when the console is enabled (the installed bun if present, else the pinned
+   `bun-v1.3.14-windows-x64.zip` downloaded from GitHub and verified against its published SHA-256)
+4. builds the console: `bun install --frozen-lockfile --ignore-scripts && bun run build`, then
    verifies the output really is the bun/Nitro bundle (`Bun.serve` must be in
    `.output/server/index.mjs` — the same guard `build-web-deb.sh` applies)
-4. stages the payload under `C:\Program Files\Slipstream`
-5. registers `SlipstreamHost` and `SlipstreamWeb` as logon tasks for the current user, highest
+5. stages the payload under `C:\Program Files\Slipstream`
+6. registers `SlipstreamHost` and `SlipstreamWeb` as logon tasks for the current user, highest
    available, with `RestartOnFailure`
-6. starts both and prints the URL
+7. starts both and prints the URL
 
 Options: `-NoWeb` (host only, the `--no-install-recommends` equivalent), `-SkipBuild`, `-NoStart`,
 `-InstallDir`, `-MgmtPort`, `-WebPort`, `-BunExe`.
@@ -87,8 +89,10 @@ the browser shows a certificate warning once — accept it. That is the same tru
 clients pin.
 
 The console is ready as soon as the host has written `%APPDATA%\slipstream\mgmt-token` and the
-identity cert; the launcher waits and retries instead of failing permanently, mirroring the
-systemd unit's `Restart=always` + `StartLimitIntervalSec=0`.
+identity cert. The launcher uses the same config directory as the host
+(`SLIPSTREAM_CONFIG_DIR`, else `%APPDATA%\slipstream`, else `~/.config/slipstream`), keeps an
+explicit `SLIPSTREAM_MGMT_TOKEN` authoritative, and polls for the token and cert instead of
+exiting permanently, mirroring the systemd unit's `Restart=always` + `StartLimitIntervalSec=0`.
 
 ## Firewall
 
@@ -103,14 +107,21 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\firewall.ps1 -Remove
 
 | Rule | Port | When you need it |
 |---|---|---|
-| `slipstream-web` | TCP 47992 | the console from another device |
+| `slipstream-web` | TCP 47992 (or the `-WebPort` you installed with) | the console from another device |
 | `slipstream-native` | UDP 9777 | native clients connecting directly |
 | `slipstream-mdns` | UDP 5353 | mDNS auto-discovery |
 | `slipstream-mgmt` | TCP 47990 | only if you bind the mgmt API off-loopback (`-IncludeMgmt`) |
 
-Rules are scoped to the Domain and Private profiles, never Public. The media data plane uses an
-ephemeral UDP port, so a restrictive firewall must also allow the ephemeral range — the project
-does not pin one.
+Rules are scoped to the Domain and Private profiles, never Public. `firewall.ps1 -Add` opens the
+default TCP 47992, so after installing with `-WebPort 48000`, open that port yourself:
+
+```powershell
+New-NetFirewallRule -DisplayName 'slipstream-web-custom' -Direction Inbound -Action Allow `
+  -Protocol TCP -LocalPort 48000 -Profile Domain,Private
+```
+
+The media data plane uses an ephemeral UDP port, so a restrictive firewall must also allow the
+ephemeral range — the project does not pin one.
 
 ## Verify
 
@@ -130,12 +141,15 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\uninstall.ps1
 powershell -ExecutionPolicy Bypass -File packaging\windows\uninstall.ps1 -PurgeConfig
 ```
 
+`-PurgeConfig` follows the same config directory precedence as the host: `SLIPSTREAM_CONFIG_DIR`,
+else `%APPDATA%\slipstream`, else `%USERPROFILE%\.config\slipstream`.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| console task runs, `47992` never listens | `%LOCALAPPDATA%\slipstream\logs\slipstream-web.log`. A missing/!empty `mgmt-token` or a missing `cert.pem`/`key.pem` makes the console refuse to start on purpose (half-configured TLS would serve the login password in the clear). |
-| console loads, every API call 401s | token mismatch: the console reads `SLIPSTREAM_MGMT_TOKEN` from `%APPDATA%\slipstream\mgmt-token`. If you passed `--mgmt-token` on the command line, the host never wrote the file. |
+| console task runs, `47992` never listens | `%LOCALAPPDATA%\slipstream\logs\slipstream-web.log`. A missing/empty `mgmt-token` or a missing `cert.pem`/`key.pem` makes the console wait and retry; half-configured TLS would serve the login password in the clear. |
+| console loads, every API call 401s | token mismatch: the console reads `SLIPSTREAM_MGMT_TOKEN` from `%APPDATA%\slipstream\mgmt-token` (or the configured `SLIPSTREAM_CONFIG_DIR`). If you passed `--mgmt-token` on the command line, the host never wrote the file; set the same explicit token for the console task. |
 | browser warns on the cert | expected: the console uses the host's CN-only self-signed identity cert. Accept once per device. |
 | `Bun.serve` missing from `.output` | wrong Nitro preset. Rebuild with `bun run build` in `web/`; the build must use `nitro-entry/bun-https.mjs`. |
 | tasks do not start at logon | they are `InteractiveToken` tasks: they run when *this* user logs in interactively. `schtasks /query /tn SlipstreamWeb /v /fo LIST`. |

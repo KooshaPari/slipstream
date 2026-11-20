@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
   Install the slipstream streaming host and its management web console on Windows.
@@ -12,8 +12,9 @@
       web console     0.0.0.0:47992     (HTTPS, proxying /api to the mgmt API server-side)
 
   What it does, in order:
-    1. resolves a slipstream-host.exe (yours, the repo's release build, or `cargo build`)
-    2. vendors bun (pinned, checksum-verified) into the private runtime dir if needed
+    1. stops any current Slipstream tasks, then resolves a slipstream-host.exe (yours, the repo's
+       release build, or `cargo build`)
+    2. vendors bun (pinned, checksum-verified) into the private runtime dir when the console is enabled
     3. builds web/ (bun install --frozen-lockfile --ignore-scripts && bun run build)
     4. stages everything under -InstallDir (default C:\Program Files\Slipstream)
     5. registers two logon scheduled tasks: SlipstreamHost and SlipstreamWeb
@@ -41,7 +42,7 @@
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 -HostExe C:\path\slipstream-host.exe -StartNow
+  powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 -HostExe C:\path\slipstream-host.exe
 #>
 [CmdletBinding()]
 param(
@@ -56,6 +57,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $BunVersion = '1.3.14'
 $BunSha256 = '0a0620930b6675d7ba440e81f4e0e00d3cfbe096c4b140d3fff02205e9e18922' # bun-windows-x64.zip
 
@@ -63,17 +65,49 @@ function Step([string]$m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Note([string]$m) { Write-Host "    $m" }
 function Fail([string]$m) { Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 
+function Invoke-Schtasks([string[]]$schtasksArgs, [bool]$allowFailure = $false) {
+  # Windows PowerShell 5.1 can turn native stderr into a terminating error under
+  # $ErrorActionPreference = 'Stop', even when 2>$null was requested. Run native commands through
+  # cmd's error redirection and inspect the real exit code instead.
+  $command = 'schtasks.exe ' + ($schtasksArgs -join ' ') + ' 2>&1'
+  $out = & cmd.exe /c $command
+  $code = $LASTEXITCODE
+  if (-not $allowFailure -and $code -ne 0) {
+    Fail ("schtasks {0} failed ({1}): {2}" -f ($schtasksArgs -join ' '), $code, ($out -join ' '))
+  }
+  return $code
+}
+
+function Add-ElevatedArgument([System.Collections.ArrayList]$argList, [string]$key, $value) {
+  # Forward explicit switches, including -Switch:$false. Without the value PowerShell treats a
+  # passed -PurgeConfig:$false as bare -PurgeConfig in the elevated process.
+  if ($value -is [switch]) {
+    if ($value.IsPresent) {
+      [void]$argList.Add('-' + $key + ':$true')
+    } else {
+      [void]$argList.Add('-' + $key + ':$false')
+    }
+  } else {
+    [void]$argList.Add('-' + $key)
+    [void]$argList.Add('"' + [string]$value + '"')
+  }
+}
+
 # ------------------------------------------------------------------ 0. elevate
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-  Step 're-launching elevated (UAC) — the install writes Program Files and registers tasks'
-  $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+  Step 're-launching elevated (UAC) - the install writes Program Files and registers tasks'
+  $argList = New-Object System.Collections.ArrayList
+  [void]$argList.Add('-NoProfile')
+  [void]$argList.Add('-ExecutionPolicy')
+  [void]$argList.Add('Bypass')
+  [void]$argList.Add('-File')
+  [void]$argList.Add('"' + $PSCommandPath + '"')
   foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-    $argList += "-$($kv.Key)"
-    if ($kv.Value -isnot [switch]) { $argList += "`"$($kv.Value)`"" }
+    Add-ElevatedArgument $argList $kv.Key $kv.Value
   }
-  $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -PassThru -Wait
+  $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList.ToArray() -PassThru -Wait
   exit $p.ExitCode
 }
 
@@ -82,16 +116,31 @@ if (-not (Test-Path (Join-Path $repo 'web\package.json'))) { Fail "not a slipstr
 $webDir = Join-Path $repo 'web'
 $runtimeBun = Join-Path $InstallDir 'bun\bun.exe'
 $webOut = Join-Path $InstallDir 'web\.output'
-$cfg = Join-Path $env:APPDATA 'slipstream'
+# Match ss_paths::config_dir: SLIPSTREAM_CONFIG_DIR > %APPDATA%\slipstream > HOME\.config\slipstream.
+$cfg = if ($env:SLIPSTREAM_CONFIG_DIR) {
+  $env:SLIPSTREAM_CONFIG_DIR
+} elseif ($env:APPDATA) {
+  Join-Path $env:APPDATA 'slipstream'
+} else {
+  Join-Path $env:USERPROFILE '.config\slipstream'
+}
 $logDir = Join-Path $env:LOCALAPPDATA 'slipstream\logs'
 $userSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
 $userName = "$env:USERDOMAIN\$env:USERNAME"
+$taskNames = @('SlipstreamWeb', 'SlipstreamHost')
 
 Write-Host "slipstream Windows install" -ForegroundColor Green
 Note "repo        $repo"
 Note "install dir $InstallDir"
 Note "ports       host $MgmtPort (loopback), console $WebPort"
+Note "config      $cfg"
 Note "user        $userName ($userSid)"
+
+# Stop first: copied host and Bun executables are locked while their tasks are running.
+Step 'stopping current slipstream tasks before replacing the payload'
+foreach ($taskName in $taskNames) {
+  Invoke-Schtasks @('/end', '/tn', $taskName) $true | Out-Null
+}
 
 New-Item -ItemType Directory -Force -Path $InstallDir, $logDir | Out-Null
 
@@ -104,7 +153,8 @@ if (-not $HostExe) {
   )
   $HostExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
-if (-not $HostExe -and -not $NoStart -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
+# Build even under -NoStart: the install always needs a host payload. -NoStart only skips launching.
+if (-not $HostExe -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
   Step 'cargo build --release -p slipstream-host'
   Push-Location $repo
   try { & cargo build --release -p slipstream-host; if ($LASTEXITCODE -ne 0) { Fail "cargo build failed ($LASTEXITCODE)" } }
@@ -117,34 +167,36 @@ if (-not $HostExe -or -not (Test-Path $HostExe)) {
 Copy-Item $HostExe (Join-Path $InstallDir 'slipstream-host.exe') -Force
 Note "host: $HostExe"
 
-# ------------------------------------------------------------------ 2. bun (vendored)
-Step "vendoring bun $BunVersion"
-if (-not $BunExe) {
-  $local = Get-Command bun -ErrorAction SilentlyContinue
-  if ($local) { $BunExe = $local.Source }
-}
-New-Item -ItemType Directory -Force -Path (Split-Path $runtimeBun -Parent) | Out-Null
-if ($BunExe -and (Test-Path $BunExe)) {
-  Copy-Item $BunExe $runtimeBun -Force
-  Note "from $BunExe"
+if ($NoWeb) {
+  Note 'console disabled (-NoWeb); skipping bun vendoring and the web build'
 } else {
-  if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { Fail 'automatic bun download only covers x64; pass -BunExe' }
-  $zip = Join-Path $env:TEMP "bun-windows-x64-$BunVersion.zip"
-  $url = "https://github.com/oven-sh/bun/releases/download/bun-v$BunVersion/bun-windows-x64.zip"
-  Step "downloading $url"
-  Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-  $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-  if ($hash -ne $BunSha256) { Remove-Item $zip -Force; Fail "bun checksum mismatch: got $hash want $BunSha256" }
-  Expand-Archive -Path $zip -DestinationPath (Join-Path $env:TEMP "bun-$BunVersion") -Force
-  Copy-Item (Join-Path $env:TEMP "bun-$BunVersion\bun-windows-x64\bun.exe") $runtimeBun -Force
-  Remove-Item $zip -Force
-  Note 'checksum verified'
-}
-$bunVersionOut = & $runtimeBun --version
-Note "bun at ${runtimeBun}: $bunVersionOut"
+  # ------------------------------------------------------------------ 2. bun (vendored)
+  Step "vendoring bun $BunVersion"
+  if (-not $BunExe) {
+    $local = Get-Command bun -ErrorAction SilentlyContinue
+    if ($local) { $BunExe = $local.Source }
+  }
+  New-Item -ItemType Directory -Force -Path (Split-Path $runtimeBun -Parent) | Out-Null
+  if ($BunExe -and (Test-Path $BunExe)) {
+    Copy-Item $BunExe $runtimeBun -Force
+    Note "from $BunExe"
+  } else {
+    if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { Fail 'automatic bun download only covers x64; pass -BunExe' }
+    $zip = Join-Path $env:TEMP "bun-windows-x64-$BunVersion.zip"
+    $url = "https://github.com/oven-sh/bun/releases/download/bun-v$BunVersion/bun-windows-x64.zip"
+    Step "downloading $url"
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($hash -ne $BunSha256) { Remove-Item $zip -Force; Fail "bun checksum mismatch: got $hash want $BunSha256" }
+    Expand-Archive -Path $zip -DestinationPath (Join-Path $env:TEMP "bun-$BunVersion") -Force
+    Copy-Item (Join-Path $env:TEMP "bun-$BunVersion\bun-windows-x64\bun.exe") $runtimeBun -Force
+    Remove-Item $zip -Force
+    Note 'checksum verified'
+  }
+  $bunVersionOut = & $runtimeBun --version
+  Note "bun at ${runtimeBun}: $bunVersionOut"
 
-# ------------------------------------------------------------------ 3. web console build
-if (-not $NoWeb) {
+  # ------------------------------------------------------------------ 3. web console build
   Step 'building the web console (Nitro SSR on bun)'
   Push-Location $webDir
   try {
@@ -178,31 +230,53 @@ if (-not $NoWeb) {
   # ---------------------------------------------------------------- 4. console launcher
   Step 'writing the console launcher'
   $launcher = Join-Path $InstallDir 'slipstream-web.cmd'
+  $initialToken = if ($env:SLIPSTREAM_MGMT_TOKEN) { $env:SLIPSTREAM_MGMT_TOKEN } else { '' }
   $body = @"
 @echo off
-rem slipstream management web console launcher — Windows counterpart of /usr/bin/slipstream-web-server
+rem slipstream management web console launcher - Windows counterpart of /usr/bin/slipstream-web-server
 rem (see scripts/slipstream-web.service). Sources the host's token + identity cert, serves HTTPS.
 setlocal
-set "CFG=%APPDATA%\slipstream"
+rem Config resolution matches the host: SLIPSTREAM_CONFIG_DIR, then APPDATA, then HOME\.config.
+if defined SLIPSTREAM_CONFIG_DIR (
+  set "CFG=%SLIPSTREAM_CONFIG_DIR%"
+) else if defined APPDATA (
+  set "CFG=%APPDATA%\slipstream"
+) else (
+  set "CFG=%USERPROFILE%\.config\slipstream"
+)
+rem An explicit operator token is authoritative. Never overwrite it with an absent/empty file.
+set "SLIPSTREAM_MGMT_TOKEN=$initialToken"
 set "SLIPSTREAM_MGMT_URL=https://127.0.0.1:$MgmtPort"
 set "PORT=$WebPort"
 set "HOST=0.0.0.0"
 set "SLIPSTREAM_UI_TLS_CERT=%CFG%\cert.pem"
 set "SLIPSTREAM_UI_TLS_KEY=%CFG%\key.pem"
 set "SLIPSTREAM_UI_SECURE=1"
-set "SLIPSTREAM_MGMT_TOKEN="
 set "HERE=%~dp0"
 set "LOG=%LOCALAPPDATA%\slipstream\logs\slipstream-web.log"
-if not exist "%CFG%\mgmt-token" (
-  echo [%DATE% %TIME%] waiting for the host to write %CFG%\mgmt-token >>"%LOG%"
-  ping -n 6 127.0.0.1 >nul
-  exit /b 1
-)
-for /f "usebackq tokens=1,* delims==" %%A in ("%CFG%\mgmt-token") do set "SLIPSTREAM_MGMT_TOKEN=%%B"
-if not defined SLIPSTREAM_MGMT_TOKEN (
-  echo [%DATE% %TIME%] mgmt-token present but empty >>"%LOG%"
-  exit /b 1
-)
+:wait_credentials
+if not exist "%CFG%\mgmt-token" goto wait_missing_token
+set "FILE_TOKEN="
+for /f "usebackq tokens=1,* delims==" %%A in ("%CFG%\mgmt-token") do set "FILE_TOKEN=%%B"
+if defined SLIPSTREAM_MGMT_TOKEN goto have_token
+if not defined FILE_TOKEN goto wait_empty_token
+set "SLIPSTREAM_MGMT_TOKEN=%FILE_TOKEN%"
+:have_token
+if not exist "%CFG%\cert.pem" goto wait_missing_cert
+if not exist "%CFG%\key.pem" goto wait_missing_cert
+goto run
+:wait_missing_token
+echo [%DATE% %TIME%] waiting for the host to write %CFG%\mgmt-token >>"%LOG%"
+ping -n 6 127.0.0.1 >nul
+goto wait_credentials
+:wait_empty_token
+echo [%DATE% %TIME%] mgmt-token present but empty >>"%LOG%"
+ping -n 6 127.0.0.1 >nul
+goto wait_credentials
+:wait_missing_cert
+echo [%DATE% %TIME%] waiting for the host identity cert in %CFG% >>"%LOG%"
+ping -n 6 127.0.0.1 >nul
+goto wait_credentials
 :run
 echo [%DATE% %TIME%] starting slipstream web console on %HOST%:%PORT% (tls) >>"%LOG%"
 "%HERE%bun\bun.exe" "%HERE%web\.output\server\index.mjs" >>"%LOG%" 2>&1
@@ -224,7 +298,7 @@ goto run
     Copy-Item $iconSrc $iconDst -Force
     Note "icon: $iconDst"
   } else {
-    Note 'no icons\slipstream.ico in this checkout — the shortcut will use the default icon'
+    Note 'no icons\slipstream.ico in this checkout - the shortcut will use the default icon'
   }
   $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
   New-Item -ItemType Directory -Force -Path $startMenu | Out-Null
@@ -242,11 +316,13 @@ goto run
 function Register-LogonTask([string]$name, [string]$command, [string]$arguments, [string]$description) {
   $esc = { param($s) [System.Security.SecurityElement]::Escape($s) }
   $argsXml = if ($arguments) { "<Arguments>$(& $esc $arguments)</Arguments>" } else { '' }
+  $author = & $esc $userName
+  $triggerUser = & $esc $userName
   $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Author>$userName</Author>
+    <Author>$author</Author>
     <Description>$(& $esc $description)</Description>
     <URI>\$name</URI>
   </RegistrationInfo>
@@ -266,7 +342,7 @@ function Register-LogonTask([string]$name, [string]$command, [string]$arguments,
     <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
   </Settings>
   <Triggers>
-    <LogonTrigger><Enabled>true</Enabled><UserId>$userName</UserId></LogonTrigger>
+    <LogonTrigger><Enabled>true</Enabled><UserId>$triggerUser</UserId></LogonTrigger>
   </Triggers>
   <Actions Context="Author">
     <Exec><Command>$(& $esc $command)</Command>$argsXml</Exec>
@@ -275,8 +351,7 @@ function Register-LogonTask([string]$name, [string]$command, [string]$arguments,
 "@
   $tmp = Join-Path $env:TEMP "$name.xml"
   [System.IO.File]::WriteAllText($tmp, $xml, [System.Text.Encoding]::Unicode)
-  & schtasks.exe /create /tn $name /xml $tmp /f | Out-Null
-  if ($LASTEXITCODE -ne 0) { Fail "schtasks /create $name failed ($LASTEXITCODE)" }
+  Invoke-Schtasks @('/create', '/tn', $name, '/xml', $tmp, '/f')
   Remove-Item $tmp -Force -ErrorAction SilentlyContinue
   Note "task $name registered"
 }
@@ -292,11 +367,10 @@ if (-not $NoWeb) {
 # ------------------------------------------------------------------ 6. start + report
 if (-not $NoStart) {
   Step 'starting'
-  & schtasks.exe /end /tn SlipstreamHost 2>$null | Out-Null
-  & schtasks.exe /run /tn SlipstreamHost | Out-Null
+  Invoke-Schtasks @('/run', '/tn', 'SlipstreamHost')
   Start-Sleep -Seconds 3
   if (-not $NoWeb) {
-    & schtasks.exe /run /tn SlipstreamWeb | Out-Null
+    Invoke-Schtasks @('/run', '/tn', 'SlipstreamWeb')
     Start-Sleep -Seconds 4
   }
 }
@@ -312,7 +386,7 @@ if (-not $NoWeb) {
   Note "web console   : https://127.0.0.1:$WebPort  $(if (Test-Port $WebPort) { 'listening' } else { 'NOT listening yet' })"
   Write-Host ''
   Write-Host "  Open  https://127.0.0.1:$WebPort  and choose a login password on the first visit" -ForegroundColor Yellow
-  Write-Host "  (self-signed host cert — accept the warning once; also reachable at https://<host-ip>:$WebPort)"
+  Write-Host "  (self-signed host cert - accept the warning once; also reachable at https://<host-ip>:$WebPort)"
 }
 Write-Host ''
 Write-Host '  logs       %LOCALAPPDATA%\slipstream\logs\slipstream-web.log'

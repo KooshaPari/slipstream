@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
   Add, remove, or show the Windows Firewall rules for slipstream.
@@ -46,17 +46,37 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Add-ElevatedArgument([System.Collections.ArrayList]$argList, [string]$key, $value) {
+  # Forward explicit switches, including -IncludeMgmt:$false. Without the value PowerShell treats
+  # a passed -IncludeMgmt:$false as bare -IncludeMgmt in the elevated process.
+  if ($value -is [switch]) {
+    if ($value.IsPresent) {
+      [void]$argList.Add('-' + $key + ':$true')
+    } else {
+      [void]$argList.Add('-' + $key + ':$false')
+    }
+  } else {
+    [void]$argList.Add('-' + $key)
+    [void]$argList.Add('"' + [string]$value + '"')
+  }
+}
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin -and ($Add -or $Remove)) {
   Write-Host '==> re-launching elevated (UAC)' -ForegroundColor Cyan
-  $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+  $argList = New-Object System.Collections.ArrayList
+  [void]$argList.Add('-NoProfile')
+  [void]$argList.Add('-ExecutionPolicy')
+  [void]$argList.Add('Bypass')
+  [void]$argList.Add('-File')
+  [void]$argList.Add('"' + $PSCommandPath + '"')
   foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-    $argList += "-$($kv.Key)"
-    if ($kv.Value -isnot [switch]) { $argList += "`"$($kv.Value)`"" }
+    Add-ElevatedArgument $argList $kv.Key $kv.Value
   }
-  $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList -PassThru -Wait
+  $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $argList.ToArray() -PassThru -Wait
   exit $p.ExitCode
 }
 
@@ -69,24 +89,28 @@ $rules = @(
 if ($IncludeMgmt) {
   $rules += @{ Name = 'slipstream-mgmt'; Protocol = 'TCP'; Port = 47990; Desc = 'slipstream mgmt REST API (only when bound off-loopback)' }
 }
+$allRuleNames = @('slipstream-web', 'slipstream-native', 'slipstream-mdns', 'slipstream-mgmt')
 
 if ($Status -or -not ($Add -or $Remove)) {
   Write-Host 'slipstream firewall rules:' -ForegroundColor Green
-  foreach ($r in $rules) {
-    $found = Get-NetFirewallRule -DisplayName $r.Name -ErrorAction SilentlyContinue
+  foreach ($name in $allRuleNames) {
+    $found = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
     $state = if ($found) { ($found | Get-NetFirewallPortFilter | ForEach-Object { "$($_.Protocol)/$($_.LocalPort)" }) -join ', ' } else { 'absent' }
-    Write-Host ("  {0,-18} {1,-4} {2,-6} {3}" -f $r.Name, $r.Protocol, $r.Port, $state)
+    $rule = $rules | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    Write-Host ("  {0,-18} {1,-4} {2,-6} {3}" -f $name, $rule.Protocol, $rule.Port, $state)
   }
   exit 0
 }
 
 if ($Remove) {
-  foreach ($r in $rules) {
-    if (Get-NetFirewallRule -DisplayName $r.Name -ErrorAction SilentlyContinue) {
-      Remove-NetFirewallRule -DisplayName $r.Name
-      Write-Host "removed $($r.Name)"
+  # -Remove means remove every rule this script can create, including one added earlier with
+  # -Add -IncludeMgmt; -IncludeMgmt is only an -Add modifier, not a removal filter.
+  foreach ($name in $allRuleNames) {
+    if (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue) {
+      Remove-NetFirewallRule -DisplayName $name
+      Write-Host "removed $name"
     } else {
-      Write-Host "$($r.Name): absent"
+      Write-Host "$name`: absent"
     }
   }
   exit 0

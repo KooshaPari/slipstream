@@ -200,7 +200,7 @@ the host needs a clipboard backend underneath. Both, and what a greyed-out toggl
 | `SLIPSTREAM_MGMT_TOKEN` | token | Bearer token for the management API. If unset it's auto-generated and persisted to `~/.config/slipstream/mgmt-token` (the bundled web console sources it). Set only to pin a specific token. |
 | `SLIPSTREAM_UI_PASSWORD` | password | Web-console login password. Normally generated on first start and stored in `~/.config/slipstream/web-password`, see [Forgot your Password?](/docs/forgot-password). |
 | `SLIPSTREAM_PLUGIN_TOKEN` | token | The scoped token the [plugin/scripting runner](/docs/plugins) uses, a narrower credential than `SLIPSTREAM_MGMT_TOKEN`, never full admin. Same precedence: if unset it's generated and persisted to `~/.config/slipstream/plugin-token`. Set only to pin a specific token. |
-| `SLIPSTREAM_CONFIG_DIR` | path | Override the config directory (default `~/.config/slipstream`), pairing state, certs, apps.json, captures. |
+| `SLIPSTREAM_CONFIG_DIR` | path | Override the config directory (default `%APPDATA%\slipstream` on Windows, `~/.config/slipstream` on Linux), pairing state, certs, apps.json, captures. |
 
 ## Updates
 

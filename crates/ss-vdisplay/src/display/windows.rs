@@ -38,7 +38,7 @@ pub fn has_heads() -> bool {
 /// Every attached head, in GDI enumeration order.
 pub fn list_monitors() -> Result<Vec<PhysicalMonitor>> {
     // Origins come from the monitor walk (matched by device name below).
-    let origins = monitor_origins();
+    let origins = monitor_origins().context("enumerate Windows display monitor origins")?;
     let mut out = Vec::new();
     let mut index = 0u32;
     loop {
@@ -66,7 +66,15 @@ pub fn list_monitors() -> Result<Vec<PhysicalMonitor>> {
         };
         let (width, height, freq) =
             current_mode(&device).with_context(|| format!("read the current mode of {device}"))?;
-        let (x, y) = origins.get(&device).copied().unwrap_or((0, 0));
+        // P83-7: never invent an origin. Duplicate `(0,0)` values make absolute input and monitor
+        // resolution treat two heads as one; skip the head when its origin could not be read.
+        let Some((x, y)) = origins.get(&device).copied() else {
+            tracing::warn!(
+                device = %device,
+                "skipping monitor with no readable GDI origin"
+            );
+            continue;
+        };
         out.push(PhysicalMonitor {
             connector: device,
             description,
@@ -173,7 +181,14 @@ impl VirtualDisplay for WindowsMirrorDisplay {
         let effective = read_mode(&self.device).context("read back the head mode after the set")?;
         let requested = (mode.width, mode.height, mode.refresh_hz);
         let effective_dims = effective.dims();
-        let (width, height, hz) = match decide_mode_readback(requested, effective_dims, true) {
+        // P83-6: WGC is the configured Windows capture backend. Probe it once here rather than
+        // claiming every effective mode is capturable and failing later with zero frames.
+        let capture_supported = ss_capture::probe_wgc();
+        let (width, height, hz) = match decide_mode_readback(
+            requested,
+            effective_dims,
+            capture_supported,
+        ) {
             ModeReadback::UseRequested => {
                 tracing::info!(
                     device = %self.device,
@@ -202,9 +217,11 @@ impl VirtualDisplay for WindowsMirrorDisplay {
                 fmt_mode(effective_dims)
             ),
         };
-        // A driver may report `dmDisplayFrequency` 0/1 for "default"; pacing needs a real rate, so
-        // fall back to the session's ask there rather than to a nonsense 1 Hz.
-        let hz = if hz > 1 { hz } else { mode.refresh_hz };
+        // A driver may report `dmDisplayFrequency` 0/1 for "default". Pacing needs a real rate;
+        // use the effective mode's own Hz (the same source as the pixels above), never the
+        // request's Hz, which would fabricate a WxH@Hz mode the head never advertised.
+        let hz = if hz > 1 { hz } else { effective.hz };
+        let hz = if hz > 1 { hz } else { 60 };
         Ok(VirtualOutput {
             node_id: 0, // no PipeWire node — capture resolves `windows_head` instead
             preferred_mode: Some((width, height, hz)),
@@ -395,8 +412,11 @@ fn apply_mode(device: &str, width: u32, height: u32, hz: u32, template: &DEVMODE
 }
 
 /// `device → (x, y)` origins from the monitor walk, matched by GDI device name.
-fn monitor_origins() -> std::collections::HashMap<String, (i32, i32)> {
-    struct Origins(std::collections::HashMap<String, (i32, i32)>);
+fn monitor_origins() -> Result<std::collections::HashMap<String, (i32, i32)>> {
+    struct Origins {
+        map: std::collections::HashMap<String, (i32, i32)>,
+        failed: bool,
+    }
     // SAFETY: synchronous enumeration; the map outlives the walk (moved out after).
     unsafe extern "system" fn enum_proc(
         hmon: HMONITOR,
@@ -412,21 +432,31 @@ fn monitor_origins() -> std::collections::HashMap<String, (i32, i32)> {
         if unsafe { GetMonitorInfoW(hmon, &mut ex.monitorInfo).as_bool() } {
             let device = wide_to_string(&ex.szDevice);
             let r = ex.monitorInfo.rcMonitor;
-            out.0.insert(device, (r.left, r.top));
+            out.map.insert(device, (r.left, r.top));
+        } else {
+            // P83-7: remember the failure instead of leaving this head to be defaulted to (0,0).
+            out.failed = true;
         }
         true.into()
     }
-    let mut origins = Origins(std::collections::HashMap::new());
+    let mut origins = Origins {
+        map: std::collections::HashMap::new(),
+        failed: false,
+    };
     // SAFETY: the walk is synchronous; `origins` outlives it.
-    unsafe {
-        let _ = EnumDisplayMonitors(
+    let ok = unsafe {
+        EnumDisplayMonitors(
             HDC::default(),
             None,
             Some(enum_proc),
             LPARAM(&mut origins as *mut Origins as isize),
-        );
+        )
+        .as_bool()
+    };
+    if !ok || origins.failed {
+        anyhow::bail!("GetMonitorInfoW failed for at least one attached monitor")
     }
-    origins.0
+    Ok(origins.map)
 }
 
 /// NUL-terminated UTF-16 device name for Win32 calls.

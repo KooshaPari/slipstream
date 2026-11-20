@@ -1483,6 +1483,8 @@ fn connect_wayland_diagnostic() -> std::result::Result<Connection, wayland_clien
 /// Exists because the process env is not a trustworthy session input: see the call site. This is
 /// the only resolver that cannot be poisoned by a previous session's teardown.
 fn fallback_wayland_socket() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::MetadataExt;
     // SAFETY: `getuid` takes no arguments, reads no memory and cannot fail; it returns this
     // process's real uid. It is used only to (a) default the runtime dir and (b) skip sockets

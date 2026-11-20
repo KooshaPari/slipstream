@@ -260,22 +260,22 @@ pub(super) async fn serve_session(
         prep,
         claim_guard,
     ) = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            handshake::negotiate(
-                &conn,
-                &mut send,
-                &mut recv,
-                &first,
-                source,
-                frames,
-                data_port,
-                &bringup,
-                quit.clone(),
-                stop.clone(),
-            ),
-        )
-        .await
-        .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
+        HANDSHAKE_TIMEOUT,
+        handshake::negotiate(
+            &conn,
+            &mut send,
+            &mut recv,
+            &first,
+            source,
+            frames,
+            data_port,
+            &bringup,
+            quit.clone(),
+            stop.clone(),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (ctrl_send, ctrl_recv) = (send, recv);
     // Can this session's backend live-reconfigure (mid-stream Reconfigure)? Gated OFF for:
     //   * gamescope (all sub-modes): a spawn respawn restarts the game, managed restarts the box's

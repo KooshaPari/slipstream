@@ -113,9 +113,7 @@ fn parse_token(contents: &str, env_var: &str) -> Result<Option<String>> {
             .trim(),
         None if line.contains('=') => {
             let key = line.split('=').next().unwrap_or(line);
-            anyhow::bail!(
-                "found `{key}=...` but this file holds the {env_var} credential"
-            );
+            anyhow::bail!("found `{key}=...` but this file holds the {env_var} credential");
         }
         None => line,
     };

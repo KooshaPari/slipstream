@@ -179,8 +179,8 @@ fn registry_string(subkey: &str, value: &str) -> Option<String> {
 /// macOS keeps its identity in a small XML plist; no plist crate needed for two flat strings.
 #[cfg(target_os = "macos")]
 fn macos_os_info() -> OsInfo {
-    let plist =
-        std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist").unwrap_or_default();
+    let plist = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
+        .unwrap_or_default();
     macos_identity(
         plist_value(&plist, "ProductName").as_deref(),
         plist_value(&plist, "ProductVersion").as_deref(),
@@ -458,7 +458,11 @@ mod tests {
             ("", "linux", "Linux"),
         ];
         for (input, chain, pretty) in cases {
-            assert_eq!(&parsed(input), &(chain.to_string(), pretty.to_string()), "input: {input:?}");
+            assert_eq!(
+                &parsed(input),
+                &(chain.to_string(), pretty.to_string()),
+                "input: {input:?}"
+            );
         }
     }
 
@@ -494,8 +498,14 @@ mod tests {
     fn macos_identity_reads_the_system_version_plist() {
         let plist = "<plist><dict>\n\t<key>ProductBuildVersion</key>\n\t<string>23F79</string>\n\t<key>ProductName</key>\n\t<string>macOS</string>\n\t<key>ProductVersion</key>\n\t<string>14.5</string>\n</dict></plist>\n";
         assert_eq!(plist_value(plist, "ProductName").as_deref(), Some("macOS"));
-        assert_eq!(plist_value(plist, "ProductVersion").as_deref(), Some("14.5"));
-        assert_eq!(plist_value(plist, "ProductBuildVersion").as_deref(), Some("23F79"));
+        assert_eq!(
+            plist_value(plist, "ProductVersion").as_deref(),
+            Some("14.5")
+        );
+        assert_eq!(
+            plist_value(plist, "ProductBuildVersion").as_deref(),
+            Some("23F79")
+        );
         assert_eq!(plist_value(plist, "Missing"), None);
 
         let info = macos_identity(
@@ -520,7 +530,10 @@ mod tests {
     #[test]
     fn detect_reports_windows_on_windows() {
         let info = detect();
-        assert_eq!(info.chain, "windows", "Windows host must not advertise a Linux chain");
+        assert_eq!(
+            info.chain, "windows",
+            "Windows host must not advertise a Linux chain"
+        );
         assert!(!info.chain.contains('/'), "windows has no family ladder");
         assert!(
             info.pretty.starts_with("Windows"),

@@ -393,17 +393,17 @@ mod tests {
 
         assert_eq!(collected.len(), 2, "both Hellos claimed");
         assert_eq!(live_len(), 2, "both claims are live at once");
-        let results: Vec<(usize, bool)> = collected
-            .iter()
-            .map(|(z, sep, _)| (*z, *sep))
-            .collect();
+        let results: Vec<(usize, bool)> = collected.iter().map(|(z, sep, _)| (*z, *sep)).collect();
         assert!(
             results.iter().all(|(_, sep)| *sep),
             "same-identity claims never conflict under Separate"
         );
         let primaries = results.iter().filter(|(z, _)| *z == 0).count();
         let secondaries = results.iter().filter(|(z, _)| *z == 1).count();
-        assert_eq!(primaries, 1, "exactly one Hello may be the primary: {results:?}");
+        assert_eq!(
+            primaries, 1,
+            "exactly one Hello may be the primary: {results:?}"
+        );
         assert_eq!(secondaries, 1, "the other must see the first: {results:?}");
         drop(collected);
         assert_eq!(live_len(), 0, "both claims released");

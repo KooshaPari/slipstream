@@ -1,8 +1,8 @@
 #[cfg(target_os = "linux")]
 use crate::types::{assign_ids, GpuHandle, GpuInfo, VENDOR_AMD, VENDOR_INTEL, VENDOR_NVIDIA};
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
-use std::collections::HashMap;
 
 /// Enumerate Linux render nodes and their PCI ids from sysfs.
 #[cfg(target_os = "linux")]
@@ -219,15 +219,7 @@ fn physical_device_counts() -> HashMap<(u32, u32), usize> {
         let mut wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: `wide` is NUL-terminated for the duration of the call; `sub` is a live
         // out-param and is closed right after enumeration.
-        let rc = unsafe {
-            RegOpenKeyExW(
-                root,
-                PWSTR(wide.as_mut_ptr()),
-                0,
-                KEY_READ,
-                &mut sub,
-            )
-        };
+        let rc = unsafe { RegOpenKeyExW(root, PWSTR(wide.as_mut_ptr()), 0, KEY_READ, &mut sub) };
         if rc.is_ok() {
             enum_subkeys(sub, |_| instances += 1);
             // SAFETY: `sub` came from a successful RegOpenKeyExW and is closed exactly once.

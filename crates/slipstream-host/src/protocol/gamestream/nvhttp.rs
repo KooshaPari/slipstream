@@ -468,10 +468,7 @@ mod tests {
         // that was just accepted is refused once its record is gone, so the device cannot launch
         // again without re-pairing.
         let pinned_fp = fp_of(&der);
-        st.paired
-            .lock()
-            .unwrap()
-            .retain(|d| fp_of(d) != pinned_fp);
+        st.paired.lock().unwrap().retain(|d| fp_of(d) != pinned_fp);
         assert!(
             !peer_is_paired(&peer, &st),
             "unpaired cert must be rejected on the next launch"

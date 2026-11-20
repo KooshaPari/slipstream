@@ -1568,10 +1568,8 @@ mod diagnostic_socket_tests {
             // (Err(NoCompositor) -> no output -> no capture -> no frames); the branch must
             // succeed by scanning the runtime dir.
             "poisoned" => {
-                let runtime = path.with_file_name(format!(
-                    "slipstream-wayland-rt-{}",
-                    std::process::id()
-                ));
+                let runtime =
+                    path.with_file_name(format!("slipstream-wayland-rt-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&runtime);
                 let live = runtime.join("wayland-9");
                 let _listener = UnixListener::bind(&live).unwrap();

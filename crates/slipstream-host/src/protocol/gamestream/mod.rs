@@ -27,6 +27,7 @@ mod video;
 
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::future::Future;
 use std::sync::Arc;
 
 /// Hold a private headless compositor (`SLIPSTREAM_HEADLESS_COMPOSITOR`) for the process
@@ -347,6 +348,21 @@ pub fn serve(
     native: crate::native::NativeServe,
     gamestream: bool,
 ) -> Result<()> {
+    serve_with_stop(mgmt, native, gamestream, std::future::pending())
+}
+
+/// Same host as [`serve`], but unwinds early when `stop` resolves. The console path
+/// passes a never-resolving future, so this adds no behavior or latency there.
+/// Windows SCM callers pass a wait on the stop event reported by the control handler.
+pub fn serve_with_stop<F>(
+    mgmt: crate::mgmt::Options,
+    native: crate::native::NativeServe,
+    gamestream: bool,
+    stop: F,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     // Private Wayland session for headless boxes (labwc / krfb / gamescope). Must run before
     // Host::detect / mDNS / session planes so capture and input see the spawned compositor.
     #[cfg(target_os = "linux")]
@@ -413,6 +429,16 @@ pub fn serve(
             version: env!("CARGO_PKG_VERSION").to_string(),
             gamestream,
         });
+        #[cfg(target_os = "windows")]
+        if std::env::args().nth(1).as_deref() == Some("--service") {
+            crate::service::report_running();
+        }
+        // A stop signal resolves the watcher and cancels the listener join. The
+        // console's `pending()` future never resolves, so `select!` is transparent.
+        let stop = async move {
+            stop.await;
+            Ok::<(), anyhow::Error>(())
+        };
         let served: anyhow::Result<()> = if gamestream {
             // Unified host: GameStream compat planes + native + mgmt. The `_nvstream` advert is
             // fatal on failure when enabled (Moonlight clients can't find the host without it) —
@@ -432,18 +458,24 @@ pub fn serve(
                 port = native.port,
                 "unified host: GameStream/Moonlight compat + native slipstream/1 (QUIC)"
             );
-            tokio::try_join!(
-                nvhttp::run(state.clone()),
-                crate::mgmt::run(
-                    state.clone(),
-                    mgmt,
-                    Some(np.clone()),
-                    stats.clone(),
-                    gamestream
-                ),
-                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
-            )
-            .map(|_| ())
+            let listeners = async {
+                tokio::try_join!(
+                    nvhttp::run(state.clone()),
+                    crate::mgmt::run(
+                        state.clone(),
+                        mgmt,
+                        Some(np.clone()),
+                        stats.clone(),
+                        gamestream
+                    ),
+                    crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
+                )
+                .map(|_| ())
+            };
+            tokio::select! {
+                listeners = listeners => listeners,
+                _ = stop => Ok(()),
+            }
         } else {
             // Secure default: native slipstream/1 + management API only (no GameStream surface).
             tracing::info!(
@@ -451,17 +483,23 @@ pub fn serve(
                 "secure host: native slipstream/1 (QUIC) + management API \
                  (GameStream OFF — pass --gamestream for stock-Moonlight compat)"
             );
-            tokio::try_join!(
-                crate::mgmt::run(
-                    state.clone(),
-                    mgmt,
-                    Some(np.clone()),
-                    stats.clone(),
-                    gamestream
-                ),
-                crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
-            )
-            .map(|_| ())
+            let listeners = async {
+                tokio::try_join!(
+                    crate::mgmt::run(
+                        state.clone(),
+                        mgmt,
+                        Some(np.clone()),
+                        stats.clone(),
+                        gamestream
+                    ),
+                    crate::native::serve(native_opts, native.mgmt_port, np, stats.clone()),
+                )
+                .map(|_| ())
+            };
+            tokio::select! {
+                listeners = listeners => listeners,
+                _ = stop => Ok(()),
+            }
         };
         crate::events::emit(crate::events::EventKind::HostStopping);
         served

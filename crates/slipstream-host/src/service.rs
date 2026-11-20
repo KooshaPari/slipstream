@@ -1,54 +1,62 @@
 //! Windows service entry: run the host under the Service Control Manager.
 //!
-//! The MSI registers `slipstream-host` (see `tray::status::SERVICE_NAME` — the two must
-//! agree); the SCM then starts this binary with no arguments and `dispatch()` below
-//! routes into the service path instead of the CLI. Console runs are unaffected:
-//! `StartServiceCtrlDispatcherW` fails with `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`
-//! outside SCM and `dispatch` returns `false` so `real_main` continues normally.
+//! The SCM starts the binary with `--service` followed by the normal serve arguments:
+//! `slipstream-host --service serve --gamestream --mgmt-bind 0.0.0.0:47990`.
+//! The flag is explicit: a console launch never calls `StartServiceCtrlDispatcherW`,
+//! so console behavior and accepted arguments remain unchanged.
 //!
-//! Lifecycle: `ServiceMain` reports `START_PENDING`, runs the default `serve` plane
-//! set inline (mgmt API + native slipstream/1, GameStream off — the secure default,
-//! same as bare `slipstream-host serve`), then reports `RUNNING`. `SERVICE_CONTROL_STOP`
-//! reports `STOP_PENDING`, hands the box's session back (the same restore the Unix
-//! `SIGTERM` path runs), and exits. Sessions in flight see a disconnect and reconnect
-//! to the restarted service — there is no graceful drain yet; a stop during a stream
-//! is a reconnect, not data loss.
+//! Lifecycle: `ServiceMain` registers the status handle, reports `START_PENDING`,
+//! parses the supplied serve args through the same parser used by the console, and
+//! starts `gamestream::serve` with an SCM stop watcher. Once startup has bound all
+//! listeners the watcher reports `RUNNING`. `SERVICE_CONTROL_STOP` and
+//! `SERVICE_CONTROL_SHUTDOWN` report `STOP_PENDING`, signal the watcher, and stop
+//! live sessions plus the virtual display. The serve future unwinds with the normal
+//! `HostStopping` event before `STOPPED` is reported.
 
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     OnceLock,
 };
-use windows::{core::w, Win32::System::Services::*};
+
+use anyhow::Context as _;
+use windows::core::w;
+use windows::Win32::Foundation::{HANDLE, NO_ERROR};
+use windows::Win32::System::Services::{
+    RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
+    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
+    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+    SERVICE_STATUS_CURRENT_STATE, SERVICE_TABLE_ENTRYW,
+};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+
+/// Service name registered with the SCM. Operator `sc create` must use this exact name.
+pub(crate) const SERVICE_NAME: &str = "slipstream-host";
 
 /// Current service state, mirrored to the SCM on every transition.
-static CURRENT_STATE: AtomicU32 = AtomicU32::new(SERVICE_STOPPED.0);
-/// Status handle from `RegisterServiceCtrlHandlerExW`, set once in `ServiceMain`.
-/// Stored raw: the handle type is neither `Send` nor `Sync`, and every use rebuilds it
-/// on the thread that owns the service lifecycle (same pattern as the tray window).
+static CURRENT_STATE: AtomicU32 = AtomicU32::new(1); // SERVICE_STOPPED
+/// Raw status handle: the wrapper is neither Send nor Sync, so rebuild on each use.
 static STATUS_HANDLE: OnceLock<usize> = OnceLock::new();
+/// Raw auto-reset Win32 event handle, shared with the serve watcher. Stored as a
+/// pointer-sized integer because the windows crate handle wrapper is not `Sync`.
+static STOP_EVENT: OnceLock<usize> = OnceLock::new();
 
-/// Rebuild the status handle stored by `ServiceMain`.
 fn status_handle() -> Option<SERVICE_STATUS_HANDLE> {
     STATUS_HANDLE
         .get()
         .map(|raw| SERVICE_STATUS_HANDLE(*raw as *mut core::ffi::c_void))
 }
 
-/// Whether `e` is `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` (not running under SCM).
-fn is_not_service_process(e: &windows::core::Error) -> bool {
-    e.code().0 as u32 & 0xFFFF
-        == windows::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT.0
+fn stop_event_handle() -> Option<HANDLE> {
+    STOP_EVENT
+        .get()
+        .map(|raw| HANDLE(*raw as *mut core::ffi::c_void))
 }
 
-/// Run under the SCM when started as a service; return `false` for console runs.
-///
-/// Blocks until the service stops (which exits the process) — a `true` return only
-/// happens if `serve` itself returns, and then the service is reported stopped.
-pub fn dispatch() -> anyhow::Result<bool> {
-    // SAFETY: null-terminated two-entry table (our main + the required null entry).
-    // The name buffer is leaked process-lifetime (the SCM may read it until the
-    // dispatcher returns); the proc is a fn item. Fails fast with
-    // `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT` for console runs.
+/// Dispatch only when `--service` was explicitly supplied. Blocks until the service stops.
+pub fn dispatch() -> anyhow::Result<()> {
+    // SAFETY: two-entry null-terminated service table; `name` is leaked for the
+    // process lifetime because the SCM may read it until the dispatcher returns.
+    // `service_main` is a valid LPSERVICE_MAIN_FUNCTIONW with the system ABI.
     unsafe {
         let name: &'static mut [u16] = Box::leak(
             w!("slipstream-host")
@@ -66,31 +74,25 @@ pub fn dispatch() -> anyhow::Result<bool> {
             },
             SERVICE_TABLE_ENTRYW::default(),
         ];
-        match StartServiceCtrlDispatcherW(table.as_ptr()) {
-            Ok(()) => Ok(true),
-            Err(e) if is_not_service_process(&e) => Ok(false),
-            Err(e) => Err(e).context_service_dispatch(),
-        }
+        StartServiceCtrlDispatcherW(table.as_ptr()).context("StartServiceCtrlDispatcherW")?;
+        Ok(())
     }
 }
 
-/// `anyhow::Context`-shaped helper without importing it into this leaf (the crate root
-/// already depends on anyhow; this keeps the import list to windows + std).
-trait ContextServiceDispatch<T> {
-    fn context_service_dispatch(self) -> anyhow::Result<T>;
+/// Install the auto-reset stop event once, before the SCM can call the handler.
+fn install_stop_event() {
+    // SAFETY: unnamed, non-inheritable, auto-reset event; null attributes/name are valid.
+    let event = unsafe {
+        CreateEventW(None, false, false, windows::core::PCWSTR::null())
+            .expect("CreateEventW for service stop")
+    };
+    let _ = STOP_EVENT.set(event.0 as usize);
 }
 
-impl<T> ContextServiceDispatch<T> for windows::core::Result<T> {
-    fn context_service_dispatch(self) -> anyhow::Result<T> {
-        self.map_err(|e| anyhow::anyhow!("service dispatcher: {e}"))
-    }
-}
-
-/// The SCM entry point: register the control handler, run the default serve set.
-unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows::core::PWSTR) {
-    // SAFETY: handler registration on the SCM-owned ServiceMain thread; the handle is
-    // stored process-wide for the handler below. A failed registration leaves no
-    // service to report to — log to the event log is a follow-up; stderr for now.
+unsafe extern "system" fn service_main(argc: u32, argv: *mut windows::core::PWSTR) {
+    install_stop_event();
+    // SAFETY: SCM-owned ServiceMain thread; the raw handle is rebuilt only on
+    // threads that share this process and outlive the service.
     let handle = unsafe {
         match RegisterServiceCtrlHandlerExW(w!("slipstream-host"), Some(handler_ex), None) {
             Ok(h) => h,
@@ -101,19 +103,52 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows::core::PW
         }
     };
     let _ = STATUS_HANDLE.set(handle.0 as usize);
-    report_state(SERVICE_START_PENDING, 0);
-    match crate::run_default_serve() {
-        Ok(()) => {
-            report_state(SERVICE_STOPPED, 0);
+    report_state(SERVICE_STATUS_CURRENT_STATE(2), 0, 1, 10_000); // START_PENDING
+
+    let args: Vec<String> = if argc > 1 && !argv.is_null() {
+        // SAFETY: argv points to argc SCM-owned wide strings valid for ServiceMain.
+        let raw = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        raw[1..]
+            .iter()
+            .filter_map(|p| unsafe { p.to_string().ok() })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // The SCM argv includes the executable path plus `--service serve ...`.
+    let serve_args = match crate::service_serve_args(&args) {
+        Some(rest) => rest,
+        None => {
+            eprintln!("slipstream-host service: expected '--service serve [options]'");
+            report_state(SERVICE_STATUS_CURRENT_STATE(1), 1, 0, 0);
+            return;
         }
+    };
+    let (mgmt_opts, native, gamestream) = match crate::parse_serve(&serve_args[1..]) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("slipstream-host service: bad serve args: {e:#}");
+            report_state(SERVICE_STATUS_CURRENT_STATE(1), 1, 0, 0);
+            return;
+        }
+    };
+
+    let exit_code = match crate::gamestream::serve_with_stop(
+        mgmt_opts,
+        native,
+        gamestream,
+        service_stop_future(),
+    ) {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("slipstream-host service: serve failed: {e:#}");
-            report_state(SERVICE_STOPPED, 1);
+            1
         }
-    }
+    };
+    report_state(SERVICE_STATUS_CURRENT_STATE(1), exit_code, 0, 0); // STOPPED
 }
 
-/// The SCM control handler: stop (restore + exit) and interrogate (re-report).
 unsafe extern "system" fn handler_ex(
     control: u32,
     _event_type: u32,
@@ -121,50 +156,95 @@ unsafe extern "system" fn handler_ex(
     _context: *mut core::ffi::c_void,
 ) -> u32 {
     match control {
-        SERVICE_CONTROL_STOP => {
-            report_state(SERVICE_STOP_PENDING, 0);
-            // The handler must not block: restore + exit on a fresh thread, under the
-            // same grace the Unix SIGTERM path honors.
-            std::thread::spawn(|| {
-                crate::vdisplay::restore_takeover_now();
-                std::process::exit(0);
-            });
-            0 // NO_ERROR
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            report_state(SERVICE_STATUS_CURRENT_STATE(3), 0, 2, 30_000); // STOP_PENDING
+            // The control handler must return immediately. The blocking waiter performs
+            // the same graceful sequence as the console's SIGTERM path: stop sessions
+            // deliberately and hand the display back before the serve future unwinds.
+            if let Some(event) = stop_event_handle() {
+                // SAFETY: `event` is the live auto-reset handle; SetEvent is callable
+                // from a service control handler and never blocks.
+                unsafe {
+                    let _ = SetEvent(event);
+                }
+            }
+            NO_ERROR.0
         }
         SERVICE_CONTROL_INTERROGATE => {
             report_state(
                 SERVICE_STATUS_CURRENT_STATE(CURRENT_STATE.load(Ordering::SeqCst)),
                 0,
+                0,
+                0,
             );
-            0
+            NO_ERROR.0
         }
         _ => 1, // ERROR_CALL_NOT_IMPLEMENTED
     }
 }
 
-/// Report `state` to the SCM (no-op before the handle exists).
-fn report_state(state: SERVICE_STATUS_CURRENT_STATE, exit_code: u32) {
+fn report_state(state: SERVICE_STATUS_CURRENT_STATE, exit_code: u32, checkpoint: u32, wait_ms: u32) {
     CURRENT_STATE.store(state.0, Ordering::SeqCst);
     if let Some(handle) = status_handle() {
-        // SAFETY: `handle` is the live registration from `ServiceMain`; the status is
-        // a plain value struct.
+        // SAFETY: handle is the live registration from ServiceMain; SERVICE_STATUS
+        // is a plain C struct with no ownership requirements.
         unsafe {
             let _ = SetServiceStatus(
                 handle,
                 &SERVICE_STATUS {
-                    dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+                    dwServiceType: windows::Win32::System::Services::SERVICE_WIN32_OWN_PROCESS,
                     dwCurrentState: state,
-                    dwControlsAccepted: if state.0 == SERVICE_RUNNING.0 {
-                        SERVICE_ACCEPT_STOP
+                    dwControlsAccepted: if state.0 == 4 {
+                        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
                     } else {
-                        Default::default()
+                        0
                     },
                     dwWin32ExitCode: exit_code,
                     dwServiceSpecificExitCode: 0,
-                    dwCheckPoint: 0,
-                    dwWaitHint: 0,
+                    dwCheckPoint: checkpoint,
+                    dwWaitHint: wait_ms,
                 },
             );
         }
+    }
+}
+
+/// Report RUNNING once listeners are bound. Called by the serve startup hook.
+pub(crate) fn report_running() {
+    report_state(SERVICE_STATUS_CURRENT_STATE(4), 0, 0, 0);
+}
+
+/// Async wrapper used by the serve loop. The blocking Win32 wait runs on a
+/// Tokio blocking thread so it never stalls the reactor.
+pub(crate) async fn service_stop_future() {
+    let _ = tokio::task::spawn_blocking(|| {
+        wait_for_service_stop();
+        crate::session::status::stop_all_quit();
+        crate::vdisplay::restore_takeover_now();
+    })
+    .await;
+}
+
+/// Wait for STOP/SHUTDOWN. The wait runs only on a Tokio blocking thread.
+fn wait_for_service_stop() {
+    if let Some(event) = stop_event_handle() {
+        // SAFETY: live auto-reset handle; the caller is a dedicated blocking thread.
+        unsafe {
+            let _ = WaitForSingleObject(event, windows::Win32::System::Threading::INFINITE);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_state_constants_match_windows_api() {
+        assert_eq!(SERVICE_NAME, "slipstream-host");
+        assert_eq!(windows::Win32::System::Services::SERVICE_RUNNING.0, 4);
+        assert_eq!(windows::Win32::System::Services::SERVICE_START_PENDING.0, 2);
+        assert_eq!(windows::Win32::System::Services::SERVICE_STOP_PENDING.0, 3);
+        assert_eq!(windows::Win32::System::Services::SERVICE_STOPPED.0, 1);
     }
 }

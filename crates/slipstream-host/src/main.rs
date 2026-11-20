@@ -307,13 +307,15 @@ fn is_management_cli(args: &[String]) -> bool {
 }
 
 fn real_main() -> Result<()> {
-    // Windows service runs enter through the SCM (no CLI args); a console launch falls
-    // through to the normal CLI below.
-    #[cfg(target_os = "windows")]
-    if service::dispatch()? {
-        return Ok(());
-    }
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Explicit opt-in only: the SCM command line must lead with `--service`. A console
+    // launch without this flag never touches StartServiceCtrlDispatcherW, so its
+    // argument parsing and output are byte-for-byte unchanged.
+    #[cfg(target_os = "windows")]
+    if args.first().map(String::as_str) == Some("--service") {
+        return service::dispatch();
+    }
 
     // `--version` prints the build-stamped version (build.rs) to stdout and exits — no logging.
     if matches!(
@@ -721,6 +723,18 @@ pub(crate) fn run_default_serve() -> Result<()> {
     gamestream::serve(mgmt_opts, native, gamestream)
 }
 
+/// Strip the leading `--service` marker after SCM argv conversion. Returns the
+/// `serve` (or other) command line the console parser would have seen.
+#[cfg(any(target_os = "windows", test))]
+fn service_serve_args(argv: &[String]) -> Option<&[String]> {
+    match argv.first().map(String::as_str) {
+        Some("--service") => argv
+            .get(1..)
+            .filter(|rest| rest.first().map(String::as_str) == Some("serve")),
+        _ => None,
+    }
+}
+
 fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, bool)> {
     let mut opts = mgmt::Options::default();
     let mut native_port: u16 = 9777; // the native plane always runs now
@@ -826,6 +840,49 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
         .gamestream
         .unwrap_or_else(|| gamestream_flag || env_flag_enabled("SLIPSTREAM_GAMESTREAM"));
     Ok((opts, native, gamestream))
+}
+
+#[cfg(test)]
+mod service_arg_tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| (*a).to_owned()).collect()
+    }
+
+    #[test]
+    fn service_flag_strips_and_keeps_serve_options() {
+        let argv = s(&[
+            "--service",
+            "serve",
+            "--gamestream",
+            "--mgmt-bind",
+            "0.0.0.0:47990",
+        ]);
+        let rest = service_serve_args(&argv).expect("service serve args");
+        assert_eq!(
+            rest,
+            &s(&["serve", "--gamestream", "--mgmt-bind", "0.0.0.0:47990"])
+        );
+        let (mgmt, _, gs) = parse_serve(&rest[1..]).expect("parse serve options");
+        assert_eq!(mgmt.bind.to_string(), "0.0.0.0:47990");
+        assert!(gs);
+    }
+
+    #[test]
+    fn console_args_are_untouched_without_service_flag() {
+        let argv = s(&["serve", "--gamestream", "--mgmt-bind", "0.0.0.0:47990"]);
+        assert!(service_serve_args(&argv).is_none());
+        let (mgmt, _, gs) = parse_serve(&argv[1..]).expect("console parse unchanged");
+        assert_eq!(mgmt.bind.to_string(), "0.0.0.0:47990");
+        assert!(gs);
+    }
+
+    #[test]
+    fn service_flag_without_serve_is_rejected() {
+        let argv = s(&["--service", "doctor"]);
+        assert!(service_serve_args(&argv).is_none());
+    }
 }
 
 fn parse_spike(args: &[String]) -> Result<Options> {

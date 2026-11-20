@@ -24,11 +24,11 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::os::fd::{AsFd, AsRawFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_output::{self, WlOutput};
@@ -1894,7 +1894,7 @@ fn park_until_stopped(
 
 #[cfg(test)]
 mod tests {
-    use super::{KModeRow, MANAGED_PREFIX, modes_from_json, pick_custom_mode};
+    use super::{modes_from_json, pick_custom_mode, KModeRow, MANAGED_PREFIX};
 
     fn row(id: &str, w: u32, h: u32, hz: f64) -> KModeRow {
         KModeRow {

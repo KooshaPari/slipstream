@@ -3,7 +3,7 @@
 //!
 //! Flags mirror the sibling clients and the probe so an operator's muscle memory transfers:
 //! `--connect HOST[:PORT]`, `--discover [SECS]`, `--pair PIN`, `--pin HEX`, `--name LABEL`,
-//! `--mode WxHxFPS`, `--bitrate KBPS`, `--codec auto|h264|hevc|av1`, `--seconds N`,
+//! `--mode WxHxFPS`, `--bitrate KBPS`, `--codec auto|h264|hevc`, `--seconds N`,
 //! `--record FILE`, `--play FILE`.
 
 use slipstream_core::Mode;
@@ -18,6 +18,7 @@ pub struct Args {
     /// `--discover [SECS]`: browse for `_slipstream._udp` and exit.
     pub discover: Option<u64>,
     /// `--pair PIN`: run the SPAKE2 pairing ceremony and print the fingerprint to pin, then exit.
+    /// The host is taken from the positional `HOST[:PORT]` (pairing implies a target).
     pub pair: Option<String>,
     /// `--pin HEX`: the host certificate fingerprint (64 hex chars). A malformed value aborts —
     /// never silently downgrades to trust-on-first-use.
@@ -172,14 +173,19 @@ fn parse_mode(m: &str) -> Option<Mode> {
     Some(mode)
 }
 
-fn parse_codec(c: &str) -> Option<u8> {
-    use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+fn parse_codec(c: &str) -> Result<u8, String> {
+    use slipstream_core::quic::{CODEC_H264, CODEC_HEVC};
     match c.to_ascii_lowercase().as_str() {
-        "auto" => Some(0),
-        "h264" | "avc" => Some(CODEC_H264),
-        "hevc" | "h265" => Some(CODEC_HEVC),
-        "av1" => Some(CODEC_AV1),
-        _ => None,
+        "auto" => Ok(0),
+        "h264" | "avc" => Ok(CODEC_H264),
+        "hevc" | "h265" => Ok(CODEC_HEVC),
+        // The Windows client currently has no AV1 decode backend: accepting it here would
+        // negotiate a stream that aborts at decode. Reject it explicitly and honestly.
+        // Reversible: flip this branch back when the FFmpeg/MF backend supports AV1.
+        "av1" => {
+            Err("--codec av1 is not supported by the Windows client (no AV1 decode backend)".into())
+        }
+        _ => Err(format!("--codec must be auto|h264|hevc, got {c:?}")),
     }
 }
 
@@ -188,6 +194,7 @@ fn parse_codec(c: &str) -> Option<u8> {
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     let argv: Vec<String> = argv.into_iter().collect();
     let mut args = Args::default();
+    let mut explicit_connect = false;
     let mut i = 0usize;
     let value = |i: &mut usize, flag: &str| -> Result<String, String> {
         *i += 1;
@@ -197,7 +204,10 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
     };
     while i < argv.len() {
         match argv[i].as_str() {
-            "--connect" => args.connect = Some(value(&mut i, "--connect")?),
+            "--connect" => {
+                explicit_connect = true;
+                args.connect = Some(value(&mut i, "--connect")?)
+            }
             "--discover" => {
                 // Optional numeric argument: `--discover 4`, but a following flag is not one.
                 let next = argv.get(i + 1).and_then(|s| s.parse::<u64>().ok());
@@ -228,8 +238,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             }
             "--codec" => {
                 let raw = value(&mut i, "--codec")?;
-                args.preferred_codec = parse_codec(&raw)
-                    .ok_or_else(|| format!("--codec must be auto|h264|hevc|av1, got {raw:?}"))?;
+                args.preferred_codec = parse_codec(&raw)?;
             }
             "--audio-channels" => {
                 let raw = value(&mut i, "--audio-channels")?;
@@ -262,10 +271,16 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
         }
         i += 1;
     }
-    if args.connect.is_some()
-        && (args.discover.is_some() || args.pair.is_some() || args.play.is_some())
-    {
-        return Err("--connect cannot be combined with --discover, --pair or --play".into());
+    // A positional HOST plus --pair is the supported pairing shape: pairing implies a target.
+    // The explicit --connect flag stays mutually exclusive with --pair; use the positional form.
+    if explicit_connect && args.pair.is_some() {
+        return Err("--connect cannot be combined with --pair; pass the host positionally".into());
+    }
+    if args.connect.is_some() && (args.discover.is_some() || args.play.is_some()) {
+        return Err("--connect cannot be combined with --discover or --play".into());
+    }
+    if args.pair.is_some() && (args.discover.is_some() || args.play.is_some()) {
+        return Err("--pair cannot be combined with --discover or --play".into());
     }
     Ok(args)
 }
@@ -273,7 +288,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
 pub fn usage() -> &'static str {
     "usage: slipstream-windows [HOST[:PORT]] [--connect HOST[:PORT]] [--pin HEX | --pair PIN]\n\
      \x20      [--discover [SECS]] [--name LABEL] [--mode WxHxFPS] [--bitrate KBPS]\n\
-     \x20      [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
+     \x20      [--codec auto|h264|hevc] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
      \x20      [--play FILE]"
 }
 
@@ -361,6 +376,14 @@ mod tests {
     }
 
     #[test]
+    fn pair_accepts_positional_host() {
+        let a = p("host.lan --pair 1234").unwrap();
+        assert_eq!(a.connect.as_deref(), Some("host.lan"));
+        assert_eq!(a.pair.as_deref(), Some("1234"));
+        assert_eq!(a.action(), Some(Action::Pair));
+    }
+
+    #[test]
     fn pair_and_connect_conflict() {
         assert!(p("--connect h --pair 1234").is_err());
         assert_eq!(p("--pair 1234").unwrap().action(), Some(Action::Pair));
@@ -371,6 +394,8 @@ mod tests {
         assert!(p("--connect h --nope").is_err());
         assert!(p("--connect h --mode 1920x1080").is_err());
         assert!(p("--connect h --codec vp9").is_err());
+        let av1 = p("--connect h --codec av1").unwrap_err();
+        assert!(av1.contains("no AV1 decode backend"), "{av1}");
         assert!(p("--connect h --audio-channels 3").is_err());
         assert!(p("--connect h --seconds x").is_err());
         assert!(p("--connect h --bitrate fast").is_err());

@@ -354,6 +354,13 @@ fn resolve(t: &Target) -> Result<SocketAddr> {
 /// `--pair PIN`: the SPAKE2 ceremony. On success the host trusts this client's certificate, so
 /// later connects are admitted without a PIN — only the fingerprint pin matters.
 fn pair(args: &Args) -> Result<()> {
+    // Pairing implies a target. HOST --pair PIN resolves the positional host through the same
+    // path as connect; with no host, fail loudly rather than guessing.
+    if args.connect.is_none() {
+        return Err(anyhow!(
+            "--pair needs a host: use slipstream-windows HOST --pair PIN"
+        ));
+    }
     let addr = resolve(&target_of(args)?)?;
     let pin = args.pair.as_deref().context("--pair needs a PIN")?;
     let (cert, key) = identity::load_or_create()?;
@@ -416,9 +423,10 @@ async fn stream_async(args: Args) -> Result<()> {
             // 10-bit/4:4:4 we cannot render.
             video_caps: 0,
             audio_channels: args.audio_channels,
-            video_codecs: slipstream_core::quic::CODEC_H264
-                | slipstream_core::quic::CODEC_HEVC
-                | slipstream_core::quic::CODEC_AV1,
+            // This client has no AV1 decode backend. Advertise only the codecs its FFmpeg/MF
+            // paths can actually decode; --codec av1 is rejected at parse time. Reversible: add
+            // CODEC_AV1 here when a real AV1 backend lands.
+            video_codecs: slipstream_core::quic::CODEC_H264 | slipstream_core::quic::CODEC_HEVC,
             preferred_codec: args.preferred_codec,
             display_hdr: slipstream_core::client::display_hdr_env_override(),
             client_caps: 0,
@@ -659,7 +667,9 @@ async fn stream_async(args: Args) -> Result<()> {
                 }
                 Err(SlipstreamError::NoFrame) => {
                     let t_spin = Instant::now();
-                    std::thread::sleep(Duration::from_micros(300));
+                    // A plain sleep here leaves Win32 messages queued: X/Esc cannot close the
+                    // window while no frame arrives. Pump for the same 300 µs interval instead.
+                    presenter.pump_for(Duration::from_micros(300));
                     spin_ns = t_spin.elapsed().as_nanos() as u64;
                     stats.spins += 1;
                     // Poll+spin without a frame still costs the same wall time; attribute it to

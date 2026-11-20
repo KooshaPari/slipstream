@@ -19,6 +19,7 @@ mod connect;
 mod discovery;
 mod ff;
 mod identity;
+mod input;
 mod mf;
 mod present;
 mod session;
@@ -208,6 +209,7 @@ fn play(args: &Args) -> Result<()> {
         &format!("slipstream — {path}"),
         args.mode.width,
         args.mode.height,
+        None,
     )
     .context("create window")?;
     let aus = split_aus(&data);
@@ -362,7 +364,21 @@ fn stream(args: Args) -> Result<()> {
 
 async fn stream_async(args: Args) -> Result<()> {
     let remote = resolve(&target_of(&args)?)?;
-    match run_stream(SessionConfig { remote, args }).await? {
+    let headless = std::env::var_os("SLIPSTREAM_WINDOWS_HEADLESS").is_some();
+    let (input, input_rx) = if headless {
+        (None, None)
+    } else {
+        let (sender, rx) = input::InputSender::channel();
+        (Some(sender), Some(rx))
+    };
+    match run_stream(SessionConfig {
+        remote,
+        args,
+        input,
+        input_rx,
+    })
+    .await?
+    {
         SessionOutcome::ZeroFrames => {
             tracing::warn!(
                 "zero frames: the host accepted the session but published none \

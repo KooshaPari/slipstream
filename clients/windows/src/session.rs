@@ -9,22 +9,29 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use slipstream_core::config::Role;
+use slipstream_core::input::InputEvent;
 use slipstream_core::packet::FLAG_PROBE;
 use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
 use slipstream_core::transport::UdpTransport;
 use slipstream_core::{Session, SlipstreamError};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::args::{hex, Args};
 use crate::connect::{self, Admission, Machine};
 use crate::identity;
+use crate::input::{InputSender, InputSenderGuard};
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
 use crate::{ff, mf, window, PipeStats};
 
 /// Inputs needed to run one client session. The CLI has already parsed and resolved these.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionConfig {
     pub remote: SocketAddr,
     pub args: Args,
+    /// Input route created by the CLI boundary. `None` keeps headless/record-only runs quiet.
+    pub input: Option<InputSender>,
+    /// Receiver paired with `input`; handed to the QUIC datagram pump once admitted.
+    pub input_rx: Option<UnboundedReceiver<InputEvent>>,
 }
 
 /// How a session ended. Every normal termination has a variant; unexpected I/O and protocol errors
@@ -74,7 +81,12 @@ pub enum SessionStop {
 
 /// Run one streaming session to completion.
 pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
-    let SessionConfig { remote, args } = cfg;
+    let SessionConfig {
+        remote,
+        args,
+        input,
+        input_rx,
+    } = cfg;
     let (cert, key) = identity::load_or_create()?;
     let (ep, observed) =
         endpoint::client_pinned_with_identity(args.pin, Some((cert.as_str(), key.as_str())));
@@ -163,6 +175,18 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         }
     }
 
+    // Admission is the first gate: input events before this point are never queued. The second
+    // gate is window focus, maintained by WM_ACTIVATE/WM_SETFOCUS/WM_KILLFOCUS in `window.rs`.
+    let _input_guard = input.as_ref().map(|s| {
+        s.set_enabled(true);
+        InputSenderGuard::new(s.clone())
+    });
+    if let (Some(sender), Some(rx)) = (&input, input_rx) {
+        let pump_conn = conn.clone();
+        let pump_sender = sender.clone();
+        tokio::spawn(async move { pump_sender.pump(rx, pump_conn).await });
+    }
+
     // Reserve our data-plane port, then let the host start.
     let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
     let udp_port = probe.local_addr()?.port();
@@ -247,6 +271,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                 &format!("slipstream — {host_label}"),
                 mode.width,
                 mode.height,
+                input.clone(),
             ) {
                 Ok(p) => Box::new(p),
                 Err(e) => {

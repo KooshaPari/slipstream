@@ -8,11 +8,19 @@
 //! Everything runs on the session thread: the window is created there, messages are pumped with a
 //! non-blocking `PeekMessageW` on every present, and closing the window (or pressing Esc) ends the
 //! session instead of hanging it.
+//!
+//! With an [`InputSender`](crate::input::InputSender), the same messages become wire input events:
+//! VK down/up, relative mouse deltas, five mouse buttons, and 120-scaled wheel deltas. Focus gates
+//! the stream; losing focus forces key/button releases so the host never keeps a stuck modifier.
+
 #![allow(unsafe_code)]
 
+use crate::input::{key, mouse_button, mouse_move, wheel, InputSender};
 use crate::present::{DecodedFrame, Presenter};
 use anyhow::{Context, Result};
+use slipstream_core::input::InputEvent;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -23,20 +31,118 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, PeekMessageW,
-    RegisterClassW, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect,
+    PeekMessageW, RegisterClassW, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW,
+    WA_INACTIVE, WINDOW_EX_STYLE, WNDCLASSW, WM_ACTIVATE, WM_CLOSE, WM_DESTROY,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETFOCUS, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE, XBUTTON1, XBUTTON2,
 };
 
 /// Set by the window procedure when the user closes the window or presses Esc.
 static CLOSED: AtomicBool = AtomicBool::new(false);
 
-const WM_DESTROY: u32 = 0x0002;
-const WM_CLOSE: u32 = 0x0010;
-const WM_KEYDOWN: u32 = 0x0100;
 const VK_ESCAPE: usize = 0x1B;
 
+/// Per-window input state, written only by the window procedure.
+#[derive(Default)]
+struct InputState {
+    sender: Option<InputSender>,
+    /// VK codes currently held (bits 0..255 across four u64s).
+    held_keys: [u64; 4],
+    /// Mouse buttons currently held (bits 1..5).
+    held_buttons: u8,
+    /// Last cursor point for delta calculation; `None` until the first mouse message.
+    last_point: Option<(i32, i32)>,
+}
+
+/// One slot per live window, keyed by `HWND` value. The client has one presentation window per
+/// session; using a table instead of a global keeps a stale window from receiving a later
+/// session's input after reconnect.
+static INPUT_STATE: Mutex<Vec<(usize, Arc<Mutex<InputState>>)>> = Mutex::new(Vec::new());
+
+fn state_for(hwnd: HWND) -> Arc<Mutex<InputState>> {
+    let key = hwnd.0 as usize;
+    let mut table = INPUT_STATE.lock().unwrap();
+    if let Some((_, state)) = table.iter().find(|(k, _)| *k == key) {
+        return state.clone();
+    }
+    let state = Arc::new(Mutex::new(InputState::default()));
+    table.push((key, state.clone()));
+    state
+}
+
+fn remove_state(hwnd: HWND) {
+    let key = hwnd.0 as usize;
+    INPUT_STATE.lock().unwrap().retain(|(k, _)| *k != key);
+}
+
+fn submit(state: &Arc<Mutex<InputState>>, ev: Option<InputEvent>) {
+    if let Some(ev) = ev {
+        if let Some(sender) = state.lock().unwrap().sender.as_ref() {
+            sender.submit(ev);
+        }
+    }
+}
+
+fn release_held_input(state: &Arc<Mutex<InputState>>) {
+    let (sender, keys, buttons) = {
+        let mut state = state.lock().unwrap();
+        if let Some(sender) = state.sender.as_ref() {
+            sender.set_focused(false);
+        }
+        let keys = std::mem::take(&mut state.held_keys);
+        let buttons = std::mem::take(&mut state.held_buttons);
+        state.last_point = None;
+        (state.sender.clone(), keys, buttons)
+    };
+    let Some(sender) = sender else {
+        return;
+    };
+    for (word, bits) in keys.into_iter().enumerate() {
+        for bit in 0..64 {
+            if bits & (1u64 << bit) != 0 {
+                let vk = word * 64 + bit;
+                if let Some(ev) = key(false, vk as u32) {
+                    sender.submit_release(ev);
+                }
+            }
+        }
+    }
+    for button in 1..=5u8 {
+        if buttons & (1 << button) != 0 {
+            if let Some(ev) = mouse_button(false, button as u32) {
+                sender.submit_release(ev);
+            }
+        }
+    }
+}
+
+fn lparam_x(lparam: LPARAM) -> i32 {
+    (lparam.0 as i16) as i32
+}
+
+fn lparam_y(lparam: LPARAM) -> i32 {
+    ((lparam.0 >> 16) as i16) as i32
+}
+
+fn wheel_delta(wparam: WPARAM) -> i32 {
+    // The high word of WPARAM is already measured in WHEEL_DELTA (120) units for both
+    // WM_MOUSEWHEEL and WM_MOUSEHWHEEL; the host injector uses the same scale.
+    ((wparam.0 >> 16) as i16) as i32
+}
+
+fn xbutton(wparam: WPARAM) -> u32 {
+    match ((wparam.0 >> 16) as u16) & 0xffff {
+        XBUTTON1 => 4,
+        XBUTTON2 => 5,
+        _ => 0,
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let state = state_for(hwnd);
     match msg {
         WM_CLOSE => {
             CLOSED.store(true, Ordering::Relaxed);
@@ -45,12 +151,95 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             CLOSED.store(true, Ordering::Relaxed);
+            release_held_input(&state);
+            remove_state(hwnd);
             unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == VK_ESCAPE => {
             unsafe { windows::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }
                 .ok();
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            if (wparam.0 as u16) == WA_INACTIVE as u16 {
+                release_held_input(&state);
+            } else if let Some(sender) = state.lock().unwrap().sender.as_ref() {
+                sender.set_focused(true);
+            }
+            LRESULT(0)
+        }
+        WM_SETFOCUS => {
+            if let Some(sender) = state.lock().unwrap().sender.as_ref() {
+                sender.set_focused(true);
+            }
+            LRESULT(0)
+        }
+        WM_KILLFOCUS => {
+            release_held_input(&state);
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let vk = wparam.0 as usize;
+            if vk < 256 {
+                state.lock().unwrap().held_keys[vk / 64] |= 1u64 << (vk % 64);
+            }
+            submit(&state, key(true, wparam.0 as u32));
+            LRESULT(0)
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            let vk = wparam.0 as usize;
+            if vk < 256 {
+                state.lock().unwrap().held_keys[vk / 64] &= !(1u64 << (vk % 64));
+            }
+            submit(&state, key(false, wparam.0 as u32));
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = (lparam_x(lparam), lparam_y(lparam));
+            let mut state = state.lock().unwrap();
+            if let Some((px, py)) = state.last_point {
+                let ev = mouse_move(x - px, y - py);
+                if let (Some(ev), Some(sender)) = (ev, state.sender.as_ref()) {
+                    sender.submit(ev);
+                }
+            }
+            state.last_point = Some((x, y));
+            drop(state);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_RBUTTONDOWN | WM_XBUTTONDOWN => {
+            let button = match msg {
+                WM_LBUTTONDOWN => 1,
+                WM_MBUTTONDOWN => 2,
+                WM_RBUTTONDOWN => 3,
+                _ => xbutton(wparam),
+            };
+            if button >= 1 && button <= 5 {
+                state.lock().unwrap().held_buttons |= 1 << button;
+            }
+            submit(&state, mouse_button(true, button));
+            LRESULT(0)
+        }
+        WM_LBUTTONUP | WM_MBUTTONUP | WM_RBUTTONUP | WM_XBUTTONUP => {
+            let button = match msg {
+                WM_LBUTTONUP => 1,
+                WM_MBUTTONUP => 2,
+                WM_RBUTTONUP => 3,
+                _ => xbutton(wparam),
+            };
+            if button >= 1 && button <= 5 {
+                state.lock().unwrap().held_buttons &= !(1 << button);
+            }
+            submit(&state, mouse_button(false, button));
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            submit(&state, wheel(wheel_delta(wparam), false));
+            LRESULT(0)
+        }
+        WM_MOUSEHWHEEL => {
+            submit(&state, wheel(wheel_delta(wparam), true));
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -84,8 +273,9 @@ pub struct GdiPresenter {
 unsafe impl Send for GdiPresenter {}
 
 impl GdiPresenter {
-    /// Create the window and the DIB section. `title` goes in the caption.
-    pub fn new(title: &str, width: u32, height: u32) -> Result<Self> {
+    /// Create the window and the DIB section. `title` goes in the caption. With `input`, captured
+    /// Win32 messages are forwarded to the host through that gated route.
+    pub fn new(title: &str, width: u32, height: u32, input: Option<InputSender>) -> Result<Self> {
         let width = width.max(2);
         let height = height.max(2);
         let class_name = wide("slipstream-window");
@@ -130,6 +320,7 @@ impl GdiPresenter {
             )
         }
         .context("CreateWindowExW")?;
+        state_for(hwnd).lock().unwrap().sender = input;
         let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
 
         let hdc_mem = unsafe { CreateCompatibleDC(None) };
@@ -351,6 +542,7 @@ impl Presenter for GdiPresenter {
 
 impl Drop for GdiPresenter {
     fn drop(&mut self) {
+        remove_state(self.hwnd);
         unsafe {
             let _ = SelectObject(self.hdc_mem, self._old);
             let _ = DeleteObject(HGDIOBJ(self.dib.0));

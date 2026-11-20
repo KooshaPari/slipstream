@@ -307,7 +307,14 @@ fn is_kwin_compositor_comm(comm: &str, cmdline: Option<&[u8]>) -> bool {
     // appear in the 15-character `comm` field, so it is only recognized through argv0.
     match comm {
         "kwin_wayland" => true,
-        ".kwin_wayland-w" => argv0_is(cmdline, &[b"kwin_wayland", b"kwin_wayland_wrapper"]),
+        ".kwin_wayland-w" => argv0_is(
+            cmdline,
+            &[
+                b"kwin_wayland",
+                b"kwin_wayland_wrapper",
+                b"kwin_wayland-wrapped",
+            ],
+        ),
         ".kwin_wayland_w" => argv0_is(cmdline, &[b"kwin_wayland_wrapper"]),
         _ => false,
     }
@@ -746,6 +753,10 @@ mod tests {
         assert!(is_kwin_compositor_comm(
             ".kwin_wayland-w",
             Some(b"/usr/bin/kwin_wayland\0")
+        ));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b"/nix/store/abc/kwin_wayland-wrapped\0")
         ));
         assert!(is_kwin_compositor_comm(
             ".kwin_wayland_w",

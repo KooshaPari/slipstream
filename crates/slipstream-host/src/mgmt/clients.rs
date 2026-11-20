@@ -97,6 +97,7 @@ pub(crate) fn client_info(der: &[u8]) -> PairedClient {
         (status = BAD_REQUEST, description = "Malformed fingerprint", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
         (status = NOT_FOUND, description = "No paired client with that fingerprint", body = ApiError),
+        (status = SERVICE_UNAVAILABLE, description = "Pairing store could not be persisted; the client is still paired", body = ApiError),
     )
 )]
 pub(crate) async fn unpair_client(
@@ -110,13 +111,23 @@ pub(crate) async fn unpair_client(
         );
     }
     let mut paired = st.app.paired.lock().unwrap_or_else(|e| e.into_inner());
+    let original = paired.clone();
     let before = paired.len();
     paired.retain(|der| !hex::encode(Sha256::digest(der)).eq_ignore_ascii_case(&fingerprint));
     if paired.len() < before {
         // Write through, or a host restart would reload the cert from `paired.json` and silently
         // undo the revocation. `peer_is_paired` reads this store live, so the removal already
-        // blocks the next launch; the save is what makes it survive a restart.
-        crate::protocol::gamestream::save_paired(&paired);
+        // blocks the next launch; the save is what makes it survive a restart. If the save fails,
+        // restore the in-memory entry so the API does not report a revocation that will vanish on
+        // the next restart, and answer 503 so the caller can retry.
+        if let Err(error) = crate::protocol::gamestream::save_paired(&paired) {
+            tracing::error!(%error, fingerprint, "management API: unpair could not be persisted");
+            *paired = original;
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "pairing store could not be persisted; client is still paired",
+            );
+        }
         tracing::info!(fingerprint, "management API: client unpaired");
         StatusCode::NO_CONTENT.into_response()
     } else {

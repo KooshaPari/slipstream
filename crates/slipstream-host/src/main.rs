@@ -187,7 +187,9 @@ mod timer_resolution {
 
     /// Best-effort: a failure is reported but never fatal, because a coarse timer degrades
     /// smoothness rather than correctness.
-    pub(crate) struct TimerResolution;
+    pub(crate) struct TimerResolution {
+        acquired: bool,
+    }
 
     impl TimerResolution {
         pub(crate) fn acquire() -> Self {
@@ -202,24 +204,28 @@ mod timer_resolution {
             } else {
                 tracing::debug!(timer_period_ms = 1, "raised Windows timer resolution");
             }
-            Self
+            Self { acquired: rc == 0 }
+        }
+
+        pub(crate) fn release(&mut self) {
+            if !self.acquired {
+                return;
+            }
+            unsafe {
+                timeEndPeriod(1);
+            }
+            self.acquired = false;
         }
     }
 
     impl Drop for TimerResolution {
         fn drop(&mut self) {
-            unsafe {
-                let _ = timeEndPeriod(1);
-            }
+            self.release();
         }
     }
 }
 
 fn main() {
-    // Must outlive every thread that paces or sleeps; held for the whole of `main`.
-    #[cfg(target_os = "windows")]
-    let _timer_resolution = timer_resolution::TimerResolution::acquire();
-
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     // Logs go to stderr so stdout stays machine-readable (`slipstream-host openapi > spec.json`).
@@ -262,10 +268,19 @@ fn main() {
         );
         default_panic(info);
     }));
+    // P83-9: install tracing first so the acquire failure warning is captured by the ring and
+    // stderr layers. The guard still outlives every thread that paces or sleeps.
+    #[cfg(target_os = "windows")]
+    let mut timer_resolution = timer_resolution::TimerResolution::acquire();
     if let Err(e) = real_main() {
         tracing::error!("{e:#}");
+        // P83-10: `process::exit` skips Drop; release explicitly before every exit path.
+        #[cfg(target_os = "windows")]
+        timer_resolution.release();
         std::process::exit(1);
     }
+    #[cfg(target_os = "windows")]
+    timer_resolution.release();
 }
 
 /// A lightweight management/CLI subcommand, such as a plugin or API operation, skips streaming

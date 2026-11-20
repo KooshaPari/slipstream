@@ -2600,7 +2600,6 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // stats slot, and correct the client's mode slot when it differs from the accept
                 // ack it already got.
                 let actual = delivered_mode(frame.width, frame.height, interval);
-                cur_mode = actual;
                 live_mode.store(
                     pack_mode(actual.width, actual.height, actual.refresh_hz),
                     Ordering::Relaxed,
@@ -2611,6 +2610,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         mode: actual,
                     });
                 }
+                cur_mode = actual;
                 // The owed AUs died with the old encoder  -  drop their in-flight records
                 // and restart the encode-stall clock for the fresh one.
                 inflight.clear();
@@ -3278,7 +3278,6 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // one in both the stats slot and a corrective accepted ack, and rebuild from it
                 // next time.
                 let actual = delivered_mode(frame.width, frame.height, interval);
-                cur_mode = actual;
                 live_mode.store(
                     pack_mode(actual.width, actual.height, actual.refresh_hz),
                     Ordering::Relaxed,
@@ -3289,6 +3288,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         mode: actual,
                     });
                 }
+                cur_mode = actual;
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 last_forced_idr = Some(std::time::Instant::now()); // anchor the IDR cooldown from the rebuild
                 next = std::time::Instant::now();

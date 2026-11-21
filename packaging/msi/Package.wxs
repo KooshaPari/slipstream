@@ -16,8 +16,10 @@
     <SummaryInformation Description="Slipstream Windows host, tray and client"
                         Manufacturer="Slipstream contributors" />
 
-    <!-- AllowSameVersionUpgrades="yes" permits same-version reinstall; the shared UpgradeCode
-         and DowngradeErrorMessage block downgrades. No custom ProductCode is authored. -->
+    <!-- WIX1076 / ICE61 warning is expected here and must not be silenced by deleting the
+         attribute: ProductCode changes on every build, so same-version rebuilds need this setting to
+         replace the previous build instead of stacking beside it. Published versions are never
+         rebuilt, so the setting is inert for releases. -->
     <MajorUpgrade Schedule="afterInstallValidate"
                   DowngradeErrorMessage="A newer version of Slipstream is already installed."
                   AllowSameVersionUpgrades="yes" />

@@ -77,6 +77,12 @@ Do not undo these rules:
   existing copy instead of sitting beside it. This is deliberate and tied to the never-rebuild rule:
   same-version reinstalls are only safe because a published version has exactly one build.
   `DowngradeErrorMessage` blocks downgrades. Keep both.
+- WiX ICE validation emits `WIX1076` from ICE61 for this `MajorUpgrade`: the maximum upgrade version
+  is not less than the current product. That warning is accepted, not a defect. Because `ProductCode`
+  changes on every build, without `AllowSameVersionUpgrades` a same-version rebuild would install
+  beside the previous build, reintroducing the stacking bug. For published versions the setting is
+  inert because they are never rebuilt. If the project ever moves to fixed per-version
+  `ProductCode`s, revisit `AllowSameVersionUpgrades` then.
 
 Because the payload guard refuses to build with placeholder exes, compile validation of these changes
 waits for the real release artifacts.

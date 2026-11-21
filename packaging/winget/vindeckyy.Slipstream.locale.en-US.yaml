@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+PackageIdentifier: vindeckyy.Slipstream
+PackageVersion: 0.24.0
+PackageLocale: en-US
+Publisher: vindeckyy
+PublisherUrl: https://github.com/vindeckyy
+PackageName: Slipstream
+PackageUrl: https://github.com/vindeckyy/slipstream
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/vindeckyy/slipstream/blob/main/LICENSE-MIT
+ShortDescription: Low-latency desktop and game streaming from a host to the devices you already use.
+Tags:
+- Streaming
+- GameStream
+- Remote-Desktop
+- Self-Hosted
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0

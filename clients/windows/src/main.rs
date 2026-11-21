@@ -368,7 +368,7 @@ async fn stream_async(args: Args) -> Result<()> {
                 "zero frames: the host accepted the session but published none \
                  (a wedged host capture thread does this — it is a host-side bug, not a client one)"
             );
-            std::process::exit(3);
+            Ok(())
         }
         SessionOutcome::Ended
         | SessionOutcome::ConnectFailed

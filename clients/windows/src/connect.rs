@@ -108,9 +108,9 @@ impl Admission {
             Admission::ConfirmTrust => {
                 format!("{host} is not paired yet; confirm its fingerprint to trust it")
             }
-            Admission::RefuseUnpaired => format!(
-                "{host} is not paired yet. Pair with its PIN (--pair) before streaming."
-            ),
+            Admission::RefuseUnpaired => {
+                format!("{host} is not paired yet. Pair with its PIN (--pair) before streaming.")
+            }
         }
     }
 }
@@ -231,7 +231,10 @@ impl Machine {
     /// The user confirmed the fingerprint on the TOFU card.
     pub fn trusted(&mut self) -> Result<Transition, String> {
         if self.phase != Phase::AwaitingTrust {
-            return Err(format!("no pending trust decision (phase {:?})", self.phase));
+            return Err(format!(
+                "no pending trust decision (phase {:?})",
+                self.phase
+            ));
         }
         self.phase = Phase::Streaming;
         Ok(Transition::Stay(Phase::Streaming, "trusted".into()))
@@ -362,7 +365,10 @@ mod tests {
         m.connect("h").unwrap();
         assert_eq!(
             m.admitted(Admission::ConfirmTrust),
-            Transition::Stay(Phase::AwaitingTrust, "h is not paired yet; confirm its fingerprint to trust it".into())
+            Transition::Stay(
+                Phase::AwaitingTrust,
+                "h is not paired yet; confirm its fingerprint to trust it".into()
+            )
         );
         assert!(!m.can_send_input());
         assert!(m.trusted().is_ok());
@@ -377,16 +383,26 @@ mod tests {
         m.connect("100.112.143.99:9777").unwrap();
         let t = m.failed(&ConnectOutcome::ApprovalTimeout);
         match t {
-            Transition::DropAndIdle(msg) => assert!(msg.contains("180 s") && msg.contains("console")),
+            Transition::DropAndIdle(msg) => {
+                assert!(msg.contains("180 s") && msg.contains("console"))
+            }
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(m.phase, Phase::Idle);
 
         let msg = ConnectOutcome::PinMismatch.message("h");
         assert!(msg.contains("different certificate"));
-        assert!(ConnectOutcome::Unreachable.message("h").contains("is slipstream-host running"));
-        assert_eq!(ConnectOutcome::from_status(0x0107), ConnectOutcome::ApprovalTimeout);
-        assert_eq!(ConnectOutcome::from_status(0x0103), ConnectOutcome::Rejected(0x0103));
+        assert!(ConnectOutcome::Unreachable
+            .message("h")
+            .contains("is slipstream-host running"));
+        assert_eq!(
+            ConnectOutcome::from_status(0x0107),
+            ConnectOutcome::ApprovalTimeout
+        );
+        assert_eq!(
+            ConnectOutcome::from_status(0x0103),
+            ConnectOutcome::Rejected(0x0103)
+        );
     }
 
     #[test]

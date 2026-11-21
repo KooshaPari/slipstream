@@ -139,7 +139,10 @@ pub fn key(down: bool, vk: u32) -> Option<InputEvent> {
 
 /// GameStream mouse button id → `MouseButtonDown`/`MouseButtonUp`.
 pub fn mouse_button(down: bool, button: u32) -> Option<InputEvent> {
-    if !matches!(button, MOUSE_LEFT | MOUSE_MIDDLE | MOUSE_RIGHT | MOUSE_X1 | MOUSE_X2) {
+    if !matches!(
+        button,
+        MOUSE_LEFT | MOUSE_MIDDLE | MOUSE_RIGHT | MOUSE_X1 | MOUSE_X2
+    ) {
         return None;
     }
     Some(InputEvent {
@@ -217,7 +220,10 @@ mod tests {
             let ev = mouse_button(true, id).unwrap();
             assert_eq!(ev.kind, InputKind::MouseButtonDown);
             assert_eq!(ev.code, id, "{name}");
-            assert_eq!(mouse_button(false, id).unwrap().kind, InputKind::MouseButtonUp);
+            assert_eq!(
+                mouse_button(false, id).unwrap().kind,
+                InputKind::MouseButtonUp
+            );
         }
         assert!(mouse_button(true, 0).is_none());
         assert!(mouse_button(true, 6).is_none());

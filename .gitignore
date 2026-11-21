@@ -41,3 +41,8 @@ clients/android/ci/__pycache__/
 /dist/
 /crates/pyrowave-sys/vendor/pyrowave/Granite/application/platforms/android/**/.gradle/
 /crates/pyrowave-sys/vendor/pyrowave/Granite/application/platforms/android/**/build/
+packaging/msi/obj/
+packaging/msi/bin/
+/packaging/msi/Slipstream.msi
+/packaging/msi/Slipstream.wixpdb
+/packaging/msi/slipstream.ico

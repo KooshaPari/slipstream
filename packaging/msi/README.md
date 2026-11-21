@@ -56,6 +56,24 @@ The requested `slipstream-client-windows.exe` does not exist anywhere in the `b2
 only Windows-capable client in this checkout is the headless CLI at `clients/cli`, whose binary is
 `slipstream.exe`. A native Windows GUI client build step is still missing upstream.
 
+## Identity and upgrade rules
+
+Do not undo these rules:
+
+- `UpgradeCode` is `6E8D3A28-9F1C-4A2B-8D3E-7C1F4A6B9E52` and is fixed forever. Changing it makes
+  Windows treat the next MSI as an unrelated product and leaves two installed copies.
+- `ProductCode` is not authored in `Package.wxs`. WiX auto-generates a distinct one for every build,
+  which is what allows MajorUpgrade to detect and replace the previous product. Never add a literal
+  `ProductCode`.
+- `Version` comes from the single `Version` define in `Slipstream.wixproj` and is used in `Package.wxs`
+  as `$(Version)`. Release builds can override it with `-d:Version=<major.minor.build.revision>`.
+  Do not replace the variable with a literal.
+- `MajorUpgrade` uses `AllowSameVersionUpgrades="yes"` so a same-version reinstall is allowed, and
+  `DowngradeErrorMessage` so a downgrade is blocked. Keep both.
+
+Because the payload guard refuses to build with placeholder exes, compile validation of these changes
+waits for the real release artifacts.
+
 ## Installed layout
 
 `[ProgramFiles64Folder]\Slipstream`: the three exes, `slipstream.ico`, and

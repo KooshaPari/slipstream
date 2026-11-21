@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:fire="http://wixtoolset.org/schemas/v4/wxs/firewall">
-  <!-- x64, per-machine installer. Version/UpgradeCode live here so the build command needs no
-       -d defines; see README.md for regeneration. -->
+  <!-- Identity contract (see README.md): UpgradeCode is fixed forever; ProductCode is auto-generated
+       by the compiler when omitted, so each build/version is distinct; Version is supplied by the
+       build project and can be overridden with -d:Version=... . -->
   <Package Name="Slipstream"
            Language="1033"
-           Version="0.24.0.0"
+           Version="$(Version)"
            UpgradeCode="6E8D3A28-9F1C-4A2B-8D3E-7C1F4A6B9E52"
            Manufacturer="Slipstream contributors"
            InstallerVersion="200"
@@ -15,7 +16,11 @@
     <SummaryInformation Description="Slipstream Windows host, tray and client"
                         Manufacturer="Slipstream contributors" />
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Slipstream is already installed." />
+    <!-- AllowSameVersionUpgrades="yes" permits same-version reinstall; the shared UpgradeCode
+         and DowngradeErrorMessage block downgrades. No custom ProductCode is authored. -->
+    <MajorUpgrade Schedule="afterInstallValidate"
+                  DowngradeErrorMessage="A newer version of Slipstream is already installed."
+                  AllowSameVersionUpgrades="yes" />
     <MediaTemplate EmbedCab="yes" />
 
     <Property Id="ARPPRODUCTICON" Value="SlipstreamIcon" />

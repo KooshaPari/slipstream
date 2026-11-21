@@ -25,6 +25,7 @@ fn event(kind: InputKind, code: u32, x: i32, y: i32, flags: u32) -> InputEvent {
 pub struct InputBuffer {
     queue: VecDeque<InputEvent>,
     held: Vec<InputEvent>,
+    held_buttons: Vec<u32>,
     mouse: Option<InputEvent>,
     last_drop_log: Option<Instant>,
     dropped_mouse: u64,
@@ -41,6 +42,7 @@ impl InputBuffer {
         Self {
             queue: VecDeque::with_capacity(INPUT_QUEUE_DEPTH),
             held: Vec::new(),
+            held_buttons: Vec::new(),
             mouse: None,
             last_drop_log: None,
             dropped_mouse: 0,
@@ -57,6 +59,12 @@ impl InputBuffer {
             // A key-up always wins: it cancels the held key and replaces any pending move only
             // after key events have been given priority below.
             self.held.retain(|h| !(h.kind == InputKind::KeyDown && h.code == ev.code));
+        } else if ev.kind == InputKind::MouseButtonDown {
+            if !self.held_buttons.contains(&ev.code) {
+                self.held_buttons.push(ev.code);
+            }
+        } else if ev.kind == InputKind::MouseButtonUp {
+            self.held_buttons.retain(|c| *c != ev.code);
         }
         if matches!(ev.kind, InputKind::MouseMoveAbs | InputKind::MouseMove) {
             // Coalesce before enqueue: only the latest pointer position matters.
@@ -138,6 +146,9 @@ impl InputBuffer {
             }
         }
         self.held.clear();
+        for code in self.held_buttons.drain(..) {
+            releases.push(event(InputKind::MouseButtonUp, code, 0, 0, 0));
+        }
         releases
     }
 }
@@ -243,6 +254,16 @@ mod tests {
         assert!(releases.iter().any(|e| e.code == 0x11));
         assert!(releases.iter().any(|e| e.code == 0x41));
         assert!(b.release_all().is_empty(), "release is idempotent");
+    }
+
+    #[test]
+    fn focus_loss_releases_held_mouse_buttons() {
+        let mut b = InputBuffer::new();
+        b.push(event(InputKind::MouseButtonDown, MOUSE_LBUTTON, 0, 0, 0));
+        let releases = b.release_all();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].kind, InputKind::MouseButtonUp);
+        assert_eq!(releases[0].code, MOUSE_LBUTTON);
     }
 
     #[test]

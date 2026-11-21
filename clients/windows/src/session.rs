@@ -218,6 +218,11 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             .context("bind data plane")?;
         let input = InputRouter::default();
         window::set_input_router(input.clone());
+        struct ReleaseOnDrop(InputRouter);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) { self.0.release_all(); }
+        }
+        let _release = ReleaseOnDrop(input.clone());
         let mut session =
             Session::new(session_cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;
         let mut sink = match &record {

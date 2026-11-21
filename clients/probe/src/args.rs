@@ -6,6 +6,7 @@ use slipstream_core::quic::endpoint;
 use slipstream_core::{CompositorPref, Mode};
 use std::io::Write;
 
+#[derive(Debug)]
 pub(crate) struct Args {
     pub(crate) connect: String,
     pub(crate) mode: Mode,
@@ -37,7 +38,8 @@ pub(crate) struct Args {
     /// encoder rate retarget (Phase 3.2) / rebuild fallback. Wiggles the cursor around the switch
     /// so a damage-driven idle desktop actually publishes frames through it.
     pub(crate) rebitrate: Option<(u32, u32)>,
-    /// `--pair PIN` — run the pairing ceremony instead of a session.
+    /// `--pair PIN` — run the pairing ceremony instead of a session. The host may be supplied with
+    /// `--connect HOST:PORT` (legacy shape) or as a positional `HOST:PORT` token.
     pub(crate) pair: Option<String>,
     /// `--name LABEL` — how the host labels this client when pairing.
     pub(crate) name: String,
@@ -150,14 +152,54 @@ pub(crate) fn load_or_create_identity() -> Result<(String, String)> {
     Ok((c, k))
 }
 
-pub(crate) fn parse_args() -> Args {
-    let argv: Vec<String> = std::env::args().collect();
+/// Parse a supplied argv into [`Args`]. Kept pure so the real CLI grammar can be tested without
+/// touching the network, a host, or identity files.
+pub(crate) fn parse_args_from(argv: &[String]) -> Result<Args> {
     let get = |flag: &str| {
         argv.iter()
             .skip_while(|a| *a != flag)
             .nth(1)
             .map(String::as_str)
+            // A flag with no following token (or followed by another flag) has no value.
+            .filter(|v| !v.starts_with("--"))
     };
+    let has = |flag: &str| argv.iter().any(|a| a == flag);
+    // Non-flag tokens that are not the value of a value-taking flag. Used only to resolve the
+    // pairing host; the probe's normal connect path remains --connect-only.
+    let positional_hosts: Vec<&str> = argv
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            if i == 0 || a.starts_with('-') {
+                return None; // argv[0] is the program name, not a subject
+            }
+            if i > 0
+                && matches!(
+                    argv[i - 1].as_str(),
+                    "--connect"
+                        | "--mode"
+                        | "--remode"
+                        | "--rebitrate"
+                        | "--pin"
+                        | "--pair"
+                        | "--name"
+                        | "--out"
+                        | "--seconds"
+                        | "--bitrate"
+                        | "--audio-channels"
+                        | "--codec"
+                        | "--launch"
+                        | "--speed-test"
+                        | "--compositor"
+                        | "--gamepad"
+                        | "--discover"
+                )
+            {
+                return None;
+            }
+            Some(a.as_str())
+        })
+        .collect();
     let mode = get("--mode").and_then(parse_mode).unwrap_or(Mode {
         width: 1280,
         height: 720,
@@ -179,8 +221,7 @@ pub(crate) fn parse_args() -> Args {
             match parse_hex32(s) {
                 Some(p) => Some(p),
                 None => {
-                    eprintln!("--pin must be exactly 64 hex chars (the host logs its fingerprint at startup)");
-                    std::process::exit(2);
+                    return Err(anyhow!("--pin must be exactly 64 hex chars (the host logs its fingerprint at startup)"));
                 }
             }
         }
@@ -191,8 +232,9 @@ pub(crate) fn parse_args() -> Args {
         Some(s) => match CompositorPref::from_name(s) {
             Some(c) => c,
             None => {
-                eprintln!("--compositor must be one of: auto, kwin, wlroots, mutter, gamescope");
-                std::process::exit(2);
+                return Err(anyhow!(
+                    "--compositor must be one of: auto, kwin, wlroots, mutter, gamescope"
+                ));
             }
         },
     };
@@ -202,28 +244,82 @@ pub(crate) fn parse_args() -> Args {
         Some(s) => match GamepadPref::from_name(s) {
             Some(g) => g,
             None => {
-                eprintln!(
+                return Err(anyhow!(
                     "--gamepad must be one of: auto, xbox360, dualsense, xboxone, dualshock4"
-                );
-                std::process::exit(2);
+                ));
             }
         },
     };
-    Args {
-        connect: get("--connect").unwrap_or("127.0.0.1:9777").to_string(),
+
+    // Pairing is a distinct mode: it needs a PIN and exactly one host, from either --connect or a
+    // positional HOST:PORT. Accept the maintainer's quoted `--pair PIN --connect host` shape, but
+    // reject every impossible combination with a message naming the conflicting flags. No flag is
+    // ever silently ignored.
+    let pair = get("--pair").map(str::to_string);
+    // A bare --pair with no PIN value must fail loudly, never be silently ignored as a connect.
+    if has("--pair") && pair.is_none() {
+        return Err(anyhow!(
+            "--pair needs a PIN value; use --pair <PIN> [--connect HOST:PORT]"
+        ));
+    }
+    let connect_flag = get("--connect").map(str::to_string);
+    let connect = if let Some(pin) = &pair {
+        if pin.trim().is_empty() {
+            return Err(anyhow!(
+                "--pair needs a non-empty PIN; use --pair <PIN> [--connect HOST:PORT]"
+            ));
+        }
+        if argv.iter().any(|a| a == "--pin") {
+            return Err(anyhow!("--pair and --pin are mutually exclusive"));
+        }
+        if has("--discover") {
+            return Err(anyhow!("--pair and --discover are mutually exclusive"));
+        }
+        match (&connect_flag, positional_hosts.as_slice()) {
+            (Some(host), []) => host.clone(),
+            (None, [host]) => (*host).to_string(),
+            (None, []) => {
+                return Err(anyhow!(
+                    "--pair PIN needs a host: use --connect HOST:PORT or --pair PIN HOST:PORT"
+                ));
+            }
+            (Some(host), [pos]) => {
+                return Err(anyhow!(
+                    "--pair host given twice: --connect {host} and positional {pos}"
+                ));
+            }
+            (Some(_), hosts) => {
+                return Err(anyhow!(
+                    "--pair accepts one host, got --connect plus {} positional hosts",
+                    hosts.len()
+                ));
+            }
+            (None, hosts) => {
+                return Err(anyhow!(
+                    "--pair accepts one host, got {} positional hosts",
+                    hosts.len()
+                ));
+            }
+        }
+    } else {
+        connect_flag.unwrap_or_else(|| "127.0.0.1:9777".to_string())
+    };
+
+    Ok(Args {
+        connect,
         mode,
         out: get("--out").map(String::from),
-        input_test: argv.iter().any(|a| a == "--input-test"),
-        mic_test: argv.iter().any(|a| a == "--mic-test"),
-        mic_burst: argv.iter().any(|a| a == "--mic-burst"),
-        touch_test: argv.iter().any(|a| a == "--touch-test"),
-        rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
-        quit: argv.iter().any(|a| a == "--quit"),
+        input_test: has("--input-test"),
+        mic_test: has("--mic-test"),
+        mic_burst: has("--mic-burst"),
+        touch_test: has("--touch-test"),
+        rich_input_test: has("--rich-input-test"),
+        quit: has("--quit"),
         seconds: get("--seconds").and_then(|s| s.parse().ok()),
         pin,
         remode,
         rebitrate,
-        pair: get("--pair").map(String::from),
+        pair,
         name: get("--name").unwrap_or("slipstream-probe").to_string(),
         compositor,
         gamepad,
@@ -247,13 +343,22 @@ pub(crate) fn parse_args() -> Args {
         }),
         // `--discover` may be a bare flag or carry a seconds value (`--discover 8`); only treat
         // the following token as a count when it parses as a number (else it's the next flag).
-        discover: argv
-            .iter()
-            .any(|a| a == "--discover")
+        discover: has("--discover")
             .then(|| get("--discover").and_then(|s| s.parse().ok()).unwrap_or(4)),
-        clock_resync: argv.iter().any(|a| a == "--clock-resync"),
-        cursor_capture: argv.iter().any(|a| a == "--cursor-capture"),
-        cursor_nochannel: argv.iter().any(|a| a == "--cursor-nochannel"),
+        clock_resync: has("--clock-resync"),
+        cursor_capture: has("--cursor-capture"),
+        cursor_nochannel: has("--cursor-nochannel"),
+    })
+}
+
+pub(crate) fn parse_args() -> Args {
+    let argv: Vec<String> = std::env::args().collect();
+    match parse_args_from(&argv) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -272,5 +377,116 @@ pub(crate) fn codec_ext(codec: u8) -> &'static str {
         slipstream_core::quic::CODEC_AV1 => "av1",
         slipstream_core::quic::CODEC_PYROWAVE => "pyrowave",
         _ => "h265",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parser_mode_table() {
+        let cases: &[(&[&str], fn(&Args) -> bool, &str)] = &[
+            // (a) new pairing invocation with a positional host and PIN, no --connect.
+            (
+                &["slipstream-probe", "--pair", "1234", "192.168.1.9:9777"],
+                |a| a.pair.as_deref() == Some("1234") && a.connect == "192.168.1.9:9777",
+                "pair positional host",
+            ),
+            // The maintainer's exact quoted shape also parses.
+            (
+                &[
+                    "slipstream-probe",
+                    "--pair",
+                    "1234",
+                    "--connect",
+                    "192.168.1.9:9777",
+                ],
+                |a| a.pair.as_deref() == Some("1234") && a.connect == "192.168.1.9:9777",
+                "pair with --connect",
+            ),
+            // (c) plain connect / serve.
+            (
+                &[
+                    "slipstream-probe",
+                    "--connect",
+                    "192.168.1.9:9777",
+                    "--mode",
+                    "1920x1080x60",
+                ],
+                |a| a.pair.is_none() && a.connect == "192.168.1.9:9777" && a.mode.width == 1920,
+                "plain connect",
+            ),
+            (
+                &["slipstream-probe"],
+                |a| a.pair.is_none() && a.connect == "127.0.0.1:9777",
+                "defaults",
+            ),
+        ];
+        for (tokens, check, name) in cases {
+            let parsed = parse_args_from(&argv(tokens))
+                .unwrap_or_else(|e| panic!("{name} should parse: {e:#}"));
+            assert!(
+                check(&parsed),
+                "{name}: unexpected parse result: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_requires_a_pin_and_host() {
+        let err = parse_args_from(&argv(&["slipstream-probe", "--pair", "192.168.1.9:9777"]))
+            .expect_err("--pair with a host but no PIN must fail");
+        assert!(err.to_string().contains("--pair"), "{err:#}");
+
+        // (b) host + bare --pair with no PIN: explicit error naming --pair, never a silent ignore.
+        let err = parse_args_from(&argv(&[
+            "slipstream-probe",
+            "--connect",
+            "192.168.1.9:9777",
+            "--pair",
+        ]))
+        .expect_err("host + --pair with no PIN must fail");
+        assert!(err.to_string().contains("--pair"), "{err:#}");
+
+        let err = parse_args_from(&argv(&["slipstream-probe", "--pair", "1234"]))
+            .expect_err("--pair PIN without a host must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--pair"), "{msg}");
+        assert!(msg.contains("host"), "{msg}");
+    }
+
+    #[test]
+    fn conflicting_flags_are_named() {
+        let err = parse_args_from(&argv(&[
+            "slipstream-probe",
+            "--pair",
+            "1234",
+            "--connect",
+            "192.168.1.9:9777",
+            "--pin",
+            &"ab".repeat(32),
+        ]))
+        .expect_err("--pair plus --pin must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--pair"), "{msg}");
+        assert!(msg.contains("--pin"), "{msg}");
+
+        let err = parse_args_from(&argv(&[
+            "slipstream-probe",
+            "--pair",
+            "1234",
+            "--connect",
+            "192.168.1.9:9777",
+            "--discover",
+        ]))
+        .expect_err("--pair plus --discover must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--pair"), "{msg}");
+        assert!(msg.contains("--discover"), "{msg}");
     }
 }

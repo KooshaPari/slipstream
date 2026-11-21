@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+PackageIdentifier: vindeckyy.Slipstream
+PackageVersion: 0.24.0
+PackageLocale: en-US
+Publisher: Slipstream contributors
+PublisherUrl: https://github.com/vindeckyy/slipstream
+PublisherSupportUrl: https://github.com/vindeckyy/slipstream/issues
+PackageUrl: https://github.com/vindeckyy/slipstream
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/vindeckyy/slipstream/blob/main/LICENSE-MIT
+Copyright: Copyright (c) Slipstream contributors
+ShortDescription: Low-latency desktop and game streaming from a Linux host.
+PackageName: Slipstream
+Moniker: slipstream
+Tags:
+- Streaming
+- GameStream
+- Remote-Desktop
+- Self-Hosted
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0
+
+# TODO(operator): Confirm the Publisher identity with the package owner before submission.
+# Verified from repo NOTICE: "Copyright (c) Slipstream contributors".
+# Verified from README/SUPPORT: repository, releases, issues, license URLs.
+# ShortDescription derived from README tagline and kept under winget length limit.
+# Moniker "slipstream" is proposed; search found no existing winget moniker collision (only msstore "Slipstream Live").
+# TODO(operator): If the publisher legal name differs from "Slipstream contributors", replace Publisher and Copyright together.

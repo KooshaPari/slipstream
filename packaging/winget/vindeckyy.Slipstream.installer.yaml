@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+PackageIdentifier: vindeckyy.Slipstream
+PackageVersion: 0.24.0
+Platform:
+- Windows.Desktop
+InstallerType: msi
+Scope: machine
+InstallModes:
+- silent
+- silentWithProgress
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/vindeckyy/slipstream/releases/download/v0.24.0/Slipstream.msi
+  InstallerSha256: PLACEHOLDER_REPLACE_WITH_REAL_SHA256_AFTER_MSI_BUILD
+  # TODO(operator): Fill ProductCode from the published MSI at submission. WiX auto-generates it
+  # per build in packaging/msi/Package.wxs; the published version must never be rebuilt, so that
+  # MSI has one fixed ProductCode. This well-formed but invalid GUID deliberately blocks submission
+  # until the real ProductCode from that exact MSI is inserted. Keep the UpgradeCode entry below.
+  ProductCode: "{00000000-0000-0000-0000-000000000000}"
+  InstallerSwitches:
+    Silent: /qn
+    SilentWithProgress: /qb
+  AppsAndFeaturesEntries:
+  - DisplayName: Slipstream
+    Publisher: Slipstream contributors
+    DisplayVersion: 0.24.0
+    UpgradeCode: "{6E8D3A28-9F1C-4A2B-8D3E-7C1F4A6B9E52}"
+    InstallerType: msi
+ManifestType: installer
+ManifestVersion: 1.12.0

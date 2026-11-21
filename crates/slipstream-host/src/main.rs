@@ -316,6 +316,17 @@ fn real_main() -> Result<()> {
     // argument parsing and output are byte-for-byte unchanged.
     #[cfg(target_os = "windows")]
     if service_requested(&args) {
+        // A human typing `--service --help` should see usage, not an out-of-SCM
+        // dispatcher error. The SCM binPath also leads with `--service`, but it
+        // continues with `serve` and never contains a help flag.
+        if args
+            .iter()
+            .skip(1)
+            .any(|a| matches!(a.as_str(), "-h" | "--help"))
+        {
+            print_usage();
+            return Ok(());
+        }
         return service::dispatch();
     }
 

@@ -39,6 +39,10 @@ static STATUS_HANDLE: OnceLock<usize> = OnceLock::new();
 /// Raw auto-reset Win32 event handle, shared with the serve watcher. Stored as a
 /// pointer-sized integer because the windows crate handle wrapper is not `Sync`.
 static STOP_EVENT: OnceLock<usize> = OnceLock::new();
+/// Arguments captured from the service process command line (`--service serve …` in the
+/// SCM ImagePath). `ServiceMain` only receives `StartService` arguments, so use this as the
+/// fallback when the operator supplied the serve options in `binPath=` instead.
+static SERVICE_COMMAND_LINE: OnceLock<Vec<String>> = OnceLock::new();
 
 fn status_handle() -> Option<SERVICE_STATUS_HANDLE> {
     STATUS_HANDLE
@@ -54,6 +58,10 @@ fn stop_event_handle() -> Option<HANDLE> {
 
 /// Dispatch only when `--service` was explicitly supplied. Blocks until the service stops.
 pub fn dispatch() -> anyhow::Result<()> {
+    // The SCM launches the process from ImagePath, so the literal `--service serve …`
+    // arguments are visible here even though ServiceMain only receives StartService args.
+    let process_args: Vec<String> = std::env::args().skip(1).collect();
+    let _ = SERVICE_COMMAND_LINE.set(process_args);
     // SAFETY: two-entry null-terminated service table; `name` is leaked for the
     // process lifetime because the SCM may read it until the dispatcher returns.
     // `service_main` is a valid LPSERVICE_MAIN_FUNCTIONW with the system ABI.
@@ -116,7 +124,15 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut windows::core::PWST
         Vec::new()
     };
 
-    // The SCM argv includes the executable path plus `--service serve ...`.
+    // ServiceMain argv[0] is the service name and Windows normally supplies only that one
+    // argument. Fall back to the ImagePath command line: `sc create binPath=` puts the serve
+    // options in the process command line, not in StartServiceArgVectors.
+    let process_args = SERVICE_COMMAND_LINE.get().cloned().unwrap_or_default();
+    let args: Vec<String> = if crate::service_serve_args(&args).is_some() {
+        args
+    } else {
+        process_args
+    };
     let serve_args = match crate::service_serve_args(&args) {
         Some(rest) => rest,
         None => {

@@ -118,6 +118,7 @@ pub(crate) async fn session(args: Args) -> Result<()> {
             } else {
                 0
             },
+            monitor_id: None,
         }
         .encode(),
     )

@@ -157,6 +157,8 @@ mod zerocopy {
 
 use anyhow::{bail, Context, Result};
 use encode::Codec;
+#[cfg(target_os = "windows")]
+use service::dispatch;
 use spike::{Options, Source};
 use std::path::PathBuf;
 
@@ -313,7 +315,7 @@ fn real_main() -> Result<()> {
     // launch without this flag never touches StartServiceCtrlDispatcherW, so its
     // argument parsing and output are byte-for-byte unchanged.
     #[cfg(target_os = "windows")]
-    if args.first().map(String::as_str) == Some("--service") {
+    if service_requested(&args) {
         return service::dispatch();
     }
 
@@ -723,16 +725,22 @@ pub(crate) fn run_default_serve() -> Result<()> {
     gamestream::serve(mgmt_opts, native, gamestream)
 }
 
+/// True when argv leads with the explicit SCM opt-in marker. Kept separate from
+/// dispatch so argument parsing is testable without `StartServiceCtrlDispatcherW`.
+#[cfg(any(target_os = "windows", test))]
+fn service_requested(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("--service")
+}
+
 /// Strip the leading `--service` marker after SCM argv conversion. Returns the
 /// `serve` (or other) command line the console parser would have seen.
 #[cfg(any(target_os = "windows", test))]
 fn service_serve_args(argv: &[String]) -> Option<&[String]> {
-    match argv.first().map(String::as_str) {
-        Some("--service") => argv
-            .get(1..)
-            .filter(|rest| rest.first().map(String::as_str) == Some("serve")),
-        _ => None,
+    if !service_requested(argv) {
+        return None;
     }
+    argv.get(1..)
+        .filter(|rest| rest.first().map(String::as_str) == Some("serve"))
 }
 
 fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, bool)> {
@@ -882,6 +890,14 @@ mod service_arg_tests {
     fn service_flag_without_serve_is_rejected() {
         let argv = s(&["--service", "doctor"]);
         assert!(service_serve_args(&argv).is_none());
+    }
+
+    #[test]
+    fn bare_service_flag_parses_without_dispatcher() {
+        let argv = s(&["--service"]);
+        assert!(service_requested(&argv));
+        assert!(service_serve_args(&argv).is_none());
+        assert!(!service_requested(&s(&["serve"])));
     }
 }
 

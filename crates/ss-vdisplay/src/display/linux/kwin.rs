@@ -31,6 +31,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use wayland_client::backend::WaylandError;
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
@@ -543,8 +544,9 @@ fn flush_bounded(conn: &Connection) -> Result<()> {
             // A nonblocking writable socket can still race a peer close or EAGAIN. The queued
             // requests stay queued, so retry on the next pump instead of ending the session.
             Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::Interrupted =>
+                if matches!(e, WaylandError::Io(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted) =>
             {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -1538,7 +1540,7 @@ fn peer_process_is_kwin(pid: i32) -> bool {
 }
 
 /// Peer PID from `SO_PEERCRED`, or `None` when the socket is not a Unix stream with credentials.
-fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
     use std::os::fd::AsFd;
     use std::os::unix::io::AsRawFd;
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };

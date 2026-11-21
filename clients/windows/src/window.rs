@@ -241,13 +241,22 @@ impl GdiPresenter {
         }
     }
 
-    fn pump(&mut self, mut msg: MSG) {
+    fn drain_messages(&mut self) -> bool {
+        let mut msg = MSG::default();
+        let mut seen = false;
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            seen = true;
+            if msg.message == WM_CLOSE { CLOSED.store(true, Ordering::Relaxed); }
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
+        seen
+    }
+    fn pump(&mut self, mut msg: MSG) {
+        let _ = self.drain_messages();
+        let _ = &mut msg;
     }
 
     fn blit(&mut self) {
@@ -309,7 +318,24 @@ impl GdiPresenter {
     }
 }
 
+fn drain_window_messages() -> bool {
+    let mut msg = MSG::default();
+    let mut seen = false;
+    while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+        seen = true;
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    seen
+}
+
 impl Presenter for GdiPresenter {
+    fn pump_idle(&mut self) {
+        drain_window_messages();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     fn present(&mut self, frame: Option<&DecodedFrame>) {
         let mut msg = MSG::default();
         self.pump(msg);
@@ -399,5 +425,47 @@ impl Drop for GdiPresenter {
             let _ = DeleteObject(HGDIOBJ(self.dib.0));
             let _ = DeleteDC(self.hdc_mem);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn no_frame_idle_pump_observes_close_within_100ms() {
+        struct CountingPresenter { polls: u32, closed: bool }
+        impl Presenter for CountingPresenter {
+            fn present(&mut self, _: Option<&DecodedFrame>) {}
+            fn status(&mut self, _: &str) {}
+            fn pump_idle(&mut self) {
+                self.polls += 1;
+                if drain_window_messages() { self.closed = true; }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            fn closed(&self) -> bool { self.closed }
+        }
+        let mut p = CountingPresenter { polls: 0, closed: false };
+        let start = Instant::now();
+        // Simulate a stream that returns NoFrame forever while a close message is pending.
+        CLOSED.store(false, Ordering::Relaxed);
+        let mut posted = false;
+        while !p.closed && start.elapsed() < Duration::from_millis(100) {
+            if !posted && p.polls >= 1 {
+                unsafe {
+                    let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(tid, WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                posted = true;
+            }
+            p.pump_idle();
+            if CLOSED.load(Ordering::Relaxed) { p.closed = true; }
+        }
+        CLOSED.store(false, Ordering::Relaxed);
+        assert!(posted);
+        assert!(p.closed, "posted WM_CLOSE not observed while NoFrame repeated");
+        assert!(start.elapsed() <= Duration::from_millis(100));
+        assert!(p.polls >= 1);
     }
 }

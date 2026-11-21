@@ -41,6 +41,10 @@ pub trait Decoder {
 /// One surface to draw on. `None` = no new picture (the presenter keeps the last frame).
 pub trait Presenter {
     fn present(&mut self, frame: Option<&DecodedFrame>);
+    /// Pump pending window/system messages while no frame is available.
+    fn pump_idle(&mut self) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     fn status(&mut self, message: &str);
     /// Diagnostic split of the last present's cost: `(convert_ns, blit_ns)`. Backends that do
     /// neither report zeros.

@@ -358,7 +358,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                 }
                 Err(SlipstreamError::NoFrame) => {
                     let t_spin = Instant::now();
-                    std::thread::sleep(Duration::from_micros(300));
+                    presenter.pump_idle();
                     spin_ns = t_spin.elapsed().as_nanos() as u64;
                     stats.spins += 1;
                     // Poll+spin without a frame still costs the same wall time; attribute it to

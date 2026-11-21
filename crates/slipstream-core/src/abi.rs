@@ -781,7 +781,6 @@ pub struct SlipstreamConnection {
     /// without a multistream Opus decoder). The decoder is built lazily from the negotiated
     /// `inner.audio_channels`; `pcm` is a fixed-capacity reusable buffer the returned pointer
     /// borrows until the next PCM call (same contract as `last_audio`).
-    #[cfg(feature = "quic-audio")]
     audio_pcm: std::sync::Mutex<AudioPcmState>,
     /// Backs the `data`/`len` pointer of the last `slipstream_connection_next_clipboard` event
     /// (a fetched payload, an offer's format list, or a fetch-request's MIME) —
@@ -794,7 +793,7 @@ pub struct SlipstreamConnection {
 
 /// Lazily-initialized in-core Opus decode state. A coupled-1-stream multistream decoder is
 /// equivalent to a plain stereo decoder, so one [`opus::MSDecoder`] handles 2/6/8 channels.
-#[cfg(feature = "quic-audio")]
+#[cfg(feature = "quic")]
 #[derive(Default)]
 struct AudioPcmState {
     decoder: Option<opus::MSDecoder>,
@@ -2053,7 +2052,6 @@ unsafe fn connect_ex_impl(
                     inner: c,
                     last: std::sync::Mutex::new(None),
                     last_audio: std::sync::Mutex::new(None),
-                    #[cfg(feature = "quic-audio")]
                     audio_pcm: std::sync::Mutex::new(AudioPcmState::default()),
                     last_clip: std::sync::Mutex::new(None),
                     last_cursor_shape: std::sync::Mutex::new(None),
@@ -2365,7 +2363,7 @@ pub unsafe extern "C" fn slipstream_connection_audio_channels(
 /// float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
 /// first `channels` of it). `samples` points at `frame_count * channels` floats and borrows
 /// connection memory **until the next PCM call** on this handle.
-#[cfg(feature = "quic-audio")]
+#[cfg(feature = "quic")]
 #[repr(C)]
 pub struct SlipstreamAudioPcm {
     /// Interleaved f32 samples (wire channel order), `frame_count * channels` long.
@@ -2391,7 +2389,7 @@ pub struct SlipstreamAudioPcm {
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
-#[cfg(feature = "quic-audio")]
+#[cfg(feature = "quic")]
 #[no_mangle]
 pub unsafe extern "C" fn slipstream_connection_next_audio_pcm(
     c: *mut SlipstreamConnection,

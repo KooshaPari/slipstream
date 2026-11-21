@@ -23,10 +23,7 @@ default = []
 tls = ["dep:rustls", "dep:sha2", "dep:rustls-pki-types"]
 # Control-plane QUIC (pairing, config, reverse audio). tokio is permitted ONLY here,
 # never on the per-frame hot path. Off by default so the core stays runtime-free.
-quic = ["tls", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:hmac", "dep:spake2"]
-# In-core Opus PCM decode for embedders without a multistream-capable decoder. Optional so
-# video-only clients (notably slipstream-windows) do not build audiopus_sys/CMake.
-quic-audio = ["quic", "dep:opus"]
+quic = ["tls", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:hmac", "dep:spake2", "dep:opus"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)

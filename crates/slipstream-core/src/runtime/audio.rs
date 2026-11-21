@@ -278,7 +278,7 @@ mod tests {
     /// `opus::MSDecoder`), for stereo / 5.1 / 7.1. This is the single guarantee the whole
     /// feature rests on — encoder layout == decoder layout == identity mapping — so if a layout
     /// constant is ever wrong, this fails. Gated on `quic` (where `opus` is a dependency).
-    #[cfg(feature = "quic-audio")]
+    #[cfg(feature = "quic")]
     #[test]
     fn multistream_layout_roundtrips_with_channel_identity() {
         const SR: u32 = 48_000;

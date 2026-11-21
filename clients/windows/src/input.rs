@@ -179,8 +179,7 @@ impl InputRouter {
 
     pub fn drain_all(&self) -> Vec<InputEvent> {
         let mut inner = self.inner.lock().unwrap();
-        let mut out = inner.release_all();
-        out.extend(inner.queue.drain(..));
+        let mut out = inner.queue.drain(..).collect::<Vec<_>>();
         if let Some(m) = inner.mouse.take() {
             out.push(m);
         }
@@ -264,6 +263,15 @@ mod tests {
         assert_eq!(releases.len(), 1);
         assert_eq!(releases[0].kind, InputKind::MouseButtonUp);
         assert_eq!(releases[0].code, MOUSE_LBUTTON);
+    }
+
+    #[test]
+    fn router_release_all_survives_drain() {
+        let r = InputRouter::default();
+        r.push(event(InputKind::KeyDown, 0x41, 0, 0, 0));
+        r.release_all();
+        let out = r.drain_all();
+        assert!(out.iter().any(|e| e.kind == InputKind::KeyUp && e.code == 0x41));
     }
 
     #[test]

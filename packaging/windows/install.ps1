@@ -230,7 +230,6 @@ if ($NoWeb) {
   # ---------------------------------------------------------------- 4. console launcher
   Step 'writing the console launcher'
   $launcher = Join-Path $InstallDir 'slipstream-web.cmd'
-  $initialToken = if ($env:SLIPSTREAM_MGMT_TOKEN) { $env:SLIPSTREAM_MGMT_TOKEN } else { '' }
   $body = @"
 @echo off
 rem slipstream management web console launcher - Windows counterpart of /usr/bin/slipstream-web-server
@@ -244,8 +243,10 @@ if defined SLIPSTREAM_CONFIG_DIR (
 ) else (
   set "CFG=%USERPROFILE%\.config\slipstream"
 )
-rem An explicit operator token is authoritative. Never overwrite it with an absent/empty file.
-set "SLIPSTREAM_MGMT_TOKEN=$initialToken"
+rem The token is NEVER baked into this launcher: a token written to a file at install time is
+rem readable by anyone who can read the install directory, and it outlives a rotation. An operator
+rem who exports SLIPSTREAM_MGMT_TOKEN in the service environment still wins; otherwise the host's
+rem token file below is the only source.
 set "SLIPSTREAM_MGMT_URL=https://127.0.0.1:$MgmtPort"
 set "PORT=$WebPort"
 set "HOST=0.0.0.0"
@@ -256,6 +257,13 @@ set "HERE=%~dp0"
 set "LOG=%LOCALAPPDATA%\slipstream\logs\slipstream-web.log"
 :wait_credentials
 if not exist "%CFG%\mgmt-token" goto wait_missing_token
+rem Lock the token down to this account (+ SYSTEM/LocalService) before reading it: inheritance off
+rem so a permissive ACL on the parent profile directory cannot grant other accounts access. Once is
+rem enough — this loop re-enters while the host is still writing its credentials.
+if not defined TOKEN_HARDENED (
+  icacls "%CFG%\mgmt-token" /inheritance:r /grant:r "%USERNAME%:R" /grant:r "SYSTEM:R" /grant:r "LOCAL SERVICE:R" >nul 2>&1
+  set "TOKEN_HARDENED=1"
+)
 set "FILE_TOKEN="
 for /f "usebackq tokens=1,* delims==" %%A in ("%CFG%\mgmt-token") do set "FILE_TOKEN=%%B"
 if defined SLIPSTREAM_MGMT_TOKEN goto have_token

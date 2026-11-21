@@ -91,8 +91,11 @@ clients pin.
 The console is ready as soon as the host has written `%APPDATA%\slipstream\mgmt-token` and the
 identity cert. The launcher uses the same config directory as the host
 (`SLIPSTREAM_CONFIG_DIR`, else `%APPDATA%\slipstream`, else `~/.config/slipstream`), keeps an
-explicit `SLIPSTREAM_MGMT_TOKEN` authoritative, and polls for the token and cert instead of
-exiting permanently, mirroring the systemd unit's `Restart=always` + `StartLimitIntervalSec=0`.
+explicit `SLIPSTREAM_MGMT_TOKEN` set in the service environment authoritative, and polls for the
+token and cert instead of exiting permanently, mirroring the systemd unit's `Restart=always` +
+`StartLimitIntervalSec=0`. The token is never baked into the launcher: it is read from the file at
+launch and that file is ACL-locked to the running account (inheritance removed, read-only) the
+first time the launcher sees it.
 
 ## Firewall
 

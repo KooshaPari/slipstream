@@ -397,6 +397,10 @@ final class SessionModel: ObservableObject {
                 timeoutMs: 185_000) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                // This task is the latch holder for exactly one attempt. Every terminal outcome
+                // below must release it, or the next `connect()` returns at the `connectTask ==
+                // nil` guard and a connect → disconnect → connect cycle silently does nothing.
+                let ownsLatch = self.connectAttempt == attempt
                 // The user may have abandoned this attempt (window closed, another host
                 // clicked) while the handshake was in flight — don't resurrect a session
                 // for a dead window, and especially don't start its mic uplink.
@@ -408,6 +412,7 @@ final class SessionModel: ObservableObject {
                     // A LATER connect has already latched its own settings; only release the
                     // latch when nothing took over, or this would blank the live session's.
                     if self.phase == .idle { SessionSettings.end() }
+                    if ownsLatch { self.connectTask = nil }
                     return
                 }
                 switch result {
@@ -465,6 +470,7 @@ final class SessionModel: ObservableObject {
                             endpoint: "\(host.address):\(host.port)")
                     }
                 }
+                if ownsLatch { self.connectTask = nil }
             }
         }
     }
@@ -586,6 +592,9 @@ final class SessionModel: ObservableObject {
         // is what makes that true — a late success fails the id check and is dropped.
         connectAttempt &+= 1
         connectTask?.cancel()
+        // Release the one-dial latch too: `cancel()` alone leaves it set, so a later `connect()`
+        // would return at its `connectTask == nil` guard and never dial again.
+        connectTask = nil
         statsTimer?.invalidate()
         statsTimer = nil
         // Release the session's resolved settings: from here every reader falls back to the plain

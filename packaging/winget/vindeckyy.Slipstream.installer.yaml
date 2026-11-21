@@ -12,9 +12,18 @@ Installers:
 - Architecture: x64
   InstallerUrl: https://github.com/vindeckyy/slipstream/releases/download/v0.24.0/Slipstream.msi
   InstallerSha256: PLACEHOLDER_REPLACE_WITH_REAL_SHA256_AFTER_MSI_BUILD
-  ProductCode: "{PLACEHOLDER-REPLACE-WITH-WIX-PRODUCT-CODE}"
+  # TODO(operator): ProductCode intentionally omitted. packaging/msi/Package.wxs (scorpion's
+  # tree) does not author a ProductCode; WiX auto-generates one per build. Setting a hardcoded
+  # ProductCode here risks silent install-detection drift. The stable identity is UpgradeCode
+  # 6E8D3A28-9F1C-4A2B-8D3E-7C1F4A6B9E52, recorded in AppsAndFeaturesEntries below.
   InstallerSwitches:
     Silent: /qn
     SilentWithProgress: /qb
+  AppsAndFeaturesEntries:
+  - DisplayName: Slipstream
+    Publisher: Slipstream contributors
+    DisplayVersion: 0.24.0
+    UpgradeCode: "{6E8D3A28-9F1C-4A2B-8D3E-7C1F4A6B9E52}"
+    InstallerType: msi
 ManifestType: installer
 ManifestVersion: 1.12.0

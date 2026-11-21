@@ -26,8 +26,8 @@ pub(crate) mod tls;
 mod video;
 
 use anyhow::{Context, Result};
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 
 /// Hold a private headless compositor (`SLIPSTREAM_HEADLESS_COMPOSITOR`) for the process

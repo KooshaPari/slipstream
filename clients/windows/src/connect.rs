@@ -84,10 +84,17 @@ pub enum Admission {
 
 /// `pinned` = the operator supplied (or a previous pairing stored) the host fingerprint.
 /// `advert` is the advert used to reach the host; `None` for manual `ip:port` entry, where there
-/// is no advert to consult and only a pin or the host's own trust can admit us.
-pub fn decide(pinned: bool, advert: Option<&HostAdvert>) -> Admission {
+/// is no advert to consult.
+/// `manual_entry` = the operator typed the address. There is no advert, so the certificate the
+/// host presents is the only anchor: gate it behind the explicit confirmation card rather than
+/// letting it stream. This is the sole trust decision in the client — core's `client_pinned(None)`
+/// accepts any certificate by design, so nothing else can enforce it.
+pub fn decide(pinned: bool, advert: Option<&HostAdvert>, manual_entry: bool) -> Admission {
     if pinned {
         return Admission::Stream;
+    }
+    if manual_entry {
+        return Admission::ConfirmTrust;
     }
     match advert {
         Some(a) if a.allows_tofu() => Admission::ConfirmTrust,
@@ -240,6 +247,12 @@ impl Machine {
         Ok(Transition::Stay(Phase::Streaming, "trusted".into()))
     }
 
+    /// True between `admitted(ConfirmTrust)` and `trusted()`. The caller must not stream or enable
+    /// input while this holds.
+    pub fn awaiting_trust(&self) -> bool {
+        self.phase == Phase::AwaitingTrust
+    }
+
     pub fn failed(&mut self, outcome: &ConnectOutcome) -> Transition {
         let host = self.host.clone().unwrap_or_else(|| "host".into());
         self.phase = Phase::Idle;
@@ -314,17 +327,31 @@ mod tests {
     fn admission_table() {
         let tofu = txt(&[("pair", "optional")]);
         let strict = txt(&[("pair", "required")]);
-        assert_eq!(decide(true, Some(&strict)), Admission::Stream);
-        assert_eq!(decide(true, None), Admission::Stream);
-        assert_eq!(decide(false, Some(&tofu)), Admission::ConfirmTrust);
-        assert_eq!(decide(false, Some(&strict)), Admission::RefuseUnpaired);
+        assert_eq!(decide(true, Some(&strict), false), Admission::Stream);
+        assert_eq!(decide(true, None, true), Admission::Stream);
+        assert_eq!(decide(false, Some(&tofu), false), Admission::ConfirmTrust);
         assert_eq!(
-            decide(false, None),
-            Admission::RefuseUnpaired,
-            "manual ip:port entry with no advert must not TOFU"
+            decide(false, Some(&strict), false),
+            Admission::RefuseUnpaired
         );
+        // Manual `ip:port` has no advert, so the presented certificate is the only anchor. It must
+        // reach the confirmation card, never stream unattended.
+        assert_eq!(decide(false, None, true), Admission::ConfirmTrust);
+        assert_eq!(decide(false, None, false), Admission::RefuseUnpaired);
         assert!(Admission::RefuseUnpaired.requires_drop());
         assert!(!Admission::Stream.requires_drop());
+    }
+
+    #[test]
+    fn awaiting_trust_blocks_input_until_confirmed() {
+        let mut m = Machine::new();
+        assert_eq!(m.connect("h:9777"), Ok(()));
+        m.admitted(Admission::ConfirmTrust);
+        assert!(m.awaiting_trust());
+        assert!(!m.can_send_input(), "no input before the user confirms");
+        assert!(m.trusted().is_ok());
+        assert!(m.can_send_input());
+        assert!(!m.awaiting_trust());
     }
 
     #[test]

@@ -89,14 +89,29 @@ impl MfDecoder {
             )
         }
         .context("MFTEnumEx(video decoder)")?;
-        let activate = if count > 0 && !activates.is_null() {
-            unsafe { (*activates).clone() }
-        } else {
-            None
-        };
-        // The activation array is CoTaskMem-allocated: hand it back before any early return.
+        // `activates` is a CoTaskMem array of `count` IMFActivate pointers, not a single pointer.
+        // Read it through a bounded slice so the count the API just reported is the only bound in
+        // play, then release every activation we were handed: CoTaskMemFree frees the *array*, not
+        // the COM objects it points at, so skipping any of them leaks a reference.
+        let mut chosen: Option<IMFActivate> = None;
+        if count > 0 && !activates.is_null() {
+            // SAFETY: `MFTEnumEx` succeeded, so it allocated `count` consecutive
+            // `IMFActivate*` slots at `activates`; `Option<IMFActivate>` is layout-compatible
+            // with that nullable COM pointer.
+            let slots: &[Option<IMFActivate>] =
+                unsafe { std::slice::from_raw_parts(activates, count as usize) };
+            chosen = slots.iter().find_map(|slot| slot.clone());
+        }
+        if count > 0 && !activates.is_null() {
+            for i in 0..count as usize {
+                // SAFETY: element `i` of the array described above; dropping it in place releases
+                // the reference the API transferred to us without moving it out of the array.
+                unsafe { std::ptr::drop_in_place(activates.add(i)) };
+            }
+        }
+        // Hand the CoTaskMem array back before any early return.
         unsafe { CoTaskMemFree(Some(activates as *const _ as *const core::ffi::c_void)) };
-        let activate = activate.ok_or_else(|| {
+        let activate = chosen.ok_or_else(|| {
             anyhow!(
                 "no Media Foundation {} decoder on this Windows install (is the HEVC Video \
                  Extension installed?)",

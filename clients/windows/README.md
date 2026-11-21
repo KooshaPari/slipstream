@@ -51,7 +51,7 @@ slipstream-windows 100.112.143.99:9777 --pair 1234
 slipstream-windows 100.112.143.99:9777 --pin <hex> --seconds 12 --record out.h265
 
 :: unpinned: trust-on-first-use, the observed fingerprint is logged for pinning
-slipstream-windows 192.168.1.138:9777 --seconds 30
+slipstream-windows 192.0.2.10:9777 --seconds 30
 ```
 
 Flags: `--connect HOST[:PORT]` (or a bare positional), `--pin HEX`, `--pair PIN`,

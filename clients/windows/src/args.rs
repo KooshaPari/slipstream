@@ -22,6 +22,10 @@ pub struct Args {
     /// `--pin HEX`: the host certificate fingerprint (64 hex chars). A malformed value aborts —
     /// never silently downgrades to trust-on-first-use.
     pub pin: Option<[u8; 32]>,
+    /// `--trust HEX`: non-interactive answer to the trust-on-first-use card. The value must equal
+    /// the fingerprint the host actually presents, otherwise the session is refused. Interactive
+    /// runs omit it and confirm at the prompt.
+    pub trust: Option<[u8; 32]>,
     /// `--name LABEL`: how the host labels this client in its pending-approval list.
     pub name: String,
     pub mode: Mode,
@@ -45,6 +49,7 @@ impl Default for Args {
             discover: None,
             pair: None,
             pin: None,
+            trust: None,
             name: default_name(),
             mode: Mode {
                 width: 1920,
@@ -214,6 +219,13 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
                         .to_string()
                 })?);
             }
+            "--trust" => {
+                let raw = value(&mut i, "--trust")?;
+                args.trust = Some(parse_hex32(&raw).ok_or_else(|| {
+                    "--trust must be exactly 64 hex chars (the fingerprint the client printed)"
+                        .to_string()
+                })?);
+            }
             "--name" => args.name = value(&mut i, "--name")?,
             "--mode" => {
                 let raw = value(&mut i, "--mode")?;
@@ -272,7 +284,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
 
 pub fn usage() -> &'static str {
     "usage: slipstream-windows [HOST[:PORT]] [--connect HOST[:PORT]] [--pin HEX | --pair PIN]\n\
-     \x20      [--discover [SECS]] [--name LABEL] [--mode WxHxFPS] [--bitrate KBPS]\n\
+     \x20      [--trust HEX] [--discover [SECS]] [--name LABEL] [--mode WxHxFPS] [--bitrate KBPS]\n\
      \x20      [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
      \x20      [--play FILE]"
 }
@@ -350,6 +362,17 @@ mod tests {
         assert!(p(&format!("--connect h --pin {not_hex}")).is_err());
         let ok = "a".repeat(64);
         assert_eq!(parse_hex32(&ok), Some([0xaa; 32]));
+    }
+
+    #[test]
+    fn trust_accepts_only_a_well_formed_fingerprint() {
+        let ok = "b".repeat(64);
+        let a = p(&format!("--connect h --trust {ok}")).unwrap();
+        assert_eq!(a.trust, Some([0xbb; 32]));
+        // Absent by default: the interactive prompt is the default path, never an implicit yes.
+        assert_eq!(p("--connect h").unwrap().trust, None);
+        assert!(p("--connect h --trust abcd").is_err());
+        assert!(p(&format!("--connect h --trust {}", "z".repeat(64))).is_err());
     }
 
     #[test]

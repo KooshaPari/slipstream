@@ -17,7 +17,7 @@ use slipstream_core::{Session, SlipstreamError};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::args::{hex, Args};
-use crate::connect::{self, Admission, Machine};
+use crate::connect::{self, Machine};
 use crate::identity;
 use crate::input::{InputSender, InputSenderGuard};
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
@@ -77,6 +77,34 @@ pub enum SessionStop {
     Ended,
     WindowClosed,
     TimedOut,
+}
+
+/// Show the host fingerprint and require an explicit `yes` before anything is streamed.
+///
+/// Fails closed. A non-interactive stdin is an error rather than an automatic accept, and a read
+/// error, EOF, a bare newline or any answer other than `y`/`yes` is a refusal. There is no
+/// "press enter to continue": a stray newline must never be enough to hand a host live keyboard
+/// and mouse input.
+fn confirm_fingerprint(host: &str, fp_hex: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        return Err(anyhow!(
+            "cannot confirm {host}'s fingerprint: stdin is not a terminal. Verify {fp_hex} out of \
+             band and re-run with --trust {fp_hex}."
+        ));
+    }
+    eprintln!("\n{host} presents certificate fingerprint:\n  {fp_hex}\n");
+    eprint!("Trust this host and send it your keyboard and mouse? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if stdin.read_line(&mut line).is_err() {
+        return Ok(false);
+    }
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Run one streaming session to completion.
@@ -154,18 +182,15 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         "session offer"
     );
 
-    // Admission, before a single byte of video is consumed.
+    // Admission, before a single byte of video is consumed. `connect::decide` is the only authority
+    // for this: this CLI takes a manual `ip:port`, which has no advert, so the certificate the host
+    // presents is the sole anchor and it must pass the confirmation card below.
     let mut machine = Machine::new();
     machine
         .connect(&remote.to_string())
         .map_err(|e| anyhow!(e))?;
-    let admission = if args.pin.is_some() {
-        Admission::Stream
-    } else {
-        // Manual `ip:port` entry has no advert to consult, so the user decides by confirming the
-        // fingerprint the host just presented (the probe's TOFU behaviour).
-        Admission::ConfirmTrust
-    };
+    let observed_fp = *observed.lock().unwrap();
+    let admission = connect::decide(args.pin.is_some(), None, true);
     let host_label = remote.to_string();
     match machine.admitted(admission) {
         connect::Transition::Stay(_, msg) => tracing::info!(%msg, "admission"),
@@ -173,6 +198,40 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             conn.close(0u32.into(), b"refused");
             return Err(anyhow!(msg));
         }
+    }
+
+    // The trust gate. With no pin, core accepts *any* host certificate by design, so this is the
+    // only place the decision is enforced: nothing streams, and `can_send_input()` stays false,
+    // until the operator confirms the fingerprint they were shown.
+    if machine.awaiting_trust() {
+        let fp = observed_fp.ok_or_else(|| {
+            anyhow!("cannot confirm trust: the host presented no certificate fingerprint")
+        })?;
+        let fp_hex = hex(&fp);
+        let confirmed = match args.trust {
+            Some(want) => {
+                if want != fp {
+                    tracing::warn!(
+                        %remote,
+                        expected = %hex(&want),
+                        presented = %fp_hex,
+                        "--trust fingerprint does not match the host"
+                    );
+                }
+                want == fp
+            }
+            None => confirm_fingerprint(&host_label, &fp_hex)?,
+        };
+        if !confirmed {
+            conn.close(0u32.into(), b"trust declined");
+            return Err(anyhow!(
+                "{host_label} presents fingerprint {fp_hex}, which was not confirmed - refusing to \
+                 stream. Verify it out of band, then re-run with --trust {fp_hex} (or --pin {fp_hex} \
+                 to pin it permanently)."
+            ));
+        }
+        machine.trusted().map_err(|e| anyhow!(e))?;
+        tracing::info!(%remote, fingerprint = %fp_hex, "host fingerprint confirmed");
     }
 
     // Admission is the first gate: input events before this point are never queued. The second

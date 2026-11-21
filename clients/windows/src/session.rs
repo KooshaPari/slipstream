@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use slipstream_core::config::Role;
 use slipstream_core::packet::FLAG_PROBE;
-use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
+use slipstream_core::quic::{endpoint, io, Hello, RequestKeyframe, Start, Welcome};
 use slipstream_core::transport::{spawn_data_punch, UdpTransport};
 use slipstream_core::{Session, SlipstreamError};
 
@@ -19,6 +19,7 @@ use crate::connect::{self, Admission, Machine};
 use crate::identity;
 use crate::input::InputRouter;
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
+use crate::recovery::{try_block_on_write, RecoveryEvent, RecoveryState};
 use crate::{ff, mf, window, PipeStats};
 
 /// Inputs needed to run one client session. The CLI has already parsed and resolved these.
@@ -95,6 +96,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         (None, None) => tracing::info!(%remote, "connected"),
     }
 
+    // The host uses an infinite GOP: keep the control stream for keyframe recovery.
     let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
     let mut recv = io::MsgReader::new(recv);
     io::write_msg(
@@ -224,6 +226,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             tracing::debug!("data-plane punch ended");
         }
     }
+    let mut recovery = RecoveryState::default();
     let (frames, bytes, presented, stop) =
         tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, SessionStop)> {
         let mut _punch_guard: Option<PunchGuard> = None;
@@ -320,6 +323,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                     sized = (m.width, m.height);
                     decoder.resize(m.width, m.height);
                     presenter.resize(m.width, m.height);
+                    recovery.advance(Some(RecoveryEvent::DecoderRestart), Instant::now());
                 }
             }
             if let Some(secs) = seconds {
@@ -347,6 +351,17 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             let t_poll = Instant::now();
             let polled = session.poll_frame();
             let poll_ns = t_poll.elapsed().as_nanos() as u64;
+            // Ask for a fresh IDR when no decodable picture has appeared; the throttle lives in RecoveryState.
+            let now = Instant::now();
+            if let Some(request) = recovery.advance(None, now) {
+                let sent = recovery.sent();
+                let elapsed_ms = now.elapsed().as_millis();
+                let request_msg = RequestKeyframe.encode();
+                let write = io::write_msg(&mut send, &request_msg);
+                if try_block_on_write(write, request.reason, request.attempted, sent, elapsed_ms) {
+                    recovery.mark_sent();
+                }
+            }
             let mut spin_ns = 0u64;
             match polled {
                 Ok(frame) => {
@@ -367,6 +382,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                         stats.note_decoded();
                         presented += 1;
                         stats.note_presented();
+                        recovery.advance(Some(RecoveryEvent::Output), Instant::now());
+                    } else {
+                        recovery.advance(Some(RecoveryEvent::DecodeError), Instant::now());
                     }
                     let t_pres = Instant::now();
                     presenter.present(decoded.as_ref());

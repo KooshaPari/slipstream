@@ -231,10 +231,16 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         // Mirror the probe: open the host's data port before video is requested so NAT/stateful
         // firewall sessions receive frames. The helper reuses the connected data socket, so it is
         // a no-op on flat LAN paths beyond tiny marker datagrams.
-        if let Ok(sock) = transport.try_clone_socket() {
-            spawn_data_punch(sock, punch_stop.clone());
-            tracing::info!(%host_udp, "data-plane punch started");
-            _punch_guard = Some(PunchGuard(punch_stop_for_guard));
+        match transport.try_clone_socket() {
+            Ok(sock) => {
+                spawn_data_punch(sock, punch_stop.clone());
+                tracing::info!(%host_udp, "data-plane punch started");
+                _punch_guard = Some(PunchGuard(punch_stop_for_guard));
+            }
+            Err(e) => {
+                tracing::warn!(%host_udp, error = %e,
+                    "could not clone data socket for punch — session proceeding without a data-plane punch; NAT/stateful-firewall sessions may receive no video");
+            }
         }
         let mut session =
             Session::new(session_cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;

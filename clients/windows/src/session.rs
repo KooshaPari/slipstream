@@ -17,6 +17,7 @@ use slipstream_core::{Session, SlipstreamError};
 use crate::args::{hex, Args};
 use crate::connect::{self, Admission, Machine};
 use crate::identity;
+use crate::input::InputRouter;
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
 use crate::{ff, mf, window, PipeStats};
 
@@ -215,6 +216,13 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, SessionStop)> {
         let transport = UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
             .context("bind data plane")?;
+        let input = InputRouter::default();
+        window::set_input_router(input.clone());
+        struct ReleaseOnDrop(InputRouter);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) { self.0.release_all(); }
+        }
+        let _release = ReleaseOnDrop(input.clone());
         let mut session =
             Session::new(session_cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;
         let mut sink = match &record {
@@ -300,6 +308,14 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                 stop = SessionStop::Ended;
                 break;
             }
+            if machine.can_send_input() {
+                while let Some(ev) = input.next() {
+                    if let Err(e) = session.send_input(&ev) {
+                        tracing::warn!(error = %format!("{e:?}"), "input send failed");
+                        break;
+                    }
+                }
+            }
             let t_poll = Instant::now();
             let polled = session.poll_frame();
             let poll_ns = t_poll.elapsed().as_nanos() as u64;
@@ -351,6 +367,12 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                     stats.spin_ns += spin_ns;
                 }
                 Err(e) => return Err(anyhow!("poll_frame: {e:?}")),
+            }
+        }
+        input.release_all();
+        if machine.can_send_input() {
+            for ev in input.drain_all() {
+                let _ = session.send_input(&ev);
             }
         }
         if let Some(mut s) = sink {

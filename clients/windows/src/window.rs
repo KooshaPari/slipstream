@@ -10,7 +10,10 @@
 //! session instead of hanging it.
 #![allow(unsafe_code)]
 
+use crate::input::{vk_to_protocol, InputRouter, MOUSE_LBUTTON};
 use crate::present::{DecodedFrame, Presenter};
+use slipstream_core::input::{InputEvent, InputKind};
+use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -35,6 +38,16 @@ const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
 const WM_KEYDOWN: u32 = 0x0100;
 const VK_ESCAPE: usize = 0x1B;
+const WM_KEYUP: u32 = 0x0101;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_KILLFOCUS: u32 = 0x0008;
+static INPUT: OnceLock<InputRouter> = OnceLock::new();
+pub fn set_input_router(r: InputRouter) { let _ = INPUT.set(r); }
+fn push(ev: InputEvent) { if let Some(r) = INPUT.get() { r.push(ev); } }
+fn release_all() { if let Some(r) = INPUT.get() { r.release_all(); } }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
@@ -45,12 +58,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             CLOSED.store(true, Ordering::Relaxed);
+            release_all();
             unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
             LRESULT(0)
         }
-        WM_KEYDOWN if wparam.0 == VK_ESCAPE => {
-            unsafe { windows::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }
-                .ok();
+        WM_KILLFOCUS => {
+            release_all();
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_KEYUP => {
+            let vk = wparam.0 & 0xFF;
+            if vk == VK_ESCAPE {
+                if msg == WM_KEYDOWN {
+                    unsafe { windows::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.ok();
+                }
+                return LRESULT(0);
+            }
+            if let Some(code) = vk_to_protocol(vk as u16) {
+                let kind = if msg == WM_KEYDOWN { InputKind::KeyDown } else { InputKind::KeyUp };
+                push(InputEvent { kind, _pad: [0; 3], code, x: 0, y: 0, flags: 0 });
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            push(InputEvent { kind: InputKind::MouseMoveAbs, _pad: [0; 3], code: 0, x, y, flags: 0 });
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP => {
+            let kind = if msg == WM_LBUTTONDOWN { InputKind::MouseButtonDown } else { InputKind::MouseButtonUp };
+            push(InputEvent { kind, _pad: [0; 3], code: MOUSE_LBUTTON, x: 0, y: 0, flags: 0 });
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            push(InputEvent { kind: InputKind::MouseScroll, _pad: [0; 3], code: 0, x: delta, y: 0, flags: 0 });
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

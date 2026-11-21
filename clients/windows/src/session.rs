@@ -18,7 +18,7 @@ use crate::args::{hex, Args};
 use crate::connect::{self, Admission, Machine};
 use crate::identity;
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
-use crate::recovery::{RecoveryEvent, RecoveryState};
+use crate::recovery::{try_block_on_write, RecoveryEvent, RecoveryState};
 use crate::{ff, mf, window, PipeStats};
 
 /// Inputs needed to run one client session. The CLI has already parsed and resolved these.
@@ -309,11 +309,13 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             let poll_ns = t_poll.elapsed().as_nanos() as u64;
             // Ask for a fresh IDR when no decodable picture has appeared; the throttle lives in RecoveryState.
             let now = Instant::now();
-            if let Some(reason) = recovery.advance(None, now) {
+            if let Some(request) = recovery.advance(None, now) {
                 let sent = recovery.sent();
-                match tokio::runtime::Handle::current().block_on(io::write_msg(&mut send, &RequestKeyframe.encode())) {
-                    Ok(()) => tracing::warn!(reason = reason.as_str(), sent, elapsed_ms = now.elapsed().as_millis(), "requested a keyframe — no decodable picture"),
-                    Err(e) => tracing::warn!(reason = reason.as_str(), error = %e, "keyframe request failed"),
+                let elapsed_ms = now.elapsed().as_millis();
+                let request_msg = RequestKeyframe.encode();
+                let write = io::write_msg(&mut send, &request_msg);
+                if try_block_on_write(write, request.reason, request.attempted, sent, elapsed_ms) {
+                    recovery.mark_sent();
                 }
             }
             let mut spin_ns = 0u64;

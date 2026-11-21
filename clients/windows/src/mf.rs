@@ -30,6 +30,18 @@ fn pack_size(width: u32, height: u32) -> u64 {
     ((width as u64) << 32) | height as u64
 }
 
+/// Release the COM references a synchronous `ProcessOutput` call leaves in `data`.
+///
+/// `MFT_OUTPUT_DATA_BUFFER` wraps `pSample`/`pEvents` in `ManuallyDrop`, so Rust will not release
+/// the `IMFSample` clone we supplied (nor a sample the MFT substituted) when `data` goes out of
+/// scope. Call this once after every `ProcessOutput`, before branching on its result.
+fn release_output_data(data: &mut MFT_OUTPUT_DATA_BUFFER) {
+    unsafe {
+        drop(std::mem::ManuallyDrop::take(&mut data.pSample));
+        drop(std::mem::ManuallyDrop::take(&mut data.pEvents));
+    }
+}
+
 pub struct MfDecoder {
     transform: IMFTransform,
     width: u32,
@@ -247,10 +259,12 @@ impl MfDecoder {
                 pEvents: std::mem::ManuallyDrop::new(None),
             };
             let mut status = 0u32;
-            match unsafe {
+            let outcome = unsafe {
                 self.transform
                     .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status)
-            } {
+            };
+            release_output_data(&mut data);
+            match outcome {
                 Ok(()) => {}
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {

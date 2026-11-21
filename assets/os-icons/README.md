@@ -8,6 +8,7 @@ The canonical OS/distro brand marks every client derives its host-card OS icon f
 | token | mark | source |
 |---|---|---|
 | `apple` | Apple (also `macos` via alias) | Font Awesome Free brands (CC BY 4.0) |
+| `windows` | Windows | Font Awesome Free brands (CC BY 4.0) |
 | `linux` | Tux | Font Awesome Free brands (CC BY 4.0) |
 | `steam` | Steam (also `steamos` via alias) | Font Awesome Free brands (CC BY 4.0) |
 | `ubuntu` | Ubuntu | Font Awesome Free brands (CC BY 4.0) |

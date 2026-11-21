@@ -588,8 +588,8 @@ const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
 /// reading the card. Chains walk most-specific-first, so a distro without a mark of its own still
 /// lands on its family's and finally on plain Tux.
 const OS_ICON_TOKENS: &[&str] = &[
-    "apple", "linux", "steam", "ubuntu", "fedora", "arch", "debian", "nixos", "opensuse",
-    "bazzite", "cachyos", "nobara",
+    "apple", "windows", "linux", "steam", "ubuntu", "fedora", "arch", "debian", "nixos",
+    "opensuse", "bazzite", "cachyos", "nobara",
 ];
 
 /// The card's OS glyph for an advertised chain, or `None` (no widget) when the host doesn't

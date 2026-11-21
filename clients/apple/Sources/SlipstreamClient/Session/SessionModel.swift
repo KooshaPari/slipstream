@@ -178,6 +178,13 @@ final class SessionModel: ObservableObject {
     /// Cumulative reassembler-drop counter at the last stats drain (per-window `lost` delta).
     private var lastFramesDropped: UInt64 = 0
     private var statsTimer: Timer?
+    /// The in-flight connect attempt, held so `disconnect()` can cancel it. An abandoned dial
+    /// otherwise keeps its parked QUIC connection open on a pairing-required host, and the next
+    /// attempt's knock resolves it `Superseded` — one user session showing up as two knocks.
+    private var connectTask: Task<Void, Never>?
+    /// Monotonic attempt id: a cancelled/superseded attempt must never touch phase/host state nor
+    /// adopt the connection it eventually gets.
+    private var connectAttempt: UInt64 = 0
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
     private var gamepadFeedback: GamepadFeedback?
@@ -247,7 +254,13 @@ final class SessionModel: ObservableObject {
                  requestAccess: Bool = false,
                  onUnreachable: (@MainActor () -> Void)? = nil) {
         guard phase == .idle else { return }
+        // One dial at a time. A second attempt while the first is still outstanding (parked on a
+        // pairing-required host) supersedes the first knock and pulls the approval row out from
+        // under the operator, so admission waits for the previous dial to actually resolve.
+        guard connectTask == nil else { return }
         phase = .connecting
+        connectAttempt &+= 1
+        let attempt = connectAttempt
         activeHost = host
         errorMessage = nil
         settings = effective
@@ -298,12 +311,28 @@ final class SessionModel: ObservableObject {
         // default (SLIPSTREAM_444, default on), so this toggle is the one real switch; the
         // hardware-decode probe below still gates what can actually be advertised.
         let want444 = effective.enable444
-        Task.detached(priority: .userInitiated) {
+        connectTask = Task.detached(priority: .userInitiated) {
             // SlipstreamConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
-            // host recognizes this Mac (nil = anonymous, fine for hosts without
-            // --require-pairing; Keychain/generation failure must not block connecting).
-            let identity = (try? ClientIdentityStore.shared.load())?.identity
+            // host recognizes this Mac.
+            // Persistent identity: read it or fail with a clear message. It must never be
+            // replaced in memory on a read error — that is exactly what registered a new
+            // "This device" on every launch. Genuine first run returns a minted identity
+            // only after it has been written to Application Support.
+            let identity: ClientIdentity
+            do {
+                identity = try ClientIdentityStore.shared.load()
+            } catch {
+                await MainActor.run { [weak self] in
+                    // Release the one-dial-at-a-time latch: this attempt is over.
+                    if self?.connectAttempt == attempt { self?.connectTask = nil }
+                    self?.phase = .idle
+                    self?.errorMessage = "This Mac's saved client identity can't be read (\(error)). "
+                        + "Refusing to connect so a new device isn't registered; fix "
+                        + "~/Library/Application Support/Slipstream and retry."
+                }
+                return
+            }
             // Advertise 10-bit + HDR10 when enabled: the host upgrades to a BT.2020 PQ Main10 stream
             // only for actual HDR content (its own gate); the VideoToolbox/Metal present path is
             // HDR-capable (P010 + itur_2100_PQ + EDR). 0 keeps the 8-bit BT.709 SDR stream.
@@ -361,20 +390,29 @@ final class SessionModel: ObservableObject {
                 clientCaps: clientCaps, launchID: launchID,
                 // Delegated approval: the host holds this connect open until the operator approves
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
-                // connects keep the snappy default.
-                timeoutMs: requestAccess ? 185_000 : 10_000) }
+                // connects keep the snappy default. Every connect now presents this Mac's
+                // identity, so every connect can be parked for a human decision: the wide budget
+                // is for all of them. A host that is really down still fails fast (QUIC declares
+                // a silent peer dead at its ~8 s idle timeout, well inside this).
+                timeoutMs: 185_000) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                // This task is the latch holder for exactly one attempt. Every terminal outcome
+                // below must release it, or the next `connect()` returns at the `connectTask ==
+                // nil` guard and a connect → disconnect → connect cycle silently does nothing.
+                let ownsLatch = self.connectAttempt == attempt
                 // The user may have abandoned this attempt (window closed, another host
                 // clicked) while the handshake was in flight — don't resurrect a session
                 // for a dead window, and especially don't start its mic uplink.
-                guard self.phase == .connecting, self.activeHost?.id == host.id else {
+                guard self.connectAttempt == attempt,
+                      self.phase == .connecting, self.activeHost?.id == host.id else {
                     if case .success(let conn) = result {
                         Task.detached { conn.close() } // joins Rust threads — off-main
                     }
                     // A LATER connect has already latched its own settings; only release the
                     // latch when nothing took over, or this would blank the live session's.
                     if self.phase == .idle { SessionSettings.end() }
+                    if ownsLatch { self.connectTask = nil }
                     return
                 }
                 switch result {
@@ -432,6 +470,7 @@ final class SessionModel: ObservableObject {
                             endpoint: "\(host.address):\(host.port)")
                     }
                 }
+                if ownsLatch { self.connectTask = nil }
             }
         }
     }
@@ -547,6 +586,15 @@ final class SessionModel: ObservableObject {
     /// `disconnectQuit()` so the host skips the keep-alive linger; `sessionEnded()` (a host-ended /
     /// dropped session) passes `false` to leave the linger intact.
     func disconnect(deliberate: Bool = true) {
+        // Cancel the in-flight dial. The blocking connect ABI has no abort hook, so this cannot
+        // shorten a host-side park; what it guarantees is that the abandoned attempt never
+        // becomes a session and closes the connection if one still lands. Bumping the attempt id
+        // is what makes that true — a late success fails the id check and is dropped.
+        connectAttempt &+= 1
+        connectTask?.cancel()
+        // Release the one-dial latch too: `cancel()` alone leaves it set, so a later `connect()`
+        // would return at its `connectTask == nil` guard and never dial again.
+        connectTask = nil
         statsTimer?.invalidate()
         statsTimer = nil
         // Release the session's resolved settings: from here every reader falls back to the plain

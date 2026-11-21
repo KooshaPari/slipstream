@@ -1,83 +1,80 @@
 // This client's persistent slipstream/1 identity: a self-signed certificate + key (PEM),
-// generated once and stored in the data-protection Keychain (with a legacy file-keychain
-// fallback for unsigned builds — see `query(dataProtection:)`). The certificate's fingerprint is how
-// hosts recognize this client after PIN pairing — losing the key un-pairs this Mac from
-// every host, so the pair is presented on every connect but never regenerated once
-// stored. That invariant drives the error handling below: a Keychain that *refuses
-// access* (locked, ACL denied) is an error, not a first run — minting a replacement
-// would silently shadow the durable identity and break every existing pairing.
+// minted once and then persisted so every launch and every session presents the same
+// certificate fingerprint — that fingerprint is how a paired host recognises this Mac.
+//
+// Durable home: `~/Library/Application Support/Slipstream/client-identity.json` (0600), via
+// `ClientIdentityFileStore`. The Keychain is a best-effort secondary: an ad-hoc-signed build
+// has no `keychain-access-groups` entitlement, so the data-protection keychain returns
+// errSecMissingEntitlement and the legacy file keychain is gated by a per-binary ACL that
+// changes with every resign. That is exactly why a launch used to present a new identity:
+// the write quietly failed, `add` downgraded to an in-memory identity, and the callers'
+// `try?` turned a Keychain refusal into an anonymous connect. Both paths now fail closed:
+// an unreadable stored identity is an error the UI surfaces, never a reason to mint.
 
 import Foundation
 import SlipstreamKit
 import Security
+import os
 
 final class ClientIdentityStore: @unchecked Sendable {
     static let shared = ClientIdentityStore()
 
-    enum IdentityError: Error {
-        /// The Keychain refused access (locked, ACL denied, …) — an identity may exist.
-        case keychain(OSStatus)
-        /// The identity lives only in memory (Keychain write failed); good enough to
-        /// present on a connect, not good enough to pair against.
-        case notPersisted
+    private let log = Logger(subsystem: "io.slipstream", category: "identity")
+    private let lock = NSLock()
+    private var cached: ClientIdentity?
+    private let resolver: ClientIdentityResolver
+
+    init(resolver: ClientIdentityResolver = ClientIdentityStore.defaultResolver()) {
+        self.resolver = resolver
     }
 
-    private let lock = NSLock()
-    private var cached: (identity: ClientIdentity, persisted: Bool)?
+    /// `~/Library/Application Support/Slipstream` — stable across launches and rebuilds,
+    /// unlike the code-signature-scoped Keychain ACL.
+    static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory())
+                .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base.appendingPathComponent("Slipstream", isDirectory: true)
+    }
 
-    /// The identity to present when connecting, generating + persisting it on first run.
-    /// `persisted == false` means the Keychain write failed and it lives only in memory —
-    /// fine for a session, see `loadForPairing()` for the strict variant. Blocking
-    /// (Keychain + key generation) — call off the main actor.
-    func load() throws -> (identity: ClientIdentity, persisted: Bool) {
+    static func defaultResolver() -> ClientIdentityResolver {
+        ClientIdentityResolver(backings: [
+            ClientIdentityFileStore(directory: defaultDirectory()),
+            KeychainIdentityBacking(),
+        ])
+    }
+
+    /// The identity to present when connecting. Throws `IdentityStoreError` when a stored
+    /// identity exists but cannot be used, or when a freshly minted one cannot be persisted —
+    /// callers must surface that, not fall back to an anonymous connect.
+    /// Blocking (file/Keychain IO + key generation) — call off the main actor.
+    func load() throws -> ClientIdentity {
         lock.lock()
         defer { lock.unlock() }
         if let cached { return cached }
-
-        switch copyStored() {
-        case .found(let identity):
-            let hit = (identity, true)
-            cached = hit
-            return hit
-        case .absent:
-            break // genuine first run — mint below
-        case .corrupt:
-            // Our own item, undecodable: the pairings it backed are unusable either
-            // way, so deliberately self-heal by replacing it (both keychains, best-effort).
-            SecItemDelete(Self.query(dataProtection: true) as CFDictionary)
-            SecItemDelete(Self.query(dataProtection: false) as CFDictionary)
-        case .denied(let status):
-            throw IdentityError.keychain(status)
+        do {
+            let identity = try resolver.load()
+            cached = identity
+            return identity
+        } catch {
+            log.error("client identity unavailable: \(String(describing: error), privacy: .public)")
+            throw error
         }
-
-        let fresh = try generateIdentity()
-        let entry: (ClientIdentity, Bool)
-        switch add(fresh) {
-        case errSecSuccess:
-            entry = (fresh, true)
-        case errSecDuplicateItem:
-            // Lost a first-run race with another instance — the stored identity is the
-            // durable one, never overwrite it.
-            if case .found(let identity) = copyStored() {
-                entry = (identity, true)
-            } else {
-                entry = (fresh, false)
-            }
-        default:
-            entry = (fresh, false)
-        }
-        cached = entry
-        return entry
     }
 
-    /// Pairing variant: the host is about to durably trust this identity, so it must be
-    /// durable on our side too — a memory-only identity would evaporate on relaunch and
-    /// strand the pairing.
+    /// Pairing uses the same durable path: `load()` only ever returns an identity that is
+    /// already on disk (or throws), so a pairing can no longer outlive its client key.
     func loadForPairing() throws -> ClientIdentity {
-        let (identity, persisted) = try load()
-        guard persisted else { throw IdentityError.notPersisted }
-        return identity
+        try load()
     }
+}
+
+/// Best-effort Keychain cache. Never authoritative: its read refusal is ignored by
+/// `ClientIdentityResolver` while the durable file is intact.
+struct KeychainIdentityBacking: ClientIdentityBacking {
+    let name = "keychain"
+    private let log = Logger(subsystem: "io.slipstream", category: "identity")
 
     private struct Stored: Codable {
         var certPEM: String
@@ -91,13 +88,6 @@ final class ClientIdentityStore: @unchecked Sendable {
         case denied(OSStatus)
     }
 
-    /// Item coordinates. We prefer the DATA-PROTECTION keychain: with the app's
-    /// `keychain-access-groups` entitlement, items there are gated by the app's identity
-    /// (team + bundle id) instead of a per-binary ACL — so a SIGNED build reads them across
-    /// rebuilds with NO Keychain prompt (a per-binary ACL re-prompts on every resign, which
-    /// is why an ad-hoc-signed app asked every launch). An ad-hoc / unsigned build (e.g.
-    /// `swift run`) has no such entitlement — `SecItem*` returns `errSecMissingEntitlement`
-    /// there, and we fall back to the legacy file keychain (still works, with the old prompt).
     private static func query(dataProtection: Bool) -> [String: Any] {
         var q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -108,14 +98,44 @@ final class ClientIdentityStore: @unchecked Sendable {
         return q
     }
 
-    private func copyStored() -> ReadResult {
-        let result = read(dataProtection: true)
-        // No entitlement (ad-hoc / unsigned build): the data-protection keychain is
-        // unavailable — read the legacy file keychain instead.
+    func loadIdentity() throws -> ClientIdentity? {
+        var result = read(dataProtection: true)
         if case .denied(errSecMissingEntitlement) = result {
-            return read(dataProtection: false)
+            result = read(dataProtection: false)
         }
-        return result
+        switch result {
+        case .found(let identity):
+            log.info("keychain identity loaded")
+            return identity
+        case .absent:
+            return nil
+        case .corrupt:
+            log.error("keychain identity corrupt")
+            throw IdentityStoreError.corrupt("keychain")
+        case .denied(let status):
+            log.error("keychain identity read refused status=\(status)")
+            throw IdentityStoreError.unreadable("keychain", "OSStatus \(status)")
+        }
+    }
+
+    func saveIdentity(_ identity: ClientIdentity) throws {
+        guard let data = try? JSONEncoder().encode(
+            Stored(certPEM: identity.certPEM, keyPEM: identity.keyPEM))
+        else { throw IdentityStoreError.notPersisted(name, "encode failed") }
+
+        var add = Self.query(dataProtection: true)
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        var status = SecItemAdd(add as CFDictionary, nil)
+        if status == errSecMissingEntitlement {
+            var legacy = Self.query(dataProtection: false)
+            legacy[kSecValueData as String] = data
+            status = SecItemAdd(legacy as CFDictionary, nil)
+        }
+        log.info("keychain identity save status=\(status)")
+        guard status == errSecSuccess || status == errSecDuplicateItem else {
+            throw IdentityStoreError.notPersisted(name, "OSStatus \(status)")
+        }
     }
 
     private func read(dataProtection: Bool) -> ReadResult {
@@ -125,7 +145,8 @@ final class ClientIdentityStore: @unchecked Sendable {
         switch SecItemCopyMatching(query as CFDictionary, &out) {
         case errSecSuccess:
             guard let data = out as? Data,
-                  let stored = try? JSONDecoder().decode(Stored.self, from: data)
+                  let stored = try? JSONDecoder().decode(Stored.self, from: data),
+                  !stored.certPEM.isEmpty, !stored.keyPEM.isEmpty
             else { return .corrupt }
             return .found(ClientIdentity(certPEM: stored.certPEM, keyPEM: stored.keyPEM))
         case errSecItemNotFound:
@@ -133,22 +154,5 @@ final class ClientIdentityStore: @unchecked Sendable {
         case let status:
             return .denied(status)
         }
-    }
-
-    private func add(_ identity: ClientIdentity) -> OSStatus {
-        guard let data = try? JSONEncoder().encode(
-            Stored(certPEM: identity.certPEM, keyPEM: identity.keyPEM))
-        else { return errSecParam }
-        var add = Self.query(dataProtection: true)
-        add[kSecValueData as String] = data
-        // After-first-unlock so a background reconnect can still read it; the access-group
-        // entitlement (not a per-binary ACL) gates it, so it survives rebuilds prompt-free.
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        let status = SecItemAdd(add as CFDictionary, nil)
-        guard status == errSecMissingEntitlement else { return status }
-        // Ad-hoc / unsigned build: persist to the legacy file keychain instead.
-        var legacy = Self.query(dataProtection: false)
-        legacy[kSecValueData as String] = data
-        return SecItemAdd(legacy as CFDictionary, nil)
     }
 }

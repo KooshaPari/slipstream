@@ -216,10 +216,11 @@ struct PairSheet: View {
                     // The host answered and said why (not armed / rate-limited / armed for
                     // another device) — show that instead of the guessing-game fallback.
                     errorText = rejection.userMessage
-                case .failure(is ClientIdentityStore.IdentityError):
-                    errorText = "Can't store this Mac's identity in the Keychain, so the "
-                        + "pairing would not survive a relaunch. Unlock the login "
-                        + "keychain and try again."
+                case .failure(is IdentityStoreError):
+                    errorText = "Can't read or save this Mac's client identity, so the "
+                        + "pairing would not survive a relaunch. Check that "
+                        + "~/Library/Application Support/Slipstream is readable "
+                        + "(and the login keychain unlocked), then try again."
                 case .failure:
                     errorText = "Pairing failed — the host didn't answer. Is it running, "
                         + "and is this device on the same network (no VPN, no guest-Wi-Fi "

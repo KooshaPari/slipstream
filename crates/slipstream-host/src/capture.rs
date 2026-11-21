@@ -281,20 +281,99 @@ pub fn capture_virtual_output(
 }
 
 /// Windows: capture the mirrored head the display backend resolved (`VirtualOutput::
-/// windows_head`) with WGC. The display already committed the client's mode, so no
-/// renegotiation wait — the first frame arrives at the negotiated size.
+/// windows_head`) with the backend the session plan resolved. The display already committed the
+/// client's mode, so no renegotiation wait — the first frame arrives at the negotiated size.
 #[cfg(target_os = "windows")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
     _want: OutputFormat,
-    _capture: crate::session_plan::CaptureBackend,
+    capture: crate::session_plan::CaptureBackend,
 ) -> Result<Box<dyn Capturer>> {
     let Some(head) = vout.windows_head else {
         bail!("Windows virtual output carries no head identity (not a mirror display?)")
     };
-    ss_capture::open_wgc_desktop_for_monitor(Some(&head))
-        .map(|c| c as Box<dyn Capturer>)
-        .context("capture the mirrored Windows head")
+    // The resolved plan is the single source of truth: whatever backend the plan logged is the one
+    // this opener uses. Honouring it is what stops `resolved session plan capture: Dxgi` from being
+    // followed by `wgc: capturing monitor`, i.e. an explicit `SLIPSTREAM_CAPTURE_METHOD=dxgi` pin
+    // logging one backend and capturing with another. A backend this path cannot serve fails
+    // loudly rather than silently falling back to WGC.
+    let backend = virtual_output_backend(capture)?;
+    tracing::info!(backend = backend.as_str(), "virtual-output capture selected");
+    match backend {
+        crate::session_plan::CaptureBackend::Wgc => {
+            ss_capture::open_wgc_desktop_for_monitor(Some(&head))
+        }
+        crate::session_plan::CaptureBackend::Dxgi => {
+            ss_capture::open_dxgi_desktop_for_monitor(Some(&head))
+        }
+        // `virtual_output_backend` admits only the two Windows backends.
+        other => bail!(
+            "capture backend '{}' reached the Windows virtual-output opener",
+            other.as_str()
+        ),
+    }
+    .map(|c| c as Box<dyn Capturer>)
+    .with_context(|| format!("capture the mirrored Windows head with {}", backend.as_str()))
+}
+
+/// Which capturer the Windows virtual-output path opens for a resolved plan.
+///
+/// Pure on purpose: the property that broke here — a plan naming one backend while the opener used
+/// another — is only testable if the decision is separable from the display. Windows sessions can be
+/// served by WGC or by DXGI Desktop Duplication; any other resolved value is a Linux backend that
+/// reached a Windows host and is refused rather than substituted.
+#[cfg(target_os = "windows")]
+fn virtual_output_backend(
+    pinned: crate::session_plan::CaptureBackend,
+) -> Result<crate::session_plan::CaptureBackend> {
+    match pinned {
+        crate::session_plan::CaptureBackend::Wgc | crate::session_plan::CaptureBackend::Dxgi => {
+            Ok(pinned)
+        }
+        other => bail!(
+            "capture backend '{}' is Linux-only on this host (use wgc|dxgi|auto)",
+            other.as_str()
+        ),
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_virtual_output_backend_tests {
+    use crate::session_plan::CaptureBackend;
+
+    /// A resolved plan's capture backend must equal the backend the Windows virtual-output opener
+    /// selects. Regression test for the divergence: `capture_virtual_output` ignored its `capture`
+    /// argument and always opened WGC, so an explicit `dxgi` pin logged
+    /// `SessionPlan { capture: Dxgi }` and then captured with `wgc`.
+    #[test]
+    fn opener_agrees_with_the_resolved_plan_for_every_spelling() {
+        // (operator value, plan backend, opener accepts it)
+        let cases: [(Option<&str>, CaptureBackend, bool); 6] = [
+            (None, CaptureBackend::Wgc, true),               // unset -> auto -> WGC
+            (Some("auto"), CaptureBackend::Wgc, true),       // auto -> WGC
+            (Some("wgc"), CaptureBackend::Wgc, true),        // explicit primary
+            (Some("DXGI"), CaptureBackend::Dxgi, true),      // explicit, case-insensitive
+            (Some("nonsense"), CaptureBackend::Wgc, true),   // unknown -> auto -> WGC
+            (Some("portal"), CaptureBackend::Portal, false), // Linux backend: loud refusal
+        ];
+        for (value, expected_plan, accepts) in cases {
+            // Exactly the plan's resolution rule: a name it knows, else the Windows primary.
+            let planned = value
+                .and_then(CaptureBackend::from_name)
+                .unwrap_or(CaptureBackend::Wgc);
+            assert_eq!(planned, expected_plan, "plan resolution for {value:?}");
+            match super::virtual_output_backend(planned) {
+                Ok(opened) => {
+                    assert!(accepts, "opener should have refused {value:?}");
+                    assert_eq!(
+                        opened, planned,
+                        "opened backend != planned backend for {value:?}"
+                    );
+                }
+                Err(_) => assert!(!accepts, "opener should have accepted {value:?}"),
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

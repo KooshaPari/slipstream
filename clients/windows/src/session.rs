@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use slipstream_core::config::Role;
 use slipstream_core::packet::FLAG_PROBE;
 use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
-use slipstream_core::transport::UdpTransport;
+use slipstream_core::transport::{spawn_data_punch, UdpTransport};
 use slipstream_core::{Session, SlipstreamError};
 
 use crate::args::{hex, Args};
@@ -212,8 +212,21 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     }
 
     let started = Instant::now();
+    // Data-plane punch lifetime is tied to this session. The guard sets the stop flag and logs
+    // the end on every exit from the blocking task (normal, `?` error, or unwind), so the
+    // keepalive thread cannot outlive the session or panic on an early return.
+    let punch_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let punch_stop_for_guard = punch_stop.clone();
+    struct PunchGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for PunchGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!("data-plane punch ended");
+        }
+    }
     let (frames, bytes, presented, stop) =
         tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, SessionStop)> {
+        let mut _punch_guard: Option<PunchGuard> = None;
         let transport = UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
             .context("bind data plane")?;
         let input = InputRouter::default();
@@ -223,6 +236,21 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             fn drop(&mut self) { self.0.release_all(); }
         }
         let _release = ReleaseOnDrop(input.clone());
+
+        // Mirror the probe: open the host's data port before video is requested so NAT/stateful
+        // firewall sessions receive frames. The helper reuses the connected data socket, so it is
+        // a no-op on flat LAN paths beyond tiny marker datagrams.
+        match transport.try_clone_socket() {
+            Ok(sock) => {
+                spawn_data_punch(sock, punch_stop.clone());
+                tracing::info!(%host_udp, "data-plane punch started");
+                _punch_guard = Some(PunchGuard(punch_stop_for_guard));
+            }
+            Err(e) => {
+                tracing::warn!(%host_udp, error = %e,
+                    "could not clone data socket for punch — session proceeding without a data-plane punch; NAT/stateful-firewall sessions may receive no video");
+            }
+        }
         let mut session =
             Session::new(session_cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;
         let mut sink = match &record {

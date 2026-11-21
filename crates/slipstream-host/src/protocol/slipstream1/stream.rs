@@ -1632,6 +1632,8 @@ pub(super) struct SessionContext {
     /// `false` = single-slice frames, the pre-0.17 wire shape TV-SoC decoders (Amlogic  -
     /// Chromecast with Google TV) require to not wedge.
     pub(super) multi_slice: bool,
+    /// Per-session `backend:name` capture target from the Hello; preferred over the host-wide pin.
+    pub(super) monitor_id: Option<String>,
     /// Shared streaming-stats recorder. The capture loop reads `is_armed()` per frame to decide
     /// whether to measure the per-stage split; the send thread builds + pushes the aggregated
     /// `StatsSample` at its 2 s boundary.
@@ -1797,6 +1799,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ctx.bit_depth,
         ctx.chroma,
         ctx.codec,
+        ctx.monitor_id.as_deref(),
+        ctx.compositor,
         // Blend CAPABILITY (the single rule in `cursor_blend_for`): cursor-FORWARD sessions
         // need it for the mid-stream capture-mouse flip (`CursorRenderMode`  -  WHETHER a
         // frame's pointer is drawn stays per-tick, the encode loop strips `frame.cursor`
@@ -1855,6 +1859,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         chroma: _,
         // Likewise the codec  -  `plan.codec` (resolved from `ctx.codec`) is the source of truth below.
         codec: _,
+        monitor_id: _,
         probe_rx,
         probe_result_tx,
         reconfig_result_tx,
@@ -1984,7 +1989,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 bitrate_kbps,
                 bitrate_auto,
                 bit_depth,
-                plan,
+                plan.clone(),
                 &quit,
                 &stop,
                 8,
@@ -2465,7 +2470,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             bitrate_kbps,
                             bitrate_auto,
                             bit_depth,
-                            plan,
+                            plan.clone(),
                             &quit,
                             &stop,
                             8,
@@ -2561,9 +2566,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 mode_bitrate,
                 bitrate_auto,
                 bit_depth,
-                plan,
-                &quit,
-                // The display this rebuild supersedes (retired below once the new pipeline is
+                        plan.clone(),
+                        &quit,
+                        // The display this rebuild supersedes (retired below once the new pipeline is
                 // up)  -  its replacement inherits the group topology (Primary/Exclusive).
                 cur_display_gen,
                 // No first-frame shortening here: this direct call has no retry wrapper to
@@ -3271,7 +3276,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         bitrate_kbps,
                         bitrate_auto,
                         bit_depth,
-                        plan,
+                        plan.clone(),
                         &quit,
                         &stop,
                         // 1, not 8: this loop re-detects the active session per iteration  -  short
@@ -4263,6 +4268,7 @@ pub(super) fn prepare_display(
     bit_depth: u8,
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
+    monitor_id: Option<&str>,
     shard_payload: u16,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
@@ -4275,6 +4281,8 @@ pub(super) fn prepare_display(
         bit_depth,
         chroma,
         codec,
+        monitor_id,
+        compositor,
         // Use the same blend capability rule as `virtual_stream`.
         crate::session_plan::cursor_blend_for(
             cursor_forward,
@@ -4303,9 +4311,9 @@ pub(super) fn prepare_display(
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
-        plan,
-        quit,
-        stop,
+                        plan.clone(),
+                        quit,
+                        stop,
         8,
         Some(trace),
     )?;
@@ -4377,7 +4385,7 @@ fn build_pipeline_with_retry(
             bitrate_kbps,
             bitrate_auto,
             bit_depth,
-            plan,
+            plan.clone(),
             quit,
             None, // fresh bring-up  -  no display superseded
             first_frame_budget,

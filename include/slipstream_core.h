@@ -1123,6 +1123,12 @@
 #endif
 
 #if defined(SLIPSTREAM_FEATURE_QUIC)
+// Longest namespaced monitor id carried in a [`Hello::monitor_id`] (bytes of UTF-8).
+// This bounds attacker-controlled handshake input; `backend:name` ids in use are far shorter.
+#define HELLO_MONITOR_ID_MAX 128
+#endif
+
+#if defined(SLIPSTREAM_FEATURE_QUIC)
 // [`Welcome::cipher`] id: AES-128-GCM — the default session AEAD every peer speaks (and the
 // only one pre-cipher builds know).
 #define CIPHER_AES_128_GCM 0

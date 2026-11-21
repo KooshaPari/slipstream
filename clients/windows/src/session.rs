@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use slipstream_core::config::Role;
 use slipstream_core::packet::FLAG_PROBE;
-use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
+use slipstream_core::quic::{endpoint, io, Hello, RequestKeyframe, Start, Welcome};
 use slipstream_core::transport::UdpTransport;
 use slipstream_core::{Session, SlipstreamError};
 
@@ -18,6 +18,7 @@ use crate::args::{hex, Args};
 use crate::connect::{self, Admission, Machine};
 use crate::identity;
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
+use crate::recovery::{RecoveryEvent, RecoveryState};
 use crate::{ff, mf, window, PipeStats};
 
 /// Inputs needed to run one client session. The CLI has already parsed and resolved these.
@@ -94,6 +95,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         (None, None) => tracing::info!(%remote, "connected"),
     }
 
+    // The host uses an infinite GOP: keep the control stream for keyframe recovery.
     let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
     let mut recv = io::MsgReader::new(recv);
     io::write_msg(
@@ -211,6 +213,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     }
 
     let started = Instant::now();
+    let mut recovery = RecoveryState::default();
     let (frames, bytes, presented, stop) =
         tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, SessionStop)> {
         let transport = UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
@@ -284,6 +287,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                     sized = (m.width, m.height);
                     decoder.resize(m.width, m.height);
                     presenter.resize(m.width, m.height);
+                    recovery.advance(Some(RecoveryEvent::DecoderRestart), Instant::now());
                 }
             }
             if let Some(secs) = seconds {
@@ -303,6 +307,15 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             let t_poll = Instant::now();
             let polled = session.poll_frame();
             let poll_ns = t_poll.elapsed().as_nanos() as u64;
+            // Ask for a fresh IDR when no decodable picture has appeared; the throttle lives in RecoveryState.
+            let now = Instant::now();
+            if let Some(reason) = recovery.advance(None, now) {
+                let sent = recovery.sent();
+                match tokio::runtime::Handle::current().block_on(io::write_msg(&mut send, &RequestKeyframe.encode())) {
+                    Ok(()) => tracing::warn!(reason = reason.as_str(), sent, elapsed_ms = now.elapsed().as_millis(), "requested a keyframe — no decodable picture"),
+                    Err(e) => tracing::warn!(reason = reason.as_str(), error = %e, "keyframe request failed"),
+                }
+            }
             let mut spin_ns = 0u64;
             match polled {
                 Ok(frame) => {
@@ -323,6 +336,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                         stats.note_decoded();
                         presented += 1;
                         stats.note_presented();
+                        recovery.advance(Some(RecoveryEvent::Output), Instant::now());
+                    } else {
+                        recovery.advance(Some(RecoveryEvent::DecodeError), Instant::now());
                     }
                     let t_pres = Instant::now();
                     presenter.present(decoded.as_ref());

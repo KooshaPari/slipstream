@@ -21,6 +21,7 @@ mod ff;
 mod identity;
 mod mf;
 mod present;
+mod recovery;
 mod session;
 mod window;
 

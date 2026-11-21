@@ -19,6 +19,42 @@ pub use ss_frame::{CapturedFrame, OutputFormat, PixelFormat};
 // and a caller reaching for it by that name would silently miss the gamescope arm. The host's
 // answer is [`capturer_supports_hdr_for`] below.
 pub use ss_capture::{capturer_supports_444, Capturer, FastSyntheticCapturer, SyntheticCapturer};
+
+/// Validate a per-session `backend:name` monitor id and return its bare monitor name.
+///
+/// The namespace is part of the wire contract, but ss-vdisplay's existing enumerators key on
+/// the backend's local name (`\\.\DISPLAY1`, `HDMI-A-2`, `Virtual-slipstream-5`). This accepts
+/// the currently implemented GDI/DRM/KWin/X11/Wayland backends and rejects an id from a
+/// backend this host cannot enumerate, so a client cannot silently select the wrong head.
+pub fn resolve_session_monitor_id(
+    monitor_id: Option<&str>,
+    monitors: &[ss_vdisplay::monitors::PhysicalMonitor],
+) -> Result<Option<String>> {
+    let Some(id) = monitor_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    let (backend, name) = id.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid monitor_id {id:?}: expected namespaced backend:name (for example \
+             gdi:\\\\.\\DISPLAY1, drm:HDMI-A-2, kwin:Virtual-slipstream-5)"
+        )
+    })?;
+    let backend = backend.trim().to_ascii_lowercase();
+    let allowed = matches!(
+        backend.as_str(),
+        "gdi" | "drm" | "kwin" | "wayland" | "x11" | "wlr" | "mutter" | "gamescope" | "hyprland"
+    );
+    if !allowed {
+        bail!("invalid monitor_id {id:?}: unknown backend {backend:?}");
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("invalid monitor_id {id:?}: empty monitor name");
+    }
+    let resolved = ss_vdisplay::monitors::resolve(monitors, name)
+        .with_context(|| format!("monitor_id {id:?}"))?;
+    Ok(Some(resolved.connector.clone()))
+}
 /// Resolve the [`ss_capture::ZeroCopyPolicy`] for a Linux capture session from the encode backend —
 /// the one reach into `crate::encode` the capturer must NOT make itself (it would recreate the
 /// capture→encode cycle). Resolved here (the host facade) and threaded in, so the edge stays one-way

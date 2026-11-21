@@ -92,6 +92,13 @@ pub struct Hello {
     /// caps everything after `display_hdr` at `HDR_META_BODY_LEN − 1` bytes total — document any
     /// future field here and mind the budget. Omitted when zero and by older clients (→ `0`).
     pub client_caps: u8,
+    /// Per-session capture target requested by the client, as `backend:name`
+    /// (e.g. `gdi:\\.\DISPLAY1`, `drm:HDMI-A-2`, `kwin:Virtual-slipstream-5`). Appended after
+    /// `client_caps` as `len u8 || UTF-8` (≤ [`HELLO_MONITOR_ID_MAX`] bytes); omitted when
+    /// absent, so clients that do not select a monitor keep the prior wire form. The host
+    /// validates this against its own `list-monitors` and falls back to the host-wide pin
+    /// when absent or unknown.
+    pub monitor_id: Option<String>,
 }
 
 /// QUIC application error code a slipstream/1 client closes the control connection with on a
@@ -116,6 +123,10 @@ pub const HELLO_NAME_MAX: usize = 64;
 /// Longest library id carried in a [`Hello::launch`] (bytes of UTF-8). Ids are short
 /// (`steam:<appid>` / `custom:<12 hex>`); the cap just bounds an attacker-controlled field.
 pub const HELLO_LAUNCH_MAX: usize = 128;
+
+/// Longest namespaced monitor id carried in a [`Hello::monitor_id`] (bytes of UTF-8).
+/// This bounds attacker-controlled handshake input; `backend:name` ids in use are far shorter.
+pub const HELLO_MONITOR_ID_MAX: usize = 128;
 
 /// [`Welcome::cipher`] id: AES-128-GCM — the default session AEAD every peer speaks (and the
 /// only one pre-cipher builds know).
@@ -253,12 +264,14 @@ impl Hello {
         let pref_present = self.preferred_codec != 0;
         let hdr_present = self.display_hdr.is_some();
         let ccaps_present = self.client_caps != 0;
+        let monitor_present = self.monitor_id.is_some();
         let need_placeholders = self.video_caps != 0
             || ac_present
             || vcodecs_present
             || pref_present
             || hdr_present
-            || ccaps_present;
+            || ccaps_present
+            || monitor_present;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -297,8 +310,16 @@ impl Hello {
             super::datagram::write_hdr_meta_body(m, &mut b);
         }
         // client_caps: single byte after the (optional) HDR block. Emitted when non-zero.
-        if ccaps_present {
+        if ccaps_present || monitor_present {
             b.push(self.client_caps);
+        }
+        // monitor_id: `len u8 || UTF-8` after client_caps. Omitted when absent so an ordinary
+        // Hello stays byte-identical to the pre-E1 form; an empty string is treated as absent
+        // by decoders and by the host resolver.
+        if let Some(id) = &self.monitor_id {
+            let id = truncate_to(id, HELLO_MONITOR_ID_MAX);
+            b.push(id.len() as u8);
+            b.extend_from_slice(id.as_bytes());
         }
         b
     }
@@ -384,6 +405,25 @@ impl Hello {
                     tail + 4
                 };
                 b.get(off).copied().unwrap_or(0)
+            },
+            // monitor_id: `len u8 || UTF-8` after client_caps. Absent, empty, oversized and
+            // non-UTF-8 values all decode to `None`: an untrusted client must never fail the
+            // handshake with a malformed monitor selection.
+            monitor_id: {
+                let ccaps_off =
+                    if b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN {
+                        tail + 4 + super::datagram::HDR_META_BODY_LEN
+                    } else {
+                        tail + 4
+                    };
+                let id_len = b.get(ccaps_off + 1).copied().unwrap_or(0) as usize;
+                (id_len > 0 && id_len <= HELLO_MONITOR_ID_MAX)
+                    .then(|| {
+                        b.get(ccaps_off + 2..ccaps_off + 2 + id_len)
+                            .and_then(|s| std::str::from_utf8(s).ok())
+                            .map(String::from)
+                    })
+                    .flatten()
             },
         })
     }
@@ -866,6 +906,7 @@ mod tests {
             preferred_codec: CODEC_H264,
             display_hdr: None,
             client_caps: 0,
+            monitor_id: None,
         };
         let enc = h.encode();
         let dec = Hello::decode(&enc).unwrap();
@@ -943,6 +984,7 @@ mod tests {
             preferred_codec: CODEC_HEVC,
             display_hdr: None,
             client_caps: 0,
+            monitor_id: None,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -974,6 +1016,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            monitor_id: None,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1092,6 +1135,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            monitor_id: None,
         };
         let enc = base.encode();
         assert_eq!(
@@ -1144,6 +1188,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            monitor_id: None,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -1204,6 +1249,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            monitor_id: None,
         };
         // A real client-panel volume (P3 primaries, 800-nit peak, 0.05-nit floor, 400-nit FALL).
         let vol = HdrMeta {
@@ -1272,6 +1318,7 @@ mod tests {
                 preferred_codec: 0,
                 display_hdr: None,
                 client_caps: 0,
+                monitor_id: None,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");
@@ -1305,6 +1352,7 @@ mod tests {
             preferred_codec: 0,
             display_hdr: None,
             client_caps: 0,
+            monitor_id: None,
         };
         let vol = HdrMeta {
             display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],

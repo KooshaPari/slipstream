@@ -19,6 +19,7 @@ mod connect;
 mod discovery;
 mod ff;
 mod identity;
+mod input;
 mod mf;
 mod present;
 mod session;

@@ -32,6 +32,16 @@ use std::time::{Duration, Instant};
 
 use session::{run_stream, SessionConfig, SessionOutcome};
 
+/// Process exit codes. Stable contract for scripts and supervisors. The Windows client had no
+/// documented table: these keep the probe's `2 = usage, 1 = runtime error` convention and preserve
+/// `3` from the old inline `std::process::exit(3)` for a zero-frame session.
+const EXIT_OK: u8 = 0;
+const EXIT_ERROR: u8 = 1;
+const EXIT_USAGE: u8 = 2;
+const EXIT_ZERO_FRAMES: u8 = 3;
+const EXIT_CONNECT_FAILED: u8 = 4;
+const EXIT_TIMED_OUT: u8 = 5;
+
 /// Pipeline counters, printed once a second: AUs received → decoded → presented, plus the interval
 /// between consecutive presented frames. The interval distribution is the point: "steady low fps"
 /// and "mostly fast with periodic 200-400 ms hitches" are different bugs with different fixes.
@@ -159,7 +169,7 @@ impl PipeStats {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -169,24 +179,27 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            return std::process::ExitCode::from(EXIT_USAGE);
         }
     };
-    if let Err(e) = run(args) {
-        tracing::error!("{e:#}");
-        std::process::exit(1);
+    match run(args) {
+        Ok(code) => std::process::ExitCode::from(code),
+        Err(e) => {
+            tracing::error!("{e:#}");
+            std::process::ExitCode::from(EXIT_ERROR)
+        }
     }
 }
 
-fn run(args: Args) -> Result<()> {
+fn run(args: Args) -> Result<u8> {
     match args.action() {
         None => {
             println!("{}", args::usage());
-            Ok(())
+            Ok(EXIT_OK)
         }
-        Some(Action::Discover(secs)) => discovery::run(secs),
-        Some(Action::Pair) => pair(&args),
-        Some(Action::Play) => play(&args),
+        Some(Action::Discover(secs)) => discovery::run(secs).map(|()| EXIT_OK),
+        Some(Action::Pair) => pair(&args).map(|()| EXIT_OK),
+        Some(Action::Play) => play(&args).map(|()| EXIT_OK),
         Some(Action::Connect) => stream(args),
     }
 }
@@ -352,7 +365,7 @@ fn pair(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn stream(args: Args) -> Result<()> {
+fn stream(args: Args) -> Result<u8> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -360,19 +373,19 @@ fn stream(args: Args) -> Result<()> {
     rt.block_on(stream_async(args))
 }
 
-async fn stream_async(args: Args) -> Result<()> {
+async fn stream_async(args: Args) -> Result<u8> {
     let remote = resolve(&target_of(&args)?)?;
-    match run_stream(SessionConfig { remote, args }).await? {
+    let outcome = run_stream(SessionConfig { remote, args }).await?;
+    Ok(match outcome {
         SessionOutcome::ZeroFrames => {
             tracing::warn!(
                 "zero frames: the host accepted the session but published none \
                  (a wedged host capture thread does this — it is a host-side bug, not a client one)"
             );
-            Ok(())
+            EXIT_ZERO_FRAMES
         }
-        SessionOutcome::Ended
-        | SessionOutcome::ConnectFailed
-        | SessionOutcome::WindowClosed
-        | SessionOutcome::TimedOut => Ok(()),
-    }
+        SessionOutcome::ConnectFailed => EXIT_CONNECT_FAILED,
+        SessionOutcome::TimedOut => EXIT_TIMED_OUT,
+        SessionOutcome::Ended | SessionOutcome::WindowClosed => EXIT_OK,
+    })
 }

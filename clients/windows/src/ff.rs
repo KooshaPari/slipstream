@@ -20,6 +20,7 @@ use std::io::{Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 const IMAGEMAGICK_FFMPEG: &str =
     r"C:\Program Files\ImageMagick-7.1.0-Q16-HDRI\ffmpeg.exe";
@@ -345,14 +346,14 @@ impl FfmpegDecoder {
 
     /// Close the input pipe and drain the frames ffmpeg still holds (end of a `--play` file).
     pub fn finish(&mut self) -> Vec<DecodedFrame> {
-        // Closing the sender ends the writer thread once it has written everything queued; joining
-        // it guarantees ffmpeg saw every AU before stdin closes.
-        drop(self.au_tx.take());
-        if let Some(w) = self.writer.take() {
-            let _ = w.join();
-        }
         let mut out = Vec::new();
-        while let Ok(frame) = self.frames.recv() {
+        // Stop accepting new AUs first, but do not join the writer while the bounded frame queue is
+        // full: ffmpeg can block writing stdout while the writer blocks writing stdin, and the
+        // reader blocks on `send` until we drain. Drain concurrently and join once the writer has
+        // closed stdin.
+        drop(self.au_tx.take());
+        let writer = self.writer.take();
+        for frame in drain_frames(&self.frames, &self.queued) {
             self.frame_index = self.frame_index.wrapping_add(1);
             self.decoded += 1;
             out.push(DecodedFrame {
@@ -363,6 +364,13 @@ impl FfmpegDecoder {
                 pts_ns: 0,
             });
         }
+        if let Some(w) = writer {
+            let _ = w.join();
+        }
+        // The reader closes its sender when stdout reaches EOF; reap the child after that so no
+        // ffmpeg process is left behind.
+        let _ = self.child.wait();
+        self.eof = true;
         out
     }
 
@@ -446,6 +454,49 @@ fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool
         }
     }
     Ok(true)
+}
+
+/// Take every frame from the bounded reader queue until the reader disconnects. Called *before*
+/// joining the writer in [`FfmpegDecoder::finish`]: the reader blocks on `send` when the queue is
+/// full, so joining the writer first lets ffmpeg block on stdout while the writer blocks on stdin.
+fn drain_frames(frames: &Receiver<Vec<u8>>, queued: &AtomicUsize) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        match frames.recv_timeout(Duration::from_millis(10)) {
+            Ok(frame) => {
+                queued.fetch_sub(1, Ordering::Relaxed);
+                out.push(frame);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic repro of the old shutdown deadlock: a bounded frame queue whose producer cannot
+    /// finish until the consumer drains it. `drain_frames` must unblock the producer and return
+    /// every frame; the previous join-then-drain order hung here.
+    #[test]
+    fn draining_bounded_queue_unblocks_the_writer() {
+        const BOUND: usize = 3;
+        const TOTAL: usize = BOUND * 4;
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(BOUND);
+        let queued = AtomicUsize::new(TOTAL);
+        let producer = std::thread::spawn(move || {
+            for i in 0..TOTAL {
+                tx.send(vec![i as u8]).expect("receiver alive");
+            }
+        });
+        let frames = drain_frames(&rx, &queued);
+        producer.join().expect("producer thread");
+        assert_eq!(frames.len(), TOTAL);
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+    }
 }
 
 impl Drop for FfmpegDecoder {

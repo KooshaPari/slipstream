@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "cCqGURk/hg0=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\koosh\\agents\\worktrees\\slipstream\\b2-msi\\packaging\\msi\\Slipstream.wixproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\koosh\\.nuget\\packages\\wixtoolset.firewall.wixext\\4.0.4\\wixtoolset.firewall.wixext.4.0.4.nupkg.sha512"
+  ],
+  "logs": []
+}

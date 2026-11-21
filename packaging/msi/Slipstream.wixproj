@@ -1,0 +1,11 @@
+<Project Sdk="WixToolset.Sdk/4.0.4">
+  <PropertyGroup>
+    <OutputName>Slipstream</OutputName>
+    <OutputType>Package</OutputType>
+    <Platform>x64</Platform>
+    <DefineConstants>Version=0.24.0.0</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Firewall.wixext" Version="4.0.4" />
+  </ItemGroup>
+</Project>

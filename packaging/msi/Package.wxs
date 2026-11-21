@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fire="http://wixtoolset.org/schemas/v4/wxs/firewall">
+  <!-- x64, per-machine installer. Version/UpgradeCode live here so the build command needs no
+       -d defines; see README.md for regeneration. -->
+  <Package Name="Slipstream"
+           Language="1033"
+           Version="0.24.0.0"
+           UpgradeCode="6E8D3A28-9F1C-4A2B-8D3E-7C1F4A6B9E52"
+           Manufacturer="Slipstream contributors"
+           InstallerVersion="200"
+           Compressed="yes"
+           Scope="perMachine">
+
+    <SummaryInformation Description="Slipstream Windows host, tray and client"
+                        Manufacturer="Slipstream contributors" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Slipstream is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPPRODUCTICON" Value="SlipstreamIcon" />
+    <Icon Id="SlipstreamIcon" SourceFile="icons/slipstream.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/vindeckyy/slipstream" />
+
+    <Feature Id="Main" Title="Slipstream" Level="1">
+      <ComponentGroupRef Id="SlipstreamFiles" />
+      <ComponentRef Id="SlipstreamPath" />
+      <ComponentRef Id="SlipstreamStartMenu" />
+      <ComponentRef Id="SlipstreamTrayAutostart" />
+      <ComponentRef Id="SlipstreamFirewall" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Slipstream" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="SlipstreamMenuFolder" Name="Slipstream" />
+    </StandardDirectory>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="SlipstreamFiles" Directory="INSTALLFOLDER">
+      <!-- Real artifacts: cargo build release for slipstream-host, slipstream-tray and slipstream-cli. -->
+      <Component Id="HostExe" Guid="3A8F2C11-6B4D-4E7A-9C21-0D5E8A7B1F34">
+        <File Id="HostExeFile" Name="slipstream-host.exe" Source="payload/slipstream-host.exe" KeyPath="yes" />
+        <ServiceInstall Id="SlipstreamHostService"
+                        Name="slipstream-host"
+                        DisplayName="Slipstream Host"
+                        Description="Slipstream streaming host (native slipstream/1 and management API)"
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="--service serve"
+                        Vital="yes" />
+        <ServiceControl Id="SlipstreamHostControl"
+                        Name="slipstream-host"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+      <Component Id="TrayExe" Guid="8C1D4E22-7A5F-4B3E-8D12-1E6F9A2C4B57">
+        <File Id="TrayExeFile" Name="slipstream-tray.exe" Source="payload/slipstream-tray.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="ClientExe" Guid="B4E6A1D9-2C3F-4A8B-9E70-5D1C8F3A6B24">
+        <File Id="ClientExeFile" Name="slipstream.exe" Source="payload/slipstream.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="IconFile" Guid="D9A7C3E1-5B2D-4F6A-8C19-0E3B7A2D5F48">
+        <File Id="SlipstreamIconFile" Name="slipstream.ico" Source="icons/slipstream.ico" KeyPath="yes" />
+      </Component>
+      <Component Id="DashboardUrl" Guid="5D6E7F8A-9B0C-4D1E-2F3A-4B5C6D7E8F90">
+        <File Id="DashboardUrlFile" Name="Slipstream Dashboard.url" Source="Slipstream Dashboard.url" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <!-- Per-machine PATH, one entry, removed on uninstall. -->
+    <Component Id="SlipstreamPath" Directory="INSTALLFOLDER" Guid="1F2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D">
+      <Environment Id="SlipstreamPathEntry"
+                   Name="PATH"
+                   Value="[INSTALLFOLDER]"
+                   Permanent="no"
+                   Part="last"
+                   Action="set"
+                   System="yes" />
+    </Component>
+  </Fragment>
+
+  <Fragment>
+    <Component Id="SlipstreamStartMenu" Directory="SlipstreamMenuFolder" Guid="2A3B4C5D-6E7F-4B8C-9D0E-1F2A3B4C5D6E">
+      <Shortcut Id="HostShortcut"
+                Name="Slipstream Host"
+                Description="Launch the Slipstream host console"
+                Target="[INSTALLFOLDER]slipstream-host.exe"
+                Arguments="serve"
+                Icon="SlipstreamIcon"
+                WorkingDirectory="INSTALLFOLDER" />
+      <Shortcut Id="ClientShortcut"
+                Name="Slipstream Client"
+                Description="Connect to a Slipstream host"
+                Target="[INSTALLFOLDER]slipstream.exe"
+                Icon="SlipstreamIcon"
+                WorkingDirectory="INSTALLFOLDER" />
+      <Shortcut Id="DashboardShortcut"
+                Name="Slipstream Dashboard"
+                Description="Open the Slipstream web dashboard"
+                Target="[INSTALLFOLDER]Slipstream Dashboard.url"
+                Icon="SlipstreamIcon" />
+      <RegistryValue Root="HKCU" Key="Software\Slipstream\StartMenu" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+      <RemoveFolder Id="RemoveSlipstreamMenu" On="uninstall" />
+    </Component>
+  </Fragment>
+
+  <Fragment>
+    <!-- Tray autostart for each installing user. The tray supports the autostart flag explicitly. -->
+    <Component Id="SlipstreamTrayAutostart" Directory="INSTALLFOLDER" Guid="3B4C5D6E-7F8A-4C9D-0E1F-2A3B4C5D6E7F">
+      <RegistryKey Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run">
+        <RegistryValue Name="SlipstreamTray"
+                       Type="string"
+                       Value="&quot;[INSTALLFOLDER]slipstream-tray.exe&quot; --autostart"
+                       KeyPath="yes" />
+      </RegistryKey>
+    </Component>
+  </Fragment>
+
+  <Fragment>
+    <!-- Windows Defender Firewall exceptions, removed with the component on uninstall.
+         Profile=all/Scope=localSubnet match the requested host port contract; scope tightening
+         can be layered later without changing the component topology. -->
+    <Component Id="SlipstreamFirewall" Directory="INSTALLFOLDER" Guid="4C5D6E7F-8A9B-4D0E-1F2A-3B4C5D6E7F8A">
+      <fire:FirewallException Id="FW_TCP_47984"
+                              Name="Slipstream TCP 47984"
+                              Description="Slipstream host (GameStream HTTP)"
+                              Port="47984" Protocol="tcp"
+                              Profile="all" Scope="localSubnet"
+                              IgnoreFailure="no" />
+
+      <fire:FirewallException Id="FW_TCP_47989"
+                              Name="Slipstream TCP 47989"
+                              Description="Slipstream host (GameStream HTTPS)"
+                              Port="47989" Protocol="tcp"
+                              Profile="all" Scope="localSubnet"
+                              IgnoreFailure="no" />
+
+      <fire:FirewallException Id="FW_TCP_48010"
+                              Name="Slipstream TCP 48010"
+                              Description="Slipstream host (GameStream RTSP)"
+                              Port="48010" Protocol="tcp"
+                              Profile="all" Scope="localSubnet"
+                              IgnoreFailure="no" />
+
+      <fire:FirewallException Id="FW_UDP_47999"
+                              Name="Slipstream UDP 47999"
+                              Description="Slipstream host (GameStream control)"
+                              Port="47999" Protocol="udp"
+                              Profile="all" Scope="localSubnet"
+                              IgnoreFailure="no" />
+
+      <fire:FirewallException Id="FW_UDP_9777"
+                              Name="Slipstream UDP 9777"
+                              Description="Slipstream host (native QUIC control)"
+                              Port="9777" Protocol="udp"
+                              Profile="all" Scope="localSubnet"
+                              IgnoreFailure="no" />
+
+      <RegistryValue Root="HKLM" Key="Software\Slipstream\Firewall" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>

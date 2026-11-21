@@ -1,0 +1,6 @@
+C:\Users\koosh\agents\worktrees\slipstream\b2-msi\packaging\msi\obj\x64\Release\Slipstream.wixproj.CoreCompileInputs.cache
+C:\Users\koosh\agents\worktrees\slipstream\b2-msi\packaging\msi\obj\x64\Release\Slipstream.msi
+C:\Users\koosh\agents\worktrees\slipstream\b2-msi\packaging\msi\obj\x64\Release\Slipstream.wixpdb
+C:\Users\koosh\agents\worktrees\slipstream\b2-msi\packaging\msi\obj\x64\Release\Slipstream.wixproj.BindTracking-neutral.txt
+C:\Users\koosh\agents\worktrees\slipstream\b2-msi\packaging\msi\bin\Slipstream.msi
+C:\Users\koosh\agents\worktrees\slipstream\b2-msi\packaging\msi\bin\Slipstream.wixpdb

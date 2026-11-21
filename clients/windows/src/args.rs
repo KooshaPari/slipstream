@@ -3,13 +3,56 @@
 //!
 //! Flags mirror the sibling clients and the probe so an operator's muscle memory transfers:
 //! `--connect HOST[:PORT]`, `--discover [SECS]`, `--pair PIN`, `--pin HEX`, `--name LABEL`,
-//! `--mode WxHxFPS`, `--bitrate KBPS`, `--codec auto|h264|hevc|av1`, `--seconds N`,
+//! `--mode WxHxFPS`, `--bitrate KBPS`, `--codec auto|h264|hevc`, `--seconds N`,
 //! `--record FILE`, `--play FILE`.
 
+use slipstream_core::quic::{CODEC_H264, CODEC_HEVC};
 use slipstream_core::Mode;
 
 /// The host's data-plane port is always 9777; a bare `--connect 10.0.0.5` means that port.
 pub const DEFAULT_PORT: u16 = 9777;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodecPreference {
+    pub name: &'static str,
+    pub alias: Option<&'static str>,
+    pub wire: u8,
+}
+
+/// Every codec the Windows client accepts as an explicit preference. This is the single source
+/// for `--codec` parsing, the values shown to the user, and the codec bits advertised in Hello.
+/// AV1 is deliberately absent: the default ffmpeg decoder rejects it, so claiming it here would
+/// invite a negotiation the client cannot decode.
+pub const CODEC_PREFERENCES: &[CodecPreference] = &[
+    CodecPreference {
+        name: "h264",
+        alias: Some("avc"),
+        wire: CODEC_H264,
+    },
+    CodecPreference {
+        name: "hevc",
+        alias: Some("h265"),
+        wire: CODEC_HEVC,
+    },
+];
+
+/// Codec bits the client advertises as decodable in `Hello::video_codecs`.
+pub fn advertised_video_codecs() -> u8 {
+    CODEC_PREFERENCES
+        .iter()
+        .fold(0u8, |bits, codec| bits | codec.wire)
+}
+
+fn codec_spec() -> String {
+    let mut names = vec!["auto"];
+    for codec in CODEC_PREFERENCES {
+        names.push(codec.name);
+        if let Some(alias) = codec.alias {
+            names.push(alias);
+        }
+    }
+    names.join("|")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -113,9 +156,7 @@ impl Target {
                 .split_once(']')
                 .ok_or_else(|| format!("unterminated '[' in {s:?}"))?;
             let port = match tail.strip_prefix(':') {
-                Some(p) => p
-                    .parse::<u16>()
-                    .map_err(|_| format!("bad port in {s:?}"))?,
+                Some(p) => p.parse::<u16>().map_err(|_| format!("bad port in {s:?}"))?,
                 None if tail.is_empty() => DEFAULT_PORT,
                 None => return Err(format!("unexpected {tail:?} after ] in {s:?}")),
             };
@@ -175,14 +216,14 @@ fn parse_mode(m: &str) -> Option<Mode> {
 }
 
 fn parse_codec(c: &str) -> Option<u8> {
-    use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
-    match c.to_ascii_lowercase().as_str() {
-        "auto" => Some(0),
-        "h264" | "avc" => Some(CODEC_H264),
-        "hevc" | "h265" => Some(CODEC_HEVC),
-        "av1" => Some(CODEC_AV1),
-        _ => None,
+    let c = c.to_ascii_lowercase();
+    if c == "auto" {
+        return Some(0);
     }
+    CODEC_PREFERENCES
+        .iter()
+        .find(|codec| codec.name == c || codec.alias == Some(c.as_str()))
+        .map(|codec| codec.wire)
 }
 
 /// Parse an argument vector (without argv[0]). Every malformed *present* flag is an error: the
@@ -219,8 +260,8 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             "--name" => args.name = value(&mut i, "--name")?,
             "--mode" => {
                 let raw = value(&mut i, "--mode")?;
-                args.mode =
-                    parse_mode(&raw).ok_or_else(|| format!("--mode must be WxHxFPS, got {raw:?}"))?;
+                args.mode = parse_mode(&raw)
+                    .ok_or_else(|| format!("--mode must be WxHxFPS, got {raw:?}"))?;
             }
             "--bitrate" => {
                 let raw = value(&mut i, "--bitrate")?;
@@ -231,7 +272,7 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             "--codec" => {
                 let raw = value(&mut i, "--codec")?;
                 args.preferred_codec = parse_codec(&raw).ok_or_else(|| {
-                    format!("--codec must be auto|h264|hevc|av1, got {raw:?}")
+                    format!("--codec must be one of {}, got {raw:?}", codec_spec())
                 })?;
             }
             "--audio-channels" => {
@@ -265,18 +306,22 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
         }
         i += 1;
     }
-    if args.connect.is_some() && (args.discover.is_some() || args.pair.is_some() || args.play.is_some())
+    if args.connect.is_some()
+        && (args.discover.is_some() || args.pair.is_some() || args.play.is_some())
     {
         return Err("--connect cannot be combined with --discover, --pair or --play".into());
     }
     Ok(args)
 }
 
-pub fn usage() -> &'static str {
-    "usage: slipstream-windows [HOST[:PORT]] [--connect HOST[:PORT]] [--pin HEX | --pair PIN]\n\
+pub fn usage() -> String {
+    format!(
+        "usage: slipstream-windows [HOST[:PORT]] [--connect HOST[:PORT]] [--pin HEX | --pair PIN]\n\
      \x20      [--discover [SECS]] [--name LABEL] [--mode WxHxFPS] [--bitrate KBPS]\n\
-     \x20      [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
-     \x20      [--play FILE]"
+     \x20      [--codec {}] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
+     \x20      [--play FILE]",
+        codec_spec()
+    )
 }
 
 #[cfg(test)]
@@ -386,6 +431,44 @@ mod tests {
         assert_eq!(a.mode.width, 1280);
         assert_eq!(a.mode.refresh_hz, 60);
         assert_eq!(p("--connect h --codec AUTO").unwrap().preferred_codec, 0);
+    }
+
+    #[test]
+    fn av1_is_rejected_with_supported_codecs_named() {
+        let err = p("--connect h --codec av1").unwrap_err();
+        assert!(err.contains("--codec must be one of auto|h264|avc|hevc|h265, got \"av1\""));
+        assert!(parse_codec("AV1").is_none());
+    }
+
+    #[test]
+    fn h264_and_hevc_are_still_accepted() {
+        assert_eq!(
+            p("--connect h --codec h264").unwrap().preferred_codec,
+            CODEC_H264
+        );
+        assert_eq!(
+            p("--connect h --codec avc").unwrap().preferred_codec,
+            CODEC_H264
+        );
+        assert_eq!(
+            p("--connect h --codec hevc").unwrap().preferred_codec,
+            CODEC_HEVC
+        );
+        assert_eq!(
+            p("--connect h --codec h265").unwrap().preferred_codec,
+            CODEC_HEVC
+        );
+    }
+
+    #[test]
+    fn advertised_codecs_match_accepted_preferences_and_exclude_av1() {
+        let bits = advertised_video_codecs();
+        assert_eq!(bits & CODEC_H264, CODEC_H264);
+        assert_eq!(bits & CODEC_HEVC, CODEC_HEVC);
+        assert_eq!(bits & slipstream_core::quic::CODEC_AV1, 0);
+        for codec in CODEC_PREFERENCES {
+            assert_eq!(bits & codec.wire, codec.wire);
+        }
     }
 
     #[test]

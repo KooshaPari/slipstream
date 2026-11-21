@@ -14,7 +14,7 @@ use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
 use slipstream_core::transport::UdpTransport;
 use slipstream_core::{Session, SlipstreamError};
 
-use crate::args::{hex, Args};
+use crate::args::{advertised_video_codecs, hex, Args};
 use crate::connect::{self, Admission, Machine};
 use crate::identity;
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
@@ -72,6 +72,28 @@ pub enum SessionStop {
     TimedOut,
 }
 
+/// Build the client's Hello from the same codec policy that parses `--codec`. Keeping this in one
+/// function makes the advertised bits directly testable without a network handshake.
+fn hello(args: &Args) -> Hello {
+    Hello {
+        abi_version: slipstream_core::WIRE_VERSION,
+        mode: args.mode,
+        compositor: slipstream_core::CompositorPref::Auto,
+        gamepad: slipstream_core::config::GamepadPref::Auto,
+        bitrate_kbps: args.bitrate_kbps,
+        name: Some(args.name.clone()),
+        launch: None,
+        // No decode backend yet: advertise no codec capability bits rather than claiming
+        // 10-bit/4:4:4 we cannot render.
+        video_caps: 0,
+        audio_channels: args.audio_channels,
+        video_codecs: advertised_video_codecs(),
+        preferred_codec: args.preferred_codec,
+        display_hdr: slipstream_core::client::display_hdr_env_override(),
+        client_caps: 0,
+    }
+}
+
 /// Run one streaming session to completion.
 pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let SessionConfig { remote, args } = cfg;
@@ -96,30 +118,8 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
 
     let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
     let mut recv = io::MsgReader::new(recv);
-    io::write_msg(
-        &mut send,
-        &Hello {
-            abi_version: slipstream_core::WIRE_VERSION,
-            mode: args.mode,
-            compositor: slipstream_core::CompositorPref::Auto,
-            gamepad: slipstream_core::config::GamepadPref::Auto,
-            bitrate_kbps: args.bitrate_kbps,
-            name: Some(args.name.clone()),
-            launch: None,
-            // No decode backend yet: advertise no codec capability bits rather than claiming
-            // 10-bit/4:4:4 we cannot render.
-            video_caps: 0,
-            audio_channels: args.audio_channels,
-            video_codecs: slipstream_core::quic::CODEC_H264
-                | slipstream_core::quic::CODEC_HEVC
-                | slipstream_core::quic::CODEC_AV1,
-            preferred_codec: args.preferred_codec,
-            display_hdr: slipstream_core::client::display_hdr_env_override(),
-            client_caps: 0,
-        }
-        .encode(),
-    )
-    .await?;
+    let hello_msg = hello(&args).encode();
+    io::write_msg(&mut send, &hello_msg).await?;
     // A host that completes the QUIC handshake but never sends `Welcome` (wedged encoder/parked
     // session) must fail, not hang the client forever.
     let welcome_msg = tokio::time::timeout(Duration::from_secs(15), recv.read_msg())
@@ -372,6 +372,15 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+
+    #[test]
+    fn hello_advertises_h264_and_hevc_but_not_av1() {
+        let hello = hello(&Args::default());
+        assert_eq!(hello.video_codecs & CODEC_H264, CODEC_H264);
+        assert_eq!(hello.video_codecs & CODEC_HEVC, CODEC_HEVC);
+        assert_eq!(hello.video_codecs & CODEC_AV1, 0);
+    }
 
     #[test]
     fn zero_frames_maps_to_zero_frames() {

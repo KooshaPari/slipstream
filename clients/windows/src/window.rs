@@ -26,18 +26,18 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    SetDIBitsToDevice, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
-    HDC, HGDIOBJ, SRCCOPY,
+    SetDIBitsToDevice, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect,
     PeekMessageW, RegisterClassW, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW,
-    WA_INACTIVE, WINDOW_EX_STYLE, WNDCLASSW, WM_ACTIVATE, WM_CLOSE, WM_DESTROY,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETFOCUS, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE, XBUTTON1, XBUTTON2,
+    WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    XBUTTON1, XBUTTON2,
 };
 
 /// Set by the window procedure when the user closes the window or presses Esc.
@@ -157,8 +157,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_KEYDOWN if wparam.0 == VK_ESCAPE => {
-            unsafe { windows::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }
-                .ok();
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    hwnd,
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            }
+            .ok();
             LRESULT(0)
         }
         WM_ACTIVATE => {
@@ -301,7 +308,12 @@ impl GdiPresenter {
         // lets `blit` take the un-stretched `SetDIBitsToDevice` path instead of GDI's software
         // stretch. Stretching an 8 MB DIB by a fractional ratio cost 28-46 ms/frame here.
         let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-        let mut outer = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
         unsafe { AdjustWindowRect(&mut outer, style, false) }.ok();
         let hwnd = unsafe {
             CreateWindowExW(
@@ -329,17 +341,8 @@ impl GdiPresenter {
         }
         let mut bits = std::ptr::null_mut();
         let bmi = Self::bitmap_info(width, height);
-        let dib = unsafe {
-            CreateDIBSection(
-                hdc_mem,
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                None,
-                0,
-            )
-        }
-        .context("CreateDIBSection")?;
+        let dib = unsafe { CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }
+            .context("CreateDIBSection")?;
         let old = unsafe { SelectObject(hdc_mem, HGDIOBJ(dib.0)) };
 
         tracing::info!(width, height, "window created");
@@ -497,7 +500,9 @@ impl Presenter for GdiPresenter {
         // 1:1 blit path survives the resize instead of silently refusing every frame.
         let bmi = Self::bitmap_info(width, height);
         let mut bits = std::ptr::null_mut();
-        let dib = match unsafe { CreateDIBSection(self.hdc_mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) } {
+        let dib = match unsafe {
+            CreateDIBSection(self.hdc_mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        } {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "could not resize the DIB — keeping the old surface");
@@ -514,7 +519,12 @@ impl Presenter for GdiPresenter {
         self.width = width;
         self.height = height;
         let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-        let mut outer = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
         unsafe { AdjustWindowRect(&mut outer, style, false) }.ok();
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(

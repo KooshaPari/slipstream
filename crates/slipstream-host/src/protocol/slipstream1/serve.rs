@@ -750,6 +750,7 @@ pub(super) async fn serve_session(
     // the encoder may keep its multi-slice default (§7 LN1). Absent ⇒ single-slice frames —
     // TV-SoC decoders (Amlogic: Chromecast with Google TV) wedge the device on multi-slice AUs.
     let multi_slice = hello.video_caps & slipstream_core::quic::VIDEO_CAP_MULTI_SLICE != 0;
+    let monitor_id = hello.monitor_id;
     let stats_dp = stats; // data-plane handle to the shared stats recorder
                           // Short label for web-console stats captures: the client's cert-fingerprint prefix, else its
                           // peer IP (no fingerprint = anonymous TOFU/--open client).
@@ -871,6 +872,7 @@ pub(super) async fn serve_session(
                         probe_seq,
                         streamed_au,
                         multi_slice,
+                        monitor_id,
                         stats: stats_dp,
                         client_label,
                         client_name,

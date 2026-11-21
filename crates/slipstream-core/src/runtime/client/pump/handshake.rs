@@ -161,6 +161,7 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 // the audio datagrams arrive untailed and the plain path applies — no
                 // behavior change, so every NativeClient build can ask.
                 client_caps: args.client_caps | crate::quic::CLIENT_CAP_AUDIO_FEC,
+                monitor_id: None,
             }
             .encode(),
         )

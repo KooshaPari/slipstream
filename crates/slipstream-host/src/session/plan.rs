@@ -233,9 +233,9 @@ impl EncoderBackend {
     }
 }
 
-/// The per-session decision, resolved once. `Copy` so it threads through the capture/encode chain
-/// without ceremony (stage 4 folds it, with the rest of the arg soup, into a `SessionContext`).
-#[derive(Clone, Copy, Debug)]
+/// The per-session decision, resolved once. `Clone` so rebuilds keep the same decisions without
+/// re-resolving them (stage 4 folds it, with the rest of the arg soup, into a `SessionContext`).
+#[derive(Clone, Debug)]
 pub struct SessionPlan {
     pub capture: CaptureBackend,
     pub topology: SessionTopology,
@@ -255,6 +255,9 @@ pub struct SessionPlan {
     /// Handshake-negotiated video codec the encoder emits — HEVC by default, H.264 for a GPU-less
     /// software host (`resolve_codec` over the client's advertised codecs ∩ the host's capability).
     pub codec: crate::encode::Codec,
+    /// Validated per-session capture target. `Some(bare connector)` overrides the host-wide
+    /// `SLIPSTREAM_CAPTURE_MONITOR` pin for this session; `None` keeps the appliance override.
+    pub monitor_id: Option<String>,
     /// Datagram-aligned wire chunking for the encoder (plan §4.4): `Some(shard_payload)` on a
     /// PyroWave session — applied to EVERY encoder this plan opens (initial + all rebuilds) so
     /// AUs stay shard-aligned across mode/bitrate/stall rebuilds. `None` for the H.26x codecs.
@@ -297,10 +300,25 @@ impl SessionPlan {
         bit_depth: u8,
         chroma: crate::encode::ChromaFormat,
         codec: crate::encode::Codec,
+        monitor_id: Option<&str>,
+        compositor: crate::vdisplay::Compositor,
         cursor_blend: bool,
         cursor_forward: bool,
         multi_slice: bool,
     ) -> Self {
+        let monitors = ss_vdisplay::monitors::list(compositor).unwrap_or_default();
+        let monitor_id = match crate::capture::resolve_session_monitor_id(monitor_id, &monitors) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                // Unknown/malformed client input is NOT a handshake failure: log and fall back to
+                // the host-wide pin, which remains the appliance override.
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "invalid per-session monitor_id — using the host monitor pin"
+                );
+                None
+            }
+        };
         SessionPlan {
             capture: CaptureBackend::resolve(),
             topology: resolve_topology(),
@@ -309,6 +327,7 @@ impl SessionPlan {
             hdr: bit_depth >= 10,
             chroma,
             codec,
+            monitor_id,
             wire_chunk: None,
             cursor_blend,
             cursor_forward,

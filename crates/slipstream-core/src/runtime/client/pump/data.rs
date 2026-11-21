@@ -111,7 +111,7 @@ impl DataPump {
         //     requested-rate session never has its ceiling raised by a burst.
         // Unset env => case 3 yields `0`, i.e. the pinned path is byte-for-byte unchanged.
         let abr_within_requested =
-            std::env::var("SLIPSTREAM_ABR_WITHIN_REQUESTED").map_or(false, |v| v != "0");
+            std::env::var("SLIPSTREAM_ABR_WITHIN_REQUESTED").is_ok_and(|v| v != "0");
         let abr_start_kbps: u32 = if rate_pinned {
             0
         } else if bitrate_kbps == 0 {

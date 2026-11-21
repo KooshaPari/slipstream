@@ -443,8 +443,6 @@ mod tests {
     /// the errno definitions available on Unix.
     #[test]
     fn transient_io_covers_raw_tx_queue_and_path_codes() {
-        use std::io::Error;
-
         #[cfg(unix)]
         {
             for code in [

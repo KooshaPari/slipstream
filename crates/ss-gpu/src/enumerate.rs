@@ -55,6 +55,11 @@ pub fn enumerate() -> Vec<GpuInfo> {
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
         });
     }
+    // One physical card can expose several render nodes; `pci_identity` is the PCI slot, so two
+    // nodes that resolve to the same slot are the same card and must not both appear. The count
+    // map is the Windows PnP fallback; `physical_device_counts` is empty on this platform, so the
+    // identity check carries the whole decision.
+    out = dedupe_to_physical_cards(out, &physical_device_counts());
     assign_ids(&mut out);
     out
 }

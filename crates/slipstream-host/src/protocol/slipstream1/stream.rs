@@ -2288,7 +2288,20 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     const MAX_ENCODER_RESETS: u32 = 5;
     let mut encoder_resets: u32 = 0;
     // Bounded retries for transient failures while reopening the encoder after a geometry change.
-    let mut geometry_reopens: u32 = 0;
+    // Encoder-reopen retry state for a capture-geometry change. Time-based, not frame-counted: the
+    // same class of transient (NVENC busy, driver hiccup during a head transition) is ridden out
+    // with 100 ms..1.6 s exponential backoff on the encoder-submit path, while five frames is only
+    // 35-83 ms at 60-144 Hz — too short to outlast the condition it is retrying through.
+    const GEOMETRY_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const GEOMETRY_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(100);
+    const GEOMETRY_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(1_600);
+    #[derive(Clone, Copy)]
+    struct GeometryRetry {
+        first_attempt: std::time::Instant,
+        next_attempt: std::time::Instant,
+        delay: std::time::Duration,
+    }
+    let mut geometry_retry: Option<GeometryRetry> = None;
     let mut last_au_at = std::time::Instant::now();
     // Last HDR mastering metadata we forwarded  -  re-sent as 0xCE on change/keyframe (see below).
     let mut last_hdr_meta: Option<slipstream_core::quic::HdrMeta> = None;
@@ -2483,7 +2496,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         inflight.clear();
                         last_au_at = std::time::Instant::now();
                         encoder_resets = 0;
-                        geometry_reopens = 0;
+                        geometry_retry = None;
                         tracing::info!(
                             compositor = compositor.id(),
                             "session switch  -  backend rebuilt, stream continues"
@@ -2917,9 +2930,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 if (frame.width, frame.height) != enc_dims {
                     let (old_w, old_h) = enc_dims;
                     // P83-1: a driver may briefly refuse an encoder reopen while another session
-                    // releases its budget or reprograms the head. Drop this mismatched frame and
-                    // retry on the next one within the same bound as the watchdog's reset budget.
-                    const MAX_GEOMETRY_REOPENS: u32 = 5;
+                    // releases its budget or reprograms the head. Retry on a wall-clock budget with
+                    // exponential backoff (see `GEOMETRY_RETRY_*`), never a bare frame count: a
+                    // transient that lasts 200 ms must not end the session just because the head
+                    // runs at 144 Hz.
                     // P83-4: mirror the mode-switch path. PyroWave's Automatic rate is a per-mode
                     // bpp pin and must be re-resolved for the delivered geometry. H.26x Automatic
                     // is managed by the encoder's rate controller; resetting it here drops the
@@ -2981,7 +2995,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             inflight.clear();
                             last_au_at = std::time::Instant::now();
                             encoder_resets = 0;
-                            geometry_reopens = 0;
+                            geometry_retry = None;
                             last_forced_idr = Some(std::time::Instant::now());
                             behind_score = 0;
                             depth_frames = 0;
@@ -2997,23 +3011,43 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             );
                         }
                         Err(e) => {
-                            geometry_reopens += 1;
-                            let attempts = geometry_reopens;
-                            if attempts >= MAX_GEOMETRY_REOPENS {
+                            let now = std::time::Instant::now();
+                            let retry = geometry_retry.get_or_insert(GeometryRetry {
+                                first_attempt: now,
+                                next_attempt: now + GEOMETRY_RETRY_BASE,
+                                delay: GEOMETRY_RETRY_BASE,
+                            });
+                            let spent = now.saturating_duration_since(retry.first_attempt);
+                            if spent >= GEOMETRY_RETRY_BUDGET {
                                 return Err(e).context(
                                     "reopen encoder for the changed capture geometry  -  \
                                      retries exhausted",
                                 );
                             }
+                            // Back off before the next attempt instead of hammering `open_video`
+                            // once per frame; the session is already not delivering, so the sleep
+                            // costs nothing a retry storm would not cost twice.
+                            let wait = retry.next_attempt.saturating_duration_since(now);
+                            retry.delay = (retry.delay * 2).min(GEOMETRY_RETRY_MAX);
+                            retry.next_attempt = now + wait + retry.delay;
                             tracing::warn!(
                                 error = %format!("{e:#}"),
-                                attempt = attempts,
+                                spent_ms = spent.as_millis() as u64,
+                                backoff_ms = retry.delay.as_millis() as u64,
                                 "capture geometry changed but the encoder reopen failed  -  \
-                                 dropping this frame and retrying"
+                                 backing off before retrying"
                             );
+                            if !wait.is_zero() {
+                                std::thread::sleep(wait);
+                            }
                             continue;
                         }
                     }
+                } else {
+                    // The delivered geometry matches the open encoder again, so any earlier reopen
+                    // failure has recovered: release the retry budget instead of carrying it into
+                    // the next, unrelated episode.
+                    geometry_retry = None;
                 }
                 // Phase-locked capture: hold the fresh frame so its ARRIVAL at the client lands a
                 // constant small lead before the client's display latch (§3 hold-then-submit; the
@@ -3298,7 +3332,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 inflight.clear();
                 last_au_at = std::time::Instant::now();
                 encoder_resets = 0;
-                geometry_reopens = 0;
+                geometry_retry = None;
                 tracing::info!(
                     compositor = compositor.id(),
                     "capture loss: pipeline rebuilt  -  stream resumes"
@@ -4585,11 +4619,16 @@ fn build_pipeline(
     // stuttering picture rather than as the mismatch it actually is. Re-resolve for what we will
     // really encode.
     //
-    // Automatic ONLY. An explicit client rate is the operator's statement about their own link and is
-    // never second-guessed  -  the same contract `resolve_bitrate_kbps_for` keeps everywhere else. The
-    // refresh is left at the negotiated one so this changes exactly one input (the pixel count) to a
-    // formula that is otherwise untouched.
-    let bitrate_kbps = if bitrate_auto && (frame.width, frame.height) != (mode.width, mode.height) {
+    // PyroWave ONLY. Its Automatic rate is a per-mode bpp pin, so the pixel count is a real input to
+    // the formula. H.26x Automatic is owned by the encoder's rate controller: an ABR session that has
+    // climbed to 35 Mbps reports that through `adopt_built_bitrate`, and re-resolving from a zero
+    // hint here would snap it back to the flat 20 Mbps default on every rebuild. An explicit client
+    // rate is the operator's statement about their own link and is never second-guessed for any
+    // codec. The refresh is left at the negotiated one so this changes exactly one input.
+    let bitrate_kbps = if bitrate_auto
+        && plan.codec == crate::encode::Codec::PyroWave
+        && (frame.width, frame.height) != (mode.width, mode.height)
+    {
         let delivered = slipstream_core::Mode {
             width: frame.width,
             height: frame.height,

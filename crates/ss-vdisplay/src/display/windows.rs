@@ -189,15 +189,16 @@ impl VirtualDisplay for WindowsMirrorDisplay {
             effective_dims,
             capture_supported,
         ) {
-            ModeReadback::UseRequested => {
+            ModeReadback::UseRequested { refresh_hz } => {
                 tracing::info!(
                     device = %self.device,
                     requested = %fmt_mode(requested),
                     effective = %fmt_mode(effective_dims),
+                    used_hz = refresh_hz,
                     mismatch = false,
                     "head mode readback"
                 );
-                requested
+                (requested.0, requested.1, refresh_hz)
             }
             ModeReadback::UseEffective => {
                 tracing::warn!(
@@ -241,8 +242,10 @@ impl VirtualDisplay for WindowsMirrorDisplay {
 /// head ignored the ask; both mean "capture here", but only one is a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ModeReadback {
-    /// The head is at the requested mode (or the ask was already satisfied): capture there.
-    UseRequested,
+    /// The head is at the requested pixel size (or the ask was already satisfied): capture there.
+    /// Carries the rate the head actually runs, which differs from the request when only the
+    /// refresh was refused.
+    UseRequested { refresh_hz: u32 },
     /// The head ignored or refused the ask but its actual mode is usable: capture there.
     UseEffective,
     /// The head reports a mode capture cannot be configured for: refuse the session loudly.
@@ -270,11 +273,19 @@ fn decide_mode_readback(
             reason: "capture cannot be configured for the display's effective mode".into(),
         };
     }
-    // Compare pixels only: a driver is free to report a fractional refresh rounded to a neighbour
-    // (143.998 Hz reads back as 143 or 144), and that is the same mode for capture purposes. The
-    // rate is still logged from the effective mode, which is what paces the stream.
+    // Pixels decide whether frames arrive at all, so agreeing pixels means the ask is satisfied. The
+    // RATE is not interchangeable: a 1080p120 ask on a 60 Hz head used to be reported as held, and
+    // the encoder then opened at 120 Hz on a 60 Hz source, pacing double and duplicating frames.
+    // Capture at the rate the head really runs. A driver may report a fractional rate rounded to a
+    // neighbour (143.998 Hz as 143 or 144); that is the real rate either way.
     if (effective.0, effective.1) == (requested.0, requested.1) {
-        ModeReadback::UseRequested
+        ModeReadback::UseRequested {
+            refresh_hz: if effective.2 == 0 {
+                requested.2
+            } else {
+                effective.2
+            },
+        }
     } else {
         ModeReadback::UseEffective
     }
@@ -479,7 +490,7 @@ mod readback_tests {
     fn readback_uses_the_request_for_the_native_mode() {
         assert_eq!(
             decide_mode_readback((2560, 1440, 144), (2560, 1440, 144), true),
-            ModeReadback::UseRequested
+            ModeReadback::UseRequested { refresh_hz: 144 }
         );
     }
 
@@ -488,7 +499,7 @@ mod readback_tests {
     fn readback_uses_the_request_for_a_working_1080p60_mode() {
         assert_eq!(
             decide_mode_readback((1920, 1080, 60), (1920, 1080, 60), true),
-            ModeReadback::UseRequested
+            ModeReadback::UseRequested { refresh_hz: 60 }
         );
     }
 
@@ -499,9 +510,8 @@ mod readback_tests {
     fn readback_uses_the_effective_mode_when_the_head_ignored_1080p144() {
         let decision = decide_mode_readback((1920, 1080, 144), (2560, 1440, 144), true);
         assert_eq!(decision, ModeReadback::UseEffective);
-        assert_ne!(
-            decision,
-            ModeReadback::UseRequested,
+        assert!(
+            !matches!(decision, ModeReadback::UseRequested { .. }),
             "capturing at the requested 1920x1080 produced zero frames on the measured panel"
         );
     }
@@ -539,7 +549,22 @@ mod readback_tests {
     fn readback_tolerates_a_rounded_refresh_for_the_same_pixels() {
         assert_eq!(
             decide_mode_readback((2560, 1440, 144), (2560, 1440, 143), true),
-            ModeReadback::UseRequested
+            ModeReadback::UseRequested { refresh_hz: 143 }
+        );
+    }
+
+    /// Refresh-only refusal: the pixels agree, the head runs slower than asked. The ask counts as
+    /// satisfied, but the encoder must pace at the head's rate, not the requested one.
+    #[test]
+    fn readback_uses_the_effective_refresh_when_only_the_rate_was_refused() {
+        assert_eq!(
+            decide_mode_readback((1920, 1080, 120), (1920, 1080, 60), true),
+            ModeReadback::UseRequested { refresh_hz: 60 }
+        );
+        // A driver that reports no rate at all must not make the session run at 0 Hz.
+        assert_eq!(
+            decide_mode_readback((1920, 1080, 60), (1920, 1080, 0), true),
+            ModeReadback::UseRequested { refresh_hz: 60 }
         );
     }
 }

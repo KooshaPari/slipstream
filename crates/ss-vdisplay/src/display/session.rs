@@ -296,16 +296,26 @@ fn default_bus(env: &EnvProbe, runtime: &str) -> String {
         .unwrap_or_else(|| format!("unix:path={runtime}/bus"))
 }
 
+/// `argv[0]` basenames that mean "this is KWin" for a Nix `makeWrapper` launcher. The wrapper's
+/// `comm` is truncated to the kernel's 15-char limit (`.kwin_wayland-w`), so the full dotted name
+/// only survives in `argv[0]`.
+#[cfg(target_os = "linux")]
+const WRAPPED_KWIN_ARGV0: &[&[u8]] = &[
+    b"kwin_wayland",
+    b".kwin_wayland-wrapped",
+    b"kwin_wayland-wrapped",
+    b".kwin_wayland-w",
+    b"kwin_wayland_wrapper",
+];
+
 #[cfg(target_os = "linux")]
 fn is_kwin_compositor_comm(comm: &str, cmdline: Option<&[u8]>) -> bool {
     match comm {
         "kwin_wayland" => true,
-        ".kwin_wayland-w" => {
-            cmdline
-                .and_then(|args| args.split(|b| *b == 0).next())
-                .and_then(|arg| arg.rsplit(|b| *b == b'/').next())
-                == Some(b"kwin_wayland".as_slice())
-        }
+        ".kwin_wayland-w" => cmdline
+            .and_then(|args| args.split(|b| *b == 0).next())
+            .and_then(|arg| arg.rsplit(|b| *b == b'/').next())
+            .is_some_and(|arg| WRAPPED_KWIN_ARGV0.contains(&arg)),
         _ => false,
     }
 }
@@ -722,6 +732,27 @@ pub fn settle_desktop_portal(_chosen: Compositor) {}
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_argv0_names_are_recognised() {
+        // The real Nix layout: the wrapper keeps the full dotted name in argv0 only.
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b".kwin_wayland-wrapped\0--wayland\0")
+        ));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b"/nix/store/abc/bin/.kwin_wayland-wrapped\0")
+        ));
+        assert!(is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b"kwin_wayland_wrapper\0")
+        ));
+        assert!(!is_kwin_compositor_comm(
+            ".kwin_wayland-w",
+            Some(b".kwin_wayland-wrong\0")
+        ));
+    }
 
     #[test]
     fn detects_native_and_nixos_wrapped_kwin_without_matching_other_processes() {

@@ -64,12 +64,19 @@ Do not undo these rules:
   Windows treat the next MSI as an unrelated product and leaves two installed copies.
 - `ProductCode` is not authored in `Package.wxs`. WiX auto-generates a distinct one for every build,
   which is what allows MajorUpgrade to detect and replace the previous product. Never add a literal
-  `ProductCode`.
+  `ProductCode`. A published version must therefore be built exactly once: rebuilding the same
+  version produces a different `ProductCode` and makes the published artifact disagree with copies
+  already installed. If a rebuild is unavoidable, bump the version.
+- For a release, the winget manifest's `ProductCode` must be read from the actual built MSI (for
+  example with `wix msi decompile`). Never copy a `ProductCode` from source or invent one; source has
+  no published `ProductCode`.
 - `Version` comes from the single `Version` define in `Slipstream.wixproj` and is used in `Package.wxs`
-  as `$(Version)`. Release builds can override it with `-d:Version=<major.minor.build.revision>`.
-  Do not replace the variable with a literal.
-- `MajorUpgrade` uses `AllowSameVersionUpgrades="yes"` so a same-version reinstall is allowed, and
-  `DowngradeErrorMessage` so a downgrade is blocked. Keep both.
+  as `$(Version)`. Releases must pass it explicitly with `-d:Version=<major.minor.build.revision>`;
+  the source default is only for local builds. Do not replace the variable with a literal.
+- `MajorUpgrade` uses `AllowSameVersionUpgrades="yes"` so a same-version MSI reinstalls over the
+  existing copy instead of sitting beside it. This is deliberate and tied to the never-rebuild rule:
+  same-version reinstalls are only safe because a published version has exactly one build.
+  `DowngradeErrorMessage` blocks downgrades. Keep both.
 
 Because the payload guard refuses to build with placeholder exes, compile validation of these changes
 waits for the real release artifacts.

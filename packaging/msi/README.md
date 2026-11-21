@@ -1,15 +1,38 @@
 # Slipstream MSI packaging
 
-WiX v4, x64, per-machine installer for the Slipstream Windows host, tray and CLI.
+WiX v4, x64, per-machine installer source for the Slipstream Windows host, tray and CLI.
+
+## WARNING: current MSI is a structural fixture
+
+`packaging\msi\bin\Slipstream.msi` was built only to prove the WiX source compiles and the File table
+lays out correctly. It contains 15-byte `PLACEHOLDER` text files in place of the three executables.
+It is **not a product**. Do **not** install it, distribute it, sign it, or treat it as a release
+artifact. Think of this filename as `Slipstream.STRUCTURAL-FIXTURE.msi` even though the build output
+is named `Slipstream.msi`. Installing it would define a `slipstream-host` service whose binary is a
+text file, then fail at start with an opaque SCM error.
+
+The build wrapper now refuses to run WiX until real payload artifacts are present.
 
 ## Build
 
 ```bat
 cd packaging\msi
-dotnet build Slipstream.wixproj -c Release -p:OutputPath=bin/
+build-msi.cmd
 ```
 
-Output: `packaging\msi\bin\Slipstream.msi`.
+The wrapper checks every payload file before invoking WiX:
+
+| Payload | Floor |
+|---|---:|
+| `payload\slipstream-host.exe` | 1,000,000 bytes |
+| `payload\slipstream-tray.exe` | 1,000,000 bytes |
+| `payload\slipstream.exe` | 1,000,000 bytes |
+| `payload\slipstream.ico` | 1,000 bytes |
+
+Missing files or files below the floor produce a clear error and a non-zero exit before any MSI is
+built. To inspect or compile the authored source only, use `dotnet build Slipstream.wixproj -c Release
+-p:OutputPath=bin/` directly, but remember that any resulting MSI with placeholder payloads is a
+structural fixture, not a distributable installer.
 
 The project uses `WixToolset.Sdk/4.0.4` and `WixToolset.Firewall.wixext/4.0.4` as NuGet
 `PackageReference`s. `dotnet build` restores both; do not point PATH at a global WiX v7 install
@@ -25,9 +48,9 @@ because its extension cache is v7-only and cannot satisfy v4.
 | `slipstream-tray.exe` | `cargo build --release -p slipstream-tray` |
 | `slipstream.exe` | `cargo build --release -p slipstream-cli` |
 
-Copy the built exes into `packaging\msi\payload\` before building the MSI. The checked-in payload
-files are tiny placeholders used only to compile and validate the installer source; they are not
-runnable programs. A release build must replace them with the real artifacts.
+Copy the built exes into `packaging\msi\payload\` before using `build-msi.cmd`. The checked-in payload
+files contain the literal text `PLACEHOLDER` and exist only for source validation; they are not
+runnable programs and must be replaced before a real MSI build.
 
 The requested `slipstream-client-windows.exe` does not exist anywhere in the `b2-msi` tree. The
 only Windows-capable client in this checkout is the headless CLI at `clients/cli`, whose binary is
@@ -55,4 +78,4 @@ Features:
 
 The MSI is unsigned. A later signing step needs a code-signing certificate with a private key
 and `signtool sign /fd SHA256 /f <cert.pfx> /p <password> <msi>`. Sign after the final MSI build
-and before distribution; do not sign the placeholder-payload MSI.
+from real payload artifacts and before distribution; never sign the placeholder-payload fixture.

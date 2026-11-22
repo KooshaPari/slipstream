@@ -22,14 +22,20 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::Scanner;
 
+/// The Windows matcher: ToolHelp snapshot, `GetProcessTimes` start stamps, image paths.
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::Scanner;
+
 /// Non-Linux baseline: process-scan matcher lands with the platform todo (Windows Toolhelp
 /// snapshot). Until then the matcher reports nothing adopted and no start-time filter, so
 /// game-lease lifetime tracking degrades to its no-opinion path instead of failing to build.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Scanner;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl Scanner {
     pub fn system() -> Self {
         Scanner

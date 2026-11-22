@@ -736,12 +736,19 @@ async fn compositors_lists_all_backends_with_flags() {
         assert!(c["default"].is_boolean());
         assert!(c["label"].as_str().is_some_and(|s| !s.is_empty()));
         if c["id"] == "windows" {
-            // The Windows backend is listed on every host but only *available* on Windows, so the
-            // expectation tracks the host OS rather than assuming Linux.
+            // A Linux host never drives the Windows backend (see `ss_vdisplay::available`). On
+            // Windows the backend is listed on every box but only *available* when there is a head
+            // to mirror, an explicit pin, or a virtual display with the IDD driver, so it is not a
+            // platform constant there and must not be asserted as one.
+            #[cfg(target_os = "linux")]
             assert_eq!(
-                c["available"],
-                cfg!(windows),
-                "Windows backend availability must track the host OS"
+                c["available"], false,
+                "a Linux host never drives the Windows backend"
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert!(
+                c["available"].is_boolean(),
+                "Windows backend availability must be reported as a boolean"
             );
         }
     }

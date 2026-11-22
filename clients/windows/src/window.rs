@@ -81,9 +81,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            push(InputEvent { kind: InputKind::MouseMoveAbs, _pad: [0; 3], code: 0, x, y, flags: 0 });
+            let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            push(InputEvent { kind: InputKind::MouseMoveAbs, _pad: [0; 3], code: 0, x: client_x, y: client_y, flags: 0 });
             LRESULT(0)
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP => {

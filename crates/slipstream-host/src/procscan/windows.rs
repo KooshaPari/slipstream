@@ -14,7 +14,8 @@
 //! process name. The Steam-appid and environment-marker signals read another process's command line
 //! or environment, which on Windows needs `NtQueryInformationProcess` and remote-memory reads. That is
 //! a larger and riskier surface than this matcher warrants, so those signals do **not** match here.
-//! Missing a match leaves a game untracked; it never adopts a wrong process.
+//! Missing a match leaves a game untracked; it never adopts a wrong process. A spec that rests
+//! entirely on those signals logs one warning instead of matching nothing silently.
 
 use super::{ProcRef, START_SLACK_SECS};
 use crate::library::DetectSpec;
@@ -61,6 +62,16 @@ impl Scanner {
     /// at or after `min_start` (seconds since boot; `None` disables the filter).
     pub fn find(&self, spec: &DetectSpec, min_start: Option<f64>) -> Vec<ProcRef> {
         if spec.is_empty() {
+            return Vec::new();
+        }
+        // A spec carrying only signals this platform cannot evaluate would otherwise match nothing
+        // forever and look like "the game has no processes". Say so once, prominently.
+        if spec.exe.is_none()
+            && spec.install_dir.is_none()
+            && spec.process_name.is_none()
+            && (spec.steam_appid.is_some() || spec.env_marker.is_some())
+        {
+            warn_unevaluable_once();
             return Vec::new();
         }
         let exe = spec.exe.as_deref().map(normalize);
@@ -116,6 +127,25 @@ impl Scanner {
                     .unwrap_or(false)
             })
             .collect()
+    }
+}
+
+/// Warn exactly once that a spec rests entirely on signals this matcher cannot read.
+///
+/// Reading another process's command line or environment block needs `NtQueryInformationProcess`
+/// plus `ReadProcessMemory` and hard-coded PEB offsets, and a wrong offset can attribute a foreign
+/// process to the game. Since the whole point of this module is never to adopt the wrong process, the
+/// gap is reported rather than guessed at, and the operator can supply an install dir, executable, or
+/// process name instead (which is also how Steam titles already arrive: `steam.rs` attaches the
+/// install dir alongside the appid).
+fn warn_unevaluable_once() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_ok() {
+        tracing::warn!(
+            "process matching on Windows cannot evaluate env-marker or Steam-appid-only signals, so a \
+             game described only that way will not be tracked; give it an install dir, an executable, \
+             or a process name"
+        );
     }
 }
 
@@ -376,6 +406,19 @@ mod tests {
     fn empty_spec_adopts_nothing() {
         let spec = DetectSpec::default();
         assert!(Scanner::system().find(&spec, None).is_empty());
+    }
+
+    #[test]
+    fn appid_only_spec_adopts_nothing_rather_than_guessing() {
+        // `steam.rs` attaches the install dir whenever it can, so this is the narrow case where only
+        // the appid is known. Adopting any `steam.exe`-adjacent process would be a guess, and a guess
+        // here can end a game the player already had open, so the answer must be "nothing".
+        let spec = DetectSpec::steam(570);
+        assert!(spec.install_dir.is_none() && spec.exe.is_none());
+        assert!(
+            Scanner::system().find(&spec, None).is_empty(),
+            "an appid-only spec must adopt nothing on Windows"
+        );
     }
 
     /// Rule 1 against the live process table: a process that started before the launch stamp is never

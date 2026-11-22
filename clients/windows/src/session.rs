@@ -156,9 +156,10 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             preferred_codec: args.preferred_codec,
             display_hdr: slipstream_core::client::display_hdr_env_override(),
             client_caps: 0,
-            // E1: additive per-session monitor choice. The host falls back to its pinned
-            // monitor when absent; client-side head selection is not wired up yet.
-            monitor_id: None,
+            // E1: additive per-session monitor choice. `--monitor` names a head; absent keeps the
+            // host's pinned monitor, which is the legacy behaviour. The host validates the id
+            // against its own monitor list, so an unknown head fails there with a clear message.
+            monitor_id: args.monitor.clone(),
         }
         .encode(),
     )

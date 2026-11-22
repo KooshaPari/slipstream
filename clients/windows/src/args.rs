@@ -40,6 +40,10 @@ pub struct Args {
     /// `--play FILE`: decode a recorded Annex-B elementary stream (with AUD NALs) into a window,
     /// with no network at all. Proves the decode+present stack on its own.
     pub play: Option<String>,
+    /// `--monitor ID`: ask the host to stream a specific head for this session, named as
+    /// `backend:name` (for example `gdi:\\.\DISPLAY1`). Absent means the host's pinned monitor,
+    /// which is the legacy behaviour, so the wire shape is unchanged for existing callers.
+    pub monitor: Option<String>,
 }
 
 impl Default for Args {
@@ -62,6 +66,7 @@ impl Default for Args {
             seconds: None,
             record: None,
             play: None,
+            monitor: None,
         }
     }
 }
@@ -188,6 +193,33 @@ fn parse_codec(c: &str) -> Option<u8> {
     }
 }
 
+/// The example used in `--monitor` diagnostics, spelled for a Windows host.
+pub const MONITOR_EXAMPLE: &str = r"gdi:\.\DISPLAY1";
+
+/// Validate `--monitor` as the namespaced `backend:name` the host resolves.
+///
+/// The *shape* is checked here so a typo fails at the CLI with a usable message instead of surviving
+/// the handshake and returning as a host-side session error. Whether that backend and head actually
+/// exist is deliberately the host's call: only the host can enumerate its own monitors.
+fn parse_monitor_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim();
+    if id.is_empty() {
+        return Err(format!("--monitor needs a value like {MONITOR_EXAMPLE}"));
+    }
+    let Some((backend, name)) = id.split_once(':') else {
+        return Err(format!(
+            "--monitor must be backend:name (for example {MONITOR_EXAMPLE}), got {id:?}"
+        ));
+    };
+    if backend.trim().is_empty() {
+        return Err(format!("--monitor needs a backend before the ':', got {id:?}"));
+    }
+    if name.trim().is_empty() {
+        return Err(format!("--monitor needs a monitor name after the ':', got {id:?}"));
+    }
+    Ok(id.to_string())
+}
+
 /// Parse an argument vector (without argv[0]). Every malformed *present* flag is an error: the
 /// client never silently drops a request the user made.
 pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
@@ -262,6 +294,10 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             }
             "--record" => args.record = Some(value(&mut i, "--record")?),
             "--play" => args.play = Some(value(&mut i, "--play")?),
+            "--monitor" => {
+                let raw = value(&mut i, "--monitor")?;
+                args.monitor = Some(parse_monitor_id(&raw)?);
+            }
             "-h" | "--help" => return Err(usage().to_string()),
             other if other.starts_with("--") => return Err(format!("unknown flag {other}")),
             other => {
@@ -286,7 +322,7 @@ pub fn usage() -> &'static str {
     "usage: slipstream-windows [HOST[:PORT]] [--connect HOST[:PORT]] [--pin HEX | --pair PIN]\n\
      \x20      [--trust HEX] [--discover [SECS]] [--name LABEL] [--mode WxHxFPS] [--bitrate KBPS]\n\
      \x20      [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
-     \x20      [--play FILE]"
+     \x20      [--play FILE] [--monitor BACKEND:NAME]"
 }
 
 #[cfg(test)]
@@ -305,6 +341,32 @@ mod tests {
         assert_eq!(a.mode.refresh_hz, 144);
         assert_eq!(a.audio_channels, 2);
         assert_eq!(a.action(), Some(Action::Connect));
+    }
+
+    #[test]
+    fn monitor_flag_is_optional_and_trimmed() {
+        // Absent: the host's pinned monitor wins, which keeps the legacy wire shape.
+        assert_eq!(p("--connect 10.0.0.5").unwrap().monitor, None);
+
+        let a = p(r"--connect 10.0.0.5 --monitor gdi:\.\DISPLAY1").unwrap();
+        assert_eq!(a.monitor.as_deref(), Some(r"gdi:\.\DISPLAY1"));
+
+        let b = p("--connect h --monitor   drm:HDMI-A-2   ").unwrap();
+        assert_eq!(b.monitor.as_deref(), Some("drm:HDMI-A-2"));
+    }
+
+    #[test]
+    fn malformed_monitor_is_rejected_not_silently_dropped() {
+        // The client never drops a request the user actually made, so every malformed value is an
+        // error: a missing value, no namespace, an empty backend, or an empty name.
+        for bad in [
+            "--connect h --monitor",
+            "--connect h --monitor DISPLAY1",
+            "--connect h --monitor :DISPLAY1",
+            "--connect h --monitor gdi:",
+        ] {
+            assert!(p(bad).is_err(), "expected an error for {bad:?}");
+        }
     }
 
     #[test]

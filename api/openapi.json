@@ -8016,15 +8016,12 @@
             "description": "Negotiated source modifier, or zero for linear/unknown.",
             "minimum": 0
           },
-<<<<<<< HEAD
           "capture_producer_us": {
             "type": "integer",
             "format": "int32",
             "description": "Wall-clock microseconds the capture producer's per-frame path took for the most recent\nproduced frame (WGC: staging copy + `Map` + row materialisation). The per-frame COST:\nread it next to `capture_frames_arrived` to separate a source delivery ceiling from a\nper-frame cost ceiling. Zero means no frame has been produced yet.",
             "minimum": 0
           },
-=======
->>>>>>> 9d74d313 (fix(api): regenerate openapi.json for cadence stats fields)
           "capture_try_next_empty": {
             "type": "integer",
             "format": "int64",

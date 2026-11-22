@@ -4,14 +4,16 @@
 //! process: the CLI boundary in `main` decides what an outcome means for the process exit code.
 
 use anyhow::{anyhow, Context, Result};
-use std::io::Write;
+use std::io::Write as StdWrite;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use slipstream_core::config::Role;
 use slipstream_core::packet::FLAG_PROBE;
-use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
-use slipstream_core::transport::UdpTransport;
+use slipstream_core::quic::{endpoint, io, Hello, RequestKeyframe, Start, Welcome};
+use slipstream_core::transport::{spawn_data_punch, UdpTransport};
 use slipstream_core::{Session, SlipstreamError};
 
 use crate::args::{hex, Args};
@@ -25,6 +27,53 @@ use crate::{ff, mf, window, PipeStats};
 pub struct SessionConfig {
     pub remote: SocketAddr,
     pub args: Args,
+}
+
+/// Bounded state for the no-video/undecodable keyframe recovery task.
+///
+/// The host uses an infinite GOP: if the opening IDR is lost, every later delta frame is
+/// undecodable and the session stays black until the host is asked for a fresh IDR. We poll the
+/// unrecoverable-drop counter on a 100 ms cadence and send exactly one RequestKeyframe per
+/// observed increase, capped by `max_asks` so a misbehaving peer cannot make us spin forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyframeRecovery {
+    last_dropped: u64,
+    asks: u32,
+    max_asks: u32,
+    poll: Duration,
+}
+
+impl KeyframeRecovery {
+    const DEFAULT_MAX_ASKS: u32 = 12;
+    const DEFAULT_POLL: Duration = Duration::from_millis(100);
+
+    fn new(initial_dropped: u64) -> Self {
+        Self {
+            last_dropped: initial_dropped,
+            asks: 0,
+            max_asks: Self::DEFAULT_MAX_ASKS,
+            poll: Self::DEFAULT_POLL,
+        }
+    }
+
+    /// True exactly once per observed loss increase until the bounded ask budget is spent.
+    fn observe(&mut self, dropped: u64) -> bool {
+        if dropped <= self.last_dropped {
+            return false;
+        }
+        self.last_dropped = dropped;
+        if self.asks >= self.max_asks {
+            return false;
+        }
+        self.asks += 1;
+        true
+    }
+}
+
+/// Punch cadence mirrored from the probe core helper: a short initial burst opens the
+/// NAT/firewall path, then a long keepalive holds it open.
+fn punch_delay_ms(iteration: u32) -> u64 {
+    if iteration < 15 { 200 } else { 2000 }
 }
 
 /// How a session ended. Every normal termination has a variant; unexpected I/O and protocol errors
@@ -94,11 +143,77 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         (None, None) => tracing::info!(%remote, "connected"),
     }
 
-    let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
-    let mut recv = io::MsgReader::new(recv);
-    io::write_msg(
-        &mut send,
-        &Hello {
+    let (send, recv) = conn.open_bi().await.context("open control stream")?;
+    // One task owns the control send stream; a bounded channel serializes handshake and
+    // keyframe writes. Quinn SendStream is !Clone and !Sync, so this is also the only safe way
+    // to add recovery without corrupting the Hello/Start framing.
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let mut writer = send;
+    tokio::spawn(async move {
+        while let Some(bytes) = ctl_rx.recv().await {
+            if io::write_msg(&mut writer, &bytes).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Drain host control messages in their own task.
+    let mut ctl = io::MsgReader::new(recv);
+    let delivered: Arc<std::sync::Mutex<Option<slipstream_core::config::Mode>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let (welcome_tx, mut welcome_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let mut welcome_tx = Some(welcome_tx);
+    {
+        let delivered = delivered.clone();
+        tokio::spawn(async move {
+            while let Ok(msg) = ctl.read_msg().await {
+                match Welcome::decode(&msg) {
+                    Ok(w) => {
+                        if let Some(tx) = welcome_tx.take() {
+                            let _ = tx.send(msg);
+                        }
+                        let _ = w;
+                    }
+                    Err(_) => match slipstream_core::quic::Reconfigured::decode(&msg) {
+                        Ok(rc) => {
+                            tracing::info!(
+                                accepted = rc.accepted,
+                                width = rc.mode.width,
+                                height = rc.mode.height,
+                                refresh_hz = rc.mode.refresh_hz,
+                                "host corrected the session mode"
+                            );
+                            *delivered.lock().unwrap() = Some(rc.mode);
+                        }
+                        Err(_) => tracing::debug!(len = msg.len(), "control message (unrecognized)"),
+                    },
+                }
+            }
+        });
+    }
+
+    // D4: mirror the probe recovery task. The blocking data loop publishes the unrecoverable-drop
+    // count; this task enqueues one RequestKeyframe per observed increase with a 100 ms poll and a
+    // hard per-session ask budget. Without this, a lost opening keyframe leaves the session black.
+    let dropped_frames = Arc::new(AtomicU64::new(0));
+    let recovery_drops = dropped_frames.clone();
+    let recovery_tx = ctl_tx.clone();
+    tokio::spawn(async move {
+        let mut recovery = KeyframeRecovery::new(0);
+        loop {
+            tokio::time::sleep(recovery.poll).await;
+            let dropped = recovery_drops.load(Ordering::Relaxed);
+            if recovery.observe(dropped)
+                && recovery_tx.send(RequestKeyframe.encode()).await.is_err()
+            {
+                break; // control stream gone
+            }
+        }
+    });
+
+    ctl_tx
+        .send(
+            Hello {
             abi_version: slipstream_core::WIRE_VERSION,
             mode: args.mode,
             compositor: slipstream_core::CompositorPref::Auto,
@@ -122,7 +237,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     .await?;
     // A host that completes the QUIC handshake but never sends `Welcome` (wedged encoder/parked
     // session) must fail, not hang the client forever.
-    let welcome_msg = tokio::time::timeout(Duration::from_secs(15), recv.read_msg())
+    let welcome_msg = tokio::time::timeout(Duration::from_secs(15), welcome_rx)
         .await
         .map_err(|_| {
             anyhow!(
@@ -130,7 +245,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                  (the host's capture/encode pipeline is stalled, or the session is parked for \
                  approval) — this is a host-side condition, not a client one"
             )
-        })??;
+        })???;
     let welcome = Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
     tracing::info!(
         mode = ?welcome.mode,
@@ -167,16 +282,20 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
     let udp_port = probe.local_addr()?.port();
     drop(probe);
-    io::write_msg(
-        &mut send,
-        &Start {
-            client_udp_port: udp_port,
-        }
-        .encode(),
-    )
-    .await?;
+    ctl_tx
+        .send(
+            Start {
+                client_udp_port: udp_port,
+            }
+            .encode(),
+        )
+        .await
+        .map_err(|_| anyhow!("control stream closed before Start"))?;
 
     let host_udp = SocketAddr::new(remote.ip(), welcome.udp_port);
+    // D3: mirror the probe data punch. The core helper owns a cloned data socket and sends
+    // PUNCH_MAGIC bursts/keepalives until this stop flag is set at session teardown.
+    let punch_stop = Arc::new(AtomicBool::new(false));
     let session_cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
     let codec = welcome.codec;
@@ -184,37 +303,16 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let record = args.record.clone();
     let seconds = args.seconds;
 
-    // The host may refuse the mode we asked for and send `Reconfigured` before the first AU.
-    // Keep reading the control stream so that correction is not lost.
-    let delivered: std::sync::Arc<std::sync::Mutex<Option<slipstream_core::config::Mode>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    {
-        let delivered = delivered.clone();
-        let mut ctl = recv;
-        tokio::spawn(async move {
-            while let Ok(msg) = ctl.read_msg().await {
-                match slipstream_core::quic::Reconfigured::decode(&msg) {
-                    Ok(rc) => {
-                        tracing::info!(
-                            accepted = rc.accepted,
-                            width = rc.mode.width,
-                            height = rc.mode.height,
-                            refresh_hz = rc.mode.refresh_hz,
-                            "host corrected the session mode"
-                        );
-                        *delivered.lock().unwrap() = Some(rc.mode);
-                    }
-                    Err(_) => tracing::debug!(len = msg.len(), "control message (not a mode ack)"),
-                }
-            }
-        });
-    }
 
     let started = Instant::now();
     let (frames, bytes, presented, stop) =
         tokio::task::spawn_blocking(move || -> Result<(u64, u64, u64, SessionStop)> {
         let transport = UdpTransport::connect(&format!("0.0.0.0:{udp_port}"), &host_udp.to_string())
             .context("bind data plane")?;
+        // D3: start the data-plane punch immediately after binding, exactly like the probe.
+        if let Ok(sock) = transport.try_clone_socket() {
+            spawn_data_punch(sock, punch_stop.clone());
+        }
         let mut session =
             Session::new(session_cfg, Box::new(transport)).map_err(|e| anyhow!("client session: {e:?}"))?;
         let mut sink = match &record {
@@ -260,6 +358,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         let (mut frames, mut bytes) = (0u64, 0u64);
         let mut presented = 0u64;
         let mut stats = PipeStats::default();
+        let recovery_drops = dropped_frames.clone();
         let mut last_rx = Instant::now();
         // The geometry we are currently sized for; starts at what the Welcome promised and moves
         // to whatever the host says it is actually delivering.
@@ -302,6 +401,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             }
             let t_poll = Instant::now();
             let polled = session.poll_frame();
+            recovery_drops.store(session.stats().frames_dropped, Ordering::Relaxed);
             let poll_ns = t_poll.elapsed().as_nanos() as u64;
             let mut spin_ns = 0u64;
             match polled {
@@ -360,6 +460,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     })
     .await??;
 
+    punch_stop.store(true, Ordering::Relaxed);
     conn.close(0u32.into(), b"quit");
     println!(
         "session ended: received {frames} video AUs, presented {presented} frames, {bytes} bytes in {:.1}s ({:.1} fps presented)",
@@ -411,5 +512,30 @@ mod tests {
             SessionOutcome::from_result(false, SessionStop::Ended, 0),
             SessionOutcome::ConnectFailed
         );
+    }
+
+    #[test]
+    fn punch_schedule_bursts_then_holds() {
+        let burst: Vec<u64> = (0..15).map(punch_delay_ms).collect();
+        assert!(burst.iter().all(|d| *d == 200));
+        assert_eq!(punch_delay_ms(15), 2000);
+        assert_eq!(punch_delay_ms(10_000), 2000);
+    }
+
+    #[test]
+    fn keyframe_recovery_asks_once_per_loss_and_stops_at_budget() {
+        let mut r = KeyframeRecovery::new(0);
+        assert!(!r.observe(0), "no loss — no keyframe request");
+        assert!(r.observe(1), "first unrecoverable drop asks for a keyframe");
+        assert!(!r.observe(1), "unchanged count must not ask again (no spin)");
+        assert!(r.observe(2), "a new loss event re-arms one request");
+
+        let mut capped = KeyframeRecovery::new(0);
+        capped.max_asks = 2;
+        assert!(capped.observe(1));
+        assert!(capped.observe(2));
+        assert!(!capped.observe(3), "bounded budget must never be exceeded");
+        assert_eq!(capped.asks, 2);
+        assert_eq!(KeyframeRecovery::new(9).poll, Duration::from_millis(100));
     }
 }

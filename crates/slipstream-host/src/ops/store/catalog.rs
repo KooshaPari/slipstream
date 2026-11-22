@@ -263,8 +263,25 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
+                // Read the request before replying. Answering before the client has finished
+                // sending, or dropping the socket straight after the reply, makes Windows reset the
+                // connection instead of delivering the response: the client then reports
+                // WSAECONNABORTED (os error 10053) and this test fails intermittently under
+                // parallel load. The assertion below is about ureq's 304 semantics, so the harness
+                // is what must be made deterministic.
+                let mut req = [0u8; 1024];
+                let _ = std::io::Read::read(&mut sock, &mut req);
                 let _ = sock.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n");
                 let _ = sock.flush();
+                // Half-close so the client sees a clean end of stream, then wait for it to hang up
+                // before this socket is dropped.
+                let _ = sock.shutdown(std::net::Shutdown::Write);
+                let mut sink = [0u8; 256];
+                while let Ok(n) = std::io::Read::read(&mut sock, &mut sink) {
+                    if n == 0 {
+                        break;
+                    }
+                }
             }
         });
 

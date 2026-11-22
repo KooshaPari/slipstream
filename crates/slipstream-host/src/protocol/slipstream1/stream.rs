@@ -1329,6 +1329,9 @@ fn send_loop(
                 let sample = crate::stats_recorder::StatsSample {
                     t_ms: 0, // stamped by push_sample from the capture's monotonic start
                     session_id,
+                    // Same source the gamestream path uses, so per-frame producer cost is
+                    // reported identically to both the native and GameStream consumers.
+                    capture_producer_us: capture_telemetry.producer_us,
                     stages: vec![
                         crate::stats_recorder::StageTiming {
                             name: "queue".into(),

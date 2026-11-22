@@ -1374,7 +1374,6 @@ fn send_loop(
                     capture_frames_arrived: capture_telemetry.frames_arrived,
                     capture_try_next_ok: capture_telemetry.try_next_ok,
                     capture_try_next_empty: capture_telemetry.try_next_empty,
-                    capture_producer_us: capture_telemetry.producer_us,
                     capture_buffers_drained: capture_telemetry.buffers_drained,
                     capture_modifier: capture_telemetry.modifier,
                     capture_width: capture_telemetry.width,
@@ -1524,6 +1523,13 @@ pub(super) struct SessionContext {
     pub(super) seconds: u32,
     /// Session stop flag (set on disconnect / reconnect-preempt).
     pub(super) stop: Arc<AtomicBool>,
+    /// Set by the session owner when this stream thread is ABANDONED — it outlived
+    /// `STREAM_STOP_GRACE` after a stop, so teardown has already released the virtual output and
+    /// its capture buffers. A submission from this thread after that copies from unmapped dmabufs,
+    /// which is the teardown SIGSEGV reported in `NvencCudaEncoder::submit`. Checked before every
+    /// submission so an abandoned thread stops touching the encoder and drops it promptly instead
+    /// of racing the driver as the process tears down.
+    pub(super) abandoned: Arc<AtomicBool>,
     /// Deliberate-quit flag (set when the client closed with `QUIT_CODE`): the display lease reads it
     /// on teardown to skip the keep-alive linger for a user "stop" (vs. an unwanted disconnect).
     pub(super) quit: Arc<AtomicBool>,
@@ -1626,6 +1632,8 @@ pub(super) struct SessionContext {
     /// `false` = single-slice frames, the pre-0.17 wire shape TV-SoC decoders (Amlogic  -
     /// Chromecast with Google TV) require to not wedge.
     pub(super) multi_slice: bool,
+    /// Per-session `backend:name` capture target from the Hello; preferred over the host-wide pin.
+    pub(super) monitor_id: Option<String>,
     /// Shared streaming-stats recorder. The capture loop reads `is_armed()` per frame to decide
     /// whether to measure the per-stage split; the send thread builds + pushes the aggregated
     /// `StatsSample` at its 2 s boundary.
@@ -1707,7 +1715,7 @@ fn park_pointer(input_tx: &std::sync::mpsc::Sender<super::input::ClientInput>, w
 ///   This is the 60 Hz-requested-on-a-144 Hz-compositor case: the loop follows the *source* arrival
 ///   rate (frame-driven pacing) but advances the grid by the *requested* interval, so a slower
 ///   request on a faster source outruns wall clock by (requested/actual)x and would otherwise drift
-///   into the future without bound  -  which the behind-only guard can never see.
+///   into the future without bound - which the behind-only guard can never see.
 #[derive(Debug, Default)]
 pub(super) struct WireGrid {
     /// Next grid point in nanoseconds; `None` until seeded from the first plausible capture stamp.
@@ -1733,6 +1741,10 @@ impl WireGrid {
         repeat: bool,
         interval_ns: u64,
     ) -> u64 {
+        debug_assert!(
+            interval_ns > 0,
+            "a zero interval would trip both stall guards every submission"
+        );
         let fresh = !repeat && plausible;
         // This submission's grid point (pre-repair). Seeded from the first plausible capture
         // stamp; every later fresh frame takes the accumulated point (never `frame.pts_ns`, whose
@@ -1766,11 +1778,7 @@ impl WireGrid {
         // from the real capture stamp once the grid is more than ~2 periods into the future.
         if let Some(g) = self.next_ns {
             if g.saturating_sub(submit_ns) > interval_ns.saturating_mul(2) {
-                self.next_ns = Some(if plausible {
-                    frame_pts_ns.min(submit_ns)
-                } else {
-                    submit_ns
-                });
+                self.next_ns = Some(if plausible { frame_pts_ns } else { submit_ns });
             }
         }
         // Advance the grid by one session frame period for the next submission.
@@ -1791,6 +1799,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ctx.bit_depth,
         ctx.chroma,
         ctx.codec,
+        ctx.monitor_id.as_deref(),
+        ctx.compositor,
         // Blend CAPABILITY (the single rule in `cursor_blend_for`): cursor-FORWARD sessions
         // need it for the mid-stream capture-mouse flip (`CursorRenderMode`  -  WHETHER a
         // frame's pointer is drawn stays per-tick, the encode loop strips `frame.cursor`
@@ -1829,6 +1839,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         mode,
         seconds,
         stop,
+        abandoned,
         quit,
         reconfig,
         keyframe,
@@ -1848,6 +1859,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         chroma: _,
         // Likewise the codec  -  `plan.codec` (resolved from `ctx.codec`) is the source of truth below.
         codec: _,
+        monitor_id: _,
         probe_rx,
         probe_result_tx,
         reconfig_result_tx,
@@ -1977,7 +1989,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 bitrate_kbps,
                 bitrate_auto,
                 bit_depth,
-                plan,
+                plan.clone(),
                 &quit,
                 &stop,
                 8,
@@ -2006,6 +2018,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // session never negotiated). Adopt it before anything downstream reads `bitrate_kbps`.
     adopt_built_bitrate(&mut bitrate_kbps, built_bitrate, &live_bitrate);
 
+    // Rebuild-in-place on capture loss: track the live mode (a mode switch or bring-up correction
+    // updates it) so a rebuild targets the CURRENT mode, and cap consecutive rebuilds so a flapping
+    // source can't loop the client through endless cold restarts.
+    let mut cur_mode;
     // Bring-up can also land on an effective mode the Welcome never promised (a mirrored Windows
     // head that refused the ask, a compositor that capped the refresh). `build_pipeline` opened
     // the encoder at the frame's real dims, so the client's mode slot is the only side still
@@ -2013,6 +2029,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // client believes are ONE value for the whole life of the session.
     {
         let actual = delivered_mode(frame.width, frame.height, interval);
+        // P83-2: the ack alone only corrects the client's slot. The loop's cached mode must agree
+        // with the first delivered frame too, or the next capture-loss rebuild targets a request
+        // the display never honored.
+        cur_mode = actual;
         if actual != mode {
             let _ = reconfig_result_tx.send(Reconfigured {
                 accepted: true,
@@ -2270,10 +2290,6 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // encoder-internal counter desyncs on the first adaptive-bitrate rebuild, so reference
     // recovery can silently fail or anchor after a loss.
     let mut au_seq: u32 = 0;
-    // Rebuild-in-place on capture loss: track the live mode (a mode switch updates it) so a rebuild
-    // targets the CURRENT mode, and cap consecutive rebuilds so a flapping source can't loop the
-    // client through endless cold restarts.
-    let mut cur_mode = mode;
     const MAX_CAPTURE_REBUILDS: u32 = 5;
     let mut capture_rebuilds: u32 = 0;
     // Encode-stall watchdog: asynchronous encoders poll non-blocking, so a wedged driver
@@ -2287,6 +2303,21 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     const ENCODE_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
     const MAX_ENCODER_RESETS: u32 = 5;
     let mut encoder_resets: u32 = 0;
+    // Bounded retries for transient failures while reopening the encoder after a geometry change.
+    // Encoder-reopen retry state for a capture-geometry change. Time-based, not frame-counted: the
+    // same class of transient (NVENC busy, driver hiccup during a head transition) is ridden out
+    // with 100 ms..1.6 s exponential backoff on the encoder-submit path, while five frames is only
+    // 35-83 ms at 60-144 Hz — too short to outlast the condition it is retrying through.
+    const GEOMETRY_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const GEOMETRY_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(100);
+    const GEOMETRY_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(1_600);
+    #[derive(Clone, Copy)]
+    struct GeometryRetry {
+        first_attempt: std::time::Instant,
+        next_attempt: std::time::Instant,
+        delay: std::time::Duration,
+    }
+    let mut geometry_retry: Option<GeometryRetry> = None;
     let mut last_au_at = std::time::Instant::now();
     // Last HDR mastering metadata we forwarded  -  re-sent as 0xCE on change/keyframe (see below).
     let mut last_hdr_meta: Option<slipstream_core::quic::HdrMeta> = None;
@@ -2439,7 +2470,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             bitrate_kbps,
                             bitrate_auto,
                             bit_depth,
-                            plan,
+                            plan.clone(),
                             &quit,
                             &stop,
                             8,
@@ -2481,6 +2512,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         inflight.clear();
                         last_au_at = std::time::Instant::now();
                         encoder_resets = 0;
+                        geometry_retry = None;
                         tracing::info!(
                             compositor = compositor.id(),
                             "session switch  -  backend rebuilt, stream continues"
@@ -2518,7 +2550,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             let mode_bitrate = if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
                 resolve_bitrate_kbps_for(plan.codec, 0, &new_mode, plan.chroma, plan.bit_depth)
             } else {
-                bitrate_kbps
+                // H.26x ABR has moved since startup; rebuilding from the stale default would undo
+                // the rate controller's work (the same defect as the geometry-change path).
+                live_bitrate.load(Ordering::Relaxed)
             };
             // The rate the rebuilt encoder ends up opened at. A full rebuild may adjust it when
             // the source delivers a size different from the requested mode.
@@ -2532,9 +2566,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 mode_bitrate,
                 bitrate_auto,
                 bit_depth,
-                plan,
-                &quit,
-                // The display this rebuild supersedes (retired below once the new pipeline is
+                        plan.clone(),
+                        &quit,
+                        // The display this rebuild supersedes (retired below once the new pipeline is
                 // up)  -  its replacement inherits the group topology (Primary/Exclusive).
                 cur_display_gen,
                 // No first-frame shortening here: this direct call has no retry wrapper to
@@ -2588,7 +2622,6 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             };
             if rebuilt {
                 adopt_built_bitrate(&mut bitrate_kbps, built_bitrate, &live_bitrate);
-                cur_mode = new_mode;
                 next = std::time::Instant::now();
                 // H2/H3: the backend may have honored a different mode than requested. `frame` is
                 // the new pipeline's first frame (just rebound above), so its
@@ -2600,12 +2633,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     pack_mode(actual.width, actual.height, actual.refresh_hz),
                     Ordering::Relaxed,
                 );
-                if actual != new_mode {
+                if actual != cur_mode {
                     let _ = reconfig_result_tx.send(Reconfigured {
                         accepted: true,
                         mode: actual,
                     });
                 }
+                cur_mode = actual;
                 // The owed AUs died with the old encoder  -  drop their in-flight records
                 // and restart the encode-stall clock for the fresh one.
                 inflight.clear();
@@ -2911,7 +2945,16 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // size and correct the client's mode slot - exactly what a mode switch does.
                 if (frame.width, frame.height) != enc_dims {
                     let (old_w, old_h) = enc_dims;
-                    let new_kbps = if bitrate_auto {
+                    // P83-1: a driver may briefly refuse an encoder reopen while another session
+                    // releases its budget or reprograms the head. Retry on a wall-clock budget with
+                    // exponential backoff (see `GEOMETRY_RETRY_*`), never a bare frame count: a
+                    // transient that lasts 200 ms must not end the session just because the head
+                    // runs at 144 Hz.
+                    // P83-4: mirror the mode-switch path. PyroWave's Automatic rate is a per-mode
+                    // bpp pin and must be re-resolved for the delivered geometry. H.26x Automatic
+                    // is managed by the encoder's rate controller; resetting it here drops the
+                    // ~35 Mbps operating point back to the flat 20 Mbps default.
+                    let new_kbps = if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
                         resolve_bitrate_kbps_for(
                             plan.codec,
                             0,
@@ -2920,7 +2963,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             bit_depth,
                         )
                     } else {
-                        bitrate_kbps
+                        // Includes explicit rates and H.26x ABR: use the CURRENT live value, not
+                        // the stale startup default.
+                        live_bitrate.load(Ordering::Relaxed)
                     };
                     let reopened = crate::encode::open_video(
                         plan.codec,
@@ -2966,6 +3011,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             inflight.clear();
                             last_au_at = std::time::Instant::now();
                             encoder_resets = 0;
+                            geometry_retry = None;
                             last_forced_idr = Some(std::time::Instant::now());
                             behind_score = 0;
                             depth_frames = 0;
@@ -2981,12 +3027,43 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             );
                         }
                         Err(e) => {
-                            // No usable geometry agreement: fail loudly rather than feed the
-                            // encoder a frame it will reject forever.
-                            return Err(e)
-                                .context("reopen encoder for the changed capture geometry");
+                            let now = std::time::Instant::now();
+                            let retry = geometry_retry.get_or_insert(GeometryRetry {
+                                first_attempt: now,
+                                next_attempt: now + GEOMETRY_RETRY_BASE,
+                                delay: GEOMETRY_RETRY_BASE,
+                            });
+                            let spent = now.saturating_duration_since(retry.first_attempt);
+                            if spent >= GEOMETRY_RETRY_BUDGET {
+                                return Err(e).context(
+                                    "reopen encoder for the changed capture geometry  -  \
+                                     retries exhausted",
+                                );
+                            }
+                            // Back off before the next attempt instead of hammering `open_video`
+                            // once per frame; the session is already not delivering, so the sleep
+                            // costs nothing a retry storm would not cost twice.
+                            let wait = retry.next_attempt.saturating_duration_since(now);
+                            retry.delay = (retry.delay * 2).min(GEOMETRY_RETRY_MAX);
+                            retry.next_attempt = now + wait + retry.delay;
+                            tracing::warn!(
+                                error = %format!("{e:#}"),
+                                spent_ms = spent.as_millis() as u64,
+                                backoff_ms = retry.delay.as_millis() as u64,
+                                "capture geometry changed but the encoder reopen failed  -  \
+                                 backing off before retrying"
+                            );
+                            if !wait.is_zero() {
+                                std::thread::sleep(wait);
+                            }
+                            continue;
                         }
                     }
+                } else {
+                    // The delivered geometry matches the open encoder again, so any earlier reopen
+                    // failure has recovered: release the retry budget instead of carrying it into
+                    // the next, unrelated episode.
+                    geometry_retry = None;
                 }
                 // Phase-locked capture: hold the fresh frame so its ARRIVAL at the client lands a
                 // constant small lead before the client's display latch (§3 hold-then-submit; the
@@ -3199,7 +3276,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         bitrate_kbps,
                         bitrate_auto,
                         bit_depth,
-                        plan,
+                        plan.clone(),
                         &quit,
                         &stop,
                         // 1, not 8: this loop re-detects the active session per iteration  -  short
@@ -3238,6 +3315,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 capturer = new_cap;
                 enc = new_enc;
                 frame = new_frame;
+                enc_dims = (frame.width, frame.height);
                 interval = new_interval;
                 cur_node_id = new_node_id;
                 cur_display_gen = new_display_gen;
@@ -3245,6 +3323,22 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // re-detects the session every cycle, precisely so it can follow a switch), so the
                 // delivered size  -  and with it an Automatic rate  -  may have changed under us.
                 adopt_built_bitrate(&mut bitrate_kbps, new_bitrate, &live_bitrate);
+                // P83-3: the rebuild may have landed on a source with a different geometry or a
+                // capped refresh. The client already believes the old mode, so publish the actual
+                // one in both the stats slot and a corrective accepted ack, and rebuild from it
+                // next time.
+                let actual = delivered_mode(frame.width, frame.height, interval);
+                live_mode.store(
+                    pack_mode(actual.width, actual.height, actual.refresh_hz),
+                    Ordering::Relaxed,
+                );
+                if actual != cur_mode {
+                    let _ = reconfig_result_tx.send(Reconfigured {
+                        accepted: true,
+                        mode: actual,
+                    });
+                }
+                cur_mode = actual;
                 enc.request_keyframe(); // belt-and-suspenders; a fresh encoder opens on an IDR anyway
                 last_forced_idr = Some(std::time::Instant::now()); // anchor the IDR cooldown from the rebuild
                 next = std::time::Instant::now();
@@ -3254,6 +3348,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 inflight.clear();
                 last_au_at = std::time::Instant::now();
                 encoder_resets = 0;
+                geometry_retry = None;
                 tracing::info!(
                     compositor = compositor.id(),
                     "capture loss: pipeline rebuilt  -  stream resumes"
@@ -3506,6 +3601,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // submission, so it lands `inflight.len()` AUs after the `au_seq` the loop is about to
         // assign next. The RFI backends pin their frame numbering to it.
         let wire_index = au_seq.wrapping_add(inflight.len() as u32);
+        // An abandoned thread (see `SessionContext::abandoned`) must not submit: the session's
+        // virtual output — and with it the capture buffers this frame points at — is already
+        // released by teardown, and copying from those unmapped dmabufs is the teardown SIGSEGV
+        // in `NvencCudaEncoder::submit`. Returning here drops the encoder on its owning thread,
+        // which is the ordering the fix is about (not a `catch_unwind` around the driver call).
+        if abandoned.load(Ordering::Relaxed) {
+            return Err(anyhow!(
+                "session abandoned: stream thread outlived the stop grace — dropping the encoder \
+                 instead of submitting against a released capture"
+            ));
+        }
         if let Err(e) = enc.submit_indexed(&frame, wire_index) {
             // A typed-terminal error is a deterministic configuration failure  -  the identical
             // wall on every attempt, so rebuilds can't help. End the session at once with the
@@ -4162,6 +4268,7 @@ pub(super) fn prepare_display(
     bit_depth: u8,
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
+    monitor_id: Option<&str>,
     shard_payload: u16,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
@@ -4174,6 +4281,8 @@ pub(super) fn prepare_display(
         bit_depth,
         chroma,
         codec,
+        monitor_id,
+        compositor,
         // Use the same blend capability rule as `virtual_stream`.
         crate::session_plan::cursor_blend_for(
             cursor_forward,
@@ -4202,9 +4311,9 @@ pub(super) fn prepare_display(
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
-        plan,
-        quit,
-        stop,
+                        plan.clone(),
+                        quit,
+                        stop,
         8,
         Some(trace),
     )?;
@@ -4262,7 +4371,7 @@ fn build_pipeline_with_retry(
         // box for a session no one is watching  -  on a Bazzite takeover that means SIGKILLing and
         // relaunching the box's Steam session once per attempt for minutes (the .181 storm
         // 2026-07-07). One in-flight attempt can still overhang; this bounds the damage to it.
-        if attempt > 1 && stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) {
             anyhow::bail!(
                 "session ended (client disconnected) during pipeline build  -  aborting retries \
                  after {} attempt(s)",
@@ -4276,7 +4385,7 @@ fn build_pipeline_with_retry(
             bitrate_kbps,
             bitrate_auto,
             bit_depth,
-            plan,
+            plan.clone(),
             quit,
             None, // fresh bring-up  -  no display superseded
             first_frame_budget,
@@ -4540,11 +4649,16 @@ fn build_pipeline(
     // stuttering picture rather than as the mismatch it actually is. Re-resolve for what we will
     // really encode.
     //
-    // Automatic ONLY. An explicit client rate is the operator's statement about their own link and is
-    // never second-guessed  -  the same contract `resolve_bitrate_kbps_for` keeps everywhere else. The
-    // refresh is left at the negotiated one so this changes exactly one input (the pixel count) to a
-    // formula that is otherwise untouched.
-    let bitrate_kbps = if bitrate_auto && (frame.width, frame.height) != (mode.width, mode.height) {
+    // PyroWave ONLY. Its Automatic rate is a per-mode bpp pin, so the pixel count is a real input to
+    // the formula. H.26x Automatic is owned by the encoder's rate controller: an ABR session that has
+    // climbed to 35 Mbps reports that through `adopt_built_bitrate`, and re-resolving from a zero
+    // hint here would snap it back to the flat 20 Mbps default on every rebuild. An explicit client
+    // rate is the operator's statement about their own link and is never second-guessed for any
+    // codec. The refresh is left at the negotiated one so this changes exactly one input.
+    let bitrate_kbps = if bitrate_auto
+        && plan.codec == crate::encode::Codec::PyroWave
+        && (frame.width, frame.height) != (mode.width, mode.height)
+    {
         let delivered = slipstream_core::Mode {
             width: frame.width,
             height: frame.height,

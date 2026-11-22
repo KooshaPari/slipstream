@@ -78,6 +78,67 @@ mod monitor_id_tests {
         assert!(err.contains("no monitor named"), "{err}");
         assert!(err.contains("monitor_id"), "{err}");
     }
+    /// The host consumes `monitor_id` from a *decoded* `Hello`, so pin the whole edge rather than the
+    /// resolver in isolation: encode a message carrying a real GDI head, decode it with the same codec
+    /// the host uses, then require the resolver to accept that decoded value and to refuse a head this
+    /// host does not have.
+    #[test]
+    fn decoded_hello_monitor_id_is_accepted_by_the_resolver() {
+        use slipstream_core::quic::Hello;
+
+        const CONNECTOR: &str = r"\\.\DISPLAY1";
+        let base = Hello {
+            abi_version: slipstream_core::WIRE_VERSION,
+            mode: slipstream_core::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 144,
+            },
+            compositor: slipstream_core::CompositorPref::Auto,
+            gamepad: slipstream_core::config::GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: Some("monitor-id-test".into()),
+            launch: None,
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: slipstream_core::quic::CODEC_H264,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            monitor_id: Some(format!(r"gdi:{CONNECTOR}")),
+        };
+        let monitors = [mon(CONNECTOR)];
+
+        let decoded = Hello::decode(&base.encode()).expect("hello decodes");
+        assert_eq!(
+            resolve_session_monitor_id(decoded.monitor_id.as_deref(), &monitors).unwrap(),
+            Some(CONNECTOR.to_string()),
+            "a GDI head id that survived the wire must resolve to the bare connector"
+        );
+
+        // A head this host does not have must be refused rather than ignored.
+        let missing = Hello {
+            monitor_id: Some(r"gdi:\\.\DISPLAY9".into()),
+            ..base.clone()
+        };
+        let decoded_missing = Hello::decode(&missing.encode()).expect("hello decodes");
+        let err = format!(
+            "{:#}",
+            resolve_session_monitor_id(decoded_missing.monitor_id.as_deref(), &monitors).unwrap_err()
+        );
+        assert!(err.contains("no monitor named"), "{err}");
+
+        // Absent on the wire still means "use the host's pinned monitor".
+        let absent = Hello {
+            monitor_id: None,
+            ..base.clone()
+        };
+        let decoded_absent = Hello::decode(&absent.encode()).expect("hello decodes");
+        assert_eq!(
+            resolve_session_monitor_id(decoded_absent.monitor_id.as_deref(), &monitors).unwrap(),
+            None
+        );
+    }
 }
 
 /// Validate a per-session `backend:name` monitor id and return its bare monitor name.

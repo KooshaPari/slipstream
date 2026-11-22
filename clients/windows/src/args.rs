@@ -194,7 +194,7 @@ fn parse_codec(c: &str) -> Option<u8> {
 }
 
 /// The example used in `--monitor` diagnostics, spelled for a Windows host.
-pub const MONITOR_EXAMPLE: &str = r"gdi:\.\DISPLAY1";
+pub const MONITOR_EXAMPLE: &str = r"gdi:\\.\DISPLAY1";
 
 /// Validate `--monitor` as the namespaced `backend:name` the host resolves.
 ///
@@ -348,8 +348,8 @@ mod tests {
         // Absent: the host's pinned monitor wins, which keeps the legacy wire shape.
         assert_eq!(p("--connect 10.0.0.5").unwrap().monitor, None);
 
-        let a = p(r"--connect 10.0.0.5 --monitor gdi:\.\DISPLAY1").unwrap();
-        assert_eq!(a.monitor.as_deref(), Some(r"gdi:\.\DISPLAY1"));
+        let a = p(r"--connect 10.0.0.5 --monitor gdi:\\.\DISPLAY1").unwrap();
+        assert_eq!(a.monitor.as_deref(), Some(r"gdi:\\.\DISPLAY1"));
 
         let b = p("--connect h --monitor   drm:HDMI-A-2   ").unwrap();
         assert_eq!(b.monitor.as_deref(), Some("drm:HDMI-A-2"));

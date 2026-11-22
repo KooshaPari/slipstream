@@ -292,15 +292,15 @@ impl Hello {
             b.push(self.video_caps);
         }
         // audio_channels: emitted when non-stereo OR a later field follows.
-        if ac_present || vcodecs_present || pref_present || hdr_present || ccaps_present {
+        if ac_present || vcodecs_present || pref_present || hdr_present || ccaps_present || monitor_present {
             b.push(self.audio_channels);
         }
         // video_codecs: emitted when non-zero OR a later field follows.
-        if vcodecs_present || pref_present || hdr_present || ccaps_present {
+        if vcodecs_present || pref_present || hdr_present || ccaps_present || monitor_present {
             b.push(self.video_codecs);
         }
         // preferred_codec: emitted when non-zero OR a later field follows.
-        if pref_present || hdr_present || ccaps_present {
+        if pref_present || hdr_present || ccaps_present || monitor_present {
             b.push(self.preferred_codec);
         }
         // display_hdr: fixed HDR_META_BODY_LEN-byte HdrMeta body; omitted when `None` even if
@@ -1424,6 +1424,28 @@ mod tests {
         let hello = Hello {
             monitor_id: Some("gdi:\\\\.\\DISPLAY1".into()),
             client_caps: CLIENT_CAP_CURSOR,
+            ..monitor_base()
+        };
+        assert_eq!(Hello::decode(&hello.encode()).unwrap(), hello);
+    }
+
+    /// The Windows client sends exactly this shape: no capability bits, a codec mask, and a
+    /// per-session monitor id. Encoding used to skip `preferred_codec` because no *caps* field
+    /// followed, then still emit the caps byte because the monitor id was present, so the decoder
+    /// read the id's length byte as `client_caps` and lost the selection. The id is only ever sent
+    /// by clients whose caps bits are still 0, so this is the common path, not a corner.
+    #[test]
+    fn monitor_id_with_default_client_caps_roundtrips() {
+        let hello = Hello {
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: crate::quic::CODEC_H264
+                | crate::quic::CODEC_HEVC
+                | crate::quic::CODEC_AV1,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            monitor_id: Some(r"gdi:\.\DISPLAY1".into()),
             ..monitor_base()
         };
         assert_eq!(Hello::decode(&hello.encode()).unwrap(), hello);

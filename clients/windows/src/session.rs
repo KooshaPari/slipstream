@@ -23,6 +23,36 @@ use crate::input::{InputSender, InputSenderGuard};
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
 use crate::{ff, mf, window, PipeStats};
 
+/// The `Hello` this client sends, built from the parsed arguments.
+///
+/// Extracted so the handshake shape, the per-session `monitor_id` in particular, is exercised against
+/// the construction the client actually uses instead of a copy in a test that can drift from it.
+pub(crate) fn hello_for(args: &Args) -> Hello {
+    Hello {
+        abi_version: slipstream_core::WIRE_VERSION,
+        mode: args.mode,
+        compositor: slipstream_core::CompositorPref::Auto,
+        gamepad: slipstream_core::config::GamepadPref::Auto,
+        bitrate_kbps: args.bitrate_kbps,
+        name: Some(args.name.clone()),
+        launch: None,
+        // Capability bits stay 0 until a decoder here advertises 10-bit/4:4:4 that it can really
+        // render; claiming them early would have the host pick a mode this client cannot show.
+        video_caps: 0,
+        audio_channels: args.audio_channels,
+        video_codecs: slipstream_core::quic::CODEC_H264
+            | slipstream_core::quic::CODEC_HEVC
+            | slipstream_core::quic::CODEC_AV1,
+        preferred_codec: args.preferred_codec,
+        display_hdr: slipstream_core::client::display_hdr_env_override(),
+        client_caps: 0,
+        // E1: additive per-session monitor choice. `--monitor` names a head; absent keeps the
+        // host's pinned monitor, which is the legacy behaviour. The host validates the id against
+        // its own monitor list, so an unknown head fails there with a clear message.
+        monitor_id: args.monitor.clone(),
+    }
+}
+
 /// Inputs needed to run one client session. The CLI has already parsed and resolved these.
 #[derive(Debug)]
 pub struct SessionConfig {
@@ -138,30 +168,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let mut recv = io::MsgReader::new(recv);
     io::write_msg(
         &mut send,
-        &Hello {
-            abi_version: slipstream_core::WIRE_VERSION,
-            mode: args.mode,
-            compositor: slipstream_core::CompositorPref::Auto,
-            gamepad: slipstream_core::config::GamepadPref::Auto,
-            bitrate_kbps: args.bitrate_kbps,
-            name: Some(args.name.clone()),
-            launch: None,
-            // No decode backend yet: advertise no codec capability bits rather than claiming
-            // 10-bit/4:4:4 we cannot render.
-            video_caps: 0,
-            audio_channels: args.audio_channels,
-            video_codecs: slipstream_core::quic::CODEC_H264
-                | slipstream_core::quic::CODEC_HEVC
-                | slipstream_core::quic::CODEC_AV1,
-            preferred_codec: args.preferred_codec,
-            display_hdr: slipstream_core::client::display_hdr_env_override(),
-            client_caps: 0,
-            // E1: additive per-session monitor choice. `--monitor` names a head; absent keeps the
-            // host's pinned monitor, which is the legacy behaviour. The host validates the id
-            // against its own monitor list, so an unknown head fails there with a clear message.
-            monitor_id: args.monitor.clone(),
-        }
-        .encode(),
+        &hello_for(&args).encode(),
     )
     .await?;
     // A host that completes the QUIC handshake but never sends `Welcome` (wedged encoder/parked
@@ -490,6 +497,40 @@ mod tests {
         assert_eq!(
             SessionOutcome::from_result(true, SessionStop::WindowClosed, 10),
             SessionOutcome::WindowClosed
+        );
+    }
+
+    /// The client's real handshake message, not a copy of it: `--monitor` must survive the same codec
+    /// the host decodes with. A real Windows head is `gdi:\\.\DISPLAY1`, so the backslashes are the
+    /// interesting part: they must arrive intact rather than being stripped or shifted.
+    #[test]
+    fn monitor_id_reaches_the_wire_and_survives_the_codec() {
+        let p = |argv: &[&str]| {
+            crate::args::parse(argv.iter().map(|s| s.to_string())).expect("args parse")
+        };
+
+        const HEAD: &str = r"gdi:\\.\DISPLAY1";
+        let hello = hello_for(&p(&["--connect", "h", "--monitor", HEAD]));
+        assert_eq!(hello.monitor_id.as_deref(), Some(HEAD));
+
+        // Round-trip through the shared codec the host uses to decode this message.
+        let bytes = hello.encode();
+        let decoded = Hello::decode(&bytes).expect("hello decodes");
+        assert_eq!(
+            decoded.monitor_id.as_deref(),
+            Some(HEAD),
+            "the head id must arrive intact (wire {} bytes, caps {}, hdr {})",
+            bytes.len(),
+            decoded.client_caps,
+            decoded.display_hdr.is_some()
+        );
+
+        // Absent stays absent, which is what keeps the legacy wire shape for existing callers.
+        let plain = hello_for(&p(&["--connect", "h"]));
+        assert_eq!(plain.monitor_id, None);
+        assert_eq!(
+            Hello::decode(&plain.encode()).expect("hello decodes").monitor_id,
+            None
         );
     }
 

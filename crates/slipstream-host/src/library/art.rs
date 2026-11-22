@@ -184,7 +184,14 @@ mod tests {
 
     #[test]
     fn local_art_path_detection() {
-        assert!(is_local_art_path("/var/lib/slipstream/cover.jpg"));
+        // Absolute in *this platform's* spelling. The rule is `Path::is_absolute()`, which is
+        // platform-defined: `/var/lib/...` is absolute on Unix but not on Windows, so a Unix
+        // literal here asserts the wrong thing on a Windows host (a first-class target).
+        #[cfg(windows)]
+        const LOCAL_ABS: &str = r"C:\ProgramData\slipstream\cover.jpg";
+        #[cfg(not(windows))]
+        const LOCAL_ABS: &str = "/var/lib/slipstream/cover.jpg";
+        assert!(is_local_art_path(LOCAL_ABS));
         // URLs and the host proxy path are NOT local files.
         assert!(!is_local_art_path("https://cdn/x.jpg"));
         assert!(!is_local_art_path("http://host/x.jpg"));
@@ -196,8 +203,12 @@ mod tests {
 
     #[test]
     fn proxy_local_art_rewrites_only_local_paths() {
+        #[cfg(windows)]
+        const LOCAL_ABS: &str = r"C:\ProgramData\slipstream\art\p.jpg";
+        #[cfg(not(windows))]
+        const LOCAL_ABS: &str = "/var/lib/slipstream/art/p.jpg";
         let mut art = Artwork {
-            portrait: Some("/var/lib/slipstream/art/p.jpg".into()),
+            portrait: Some(LOCAL_ABS.into()),
             hero: Some("https://cdn/h.jpg".into()),
             logo: None,
             header: Some("/api/v1/library/art/custom:x/header".into()),

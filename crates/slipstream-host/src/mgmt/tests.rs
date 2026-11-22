@@ -736,9 +736,12 @@ async fn compositors_lists_all_backends_with_flags() {
         assert!(c["default"].is_boolean());
         assert!(c["label"].as_str().is_some_and(|s| !s.is_empty()));
         if c["id"] == "windows" {
+            // The Windows backend is listed on every host but only *available* on Windows, so the
+            // expectation tracks the host OS rather than assuming Linux.
             assert_eq!(
-                c["available"], false,
-                "Windows backend is never available on Linux"
+                c["available"],
+                cfg!(windows),
+                "Windows backend availability must track the host OS"
             );
         }
     }

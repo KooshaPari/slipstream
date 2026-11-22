@@ -1,3 +1,14 @@
 # Vector PDF assets are binary: core.autocrlf must never rewrite their line endings, because a
 # PDF's xref table holds byte offsets (a CRLF rewrite silently invalidates the file).
 *.pdf binary
+
+# Detached signatures are base64 over canonical index bytes. core.autocrlf must never append a
+# line ending: the committed blob is a single 88-char line with none, and include_str! reads the
+# working tree verbatim, so a CRLF checkout decodes to different bytes and verification fails.
+# Observed on Windows (88 -> 90 bytes, one CR) while Linux CI passed.
+*.sig -text
+
+# The plugin index is a SIGNED artifact: index.json.sig covers the exact bytes of index.json, so
+# core.autocrlf must not rewrite either. Measured on Windows: blob 116 bytes vs worktree 123 (7
+# converted line endings), which breaks verification while Linux CI passes.
+plugin-index/**/*.json -text

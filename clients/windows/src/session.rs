@@ -156,6 +156,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             preferred_codec: args.preferred_codec,
             display_hdr: slipstream_core::client::display_hdr_env_override(),
             client_caps: 0,
+            // E1: additive per-session monitor choice. The host falls back to its pinned
+            // monitor when absent; client-side head selection is not wired up yet.
+            monitor_id: None,
         }
         .encode(),
     )

@@ -1552,7 +1552,6 @@ typedef struct {
 } SlipstreamAudioPacket;
 #endif
 
-#if defined(SLIPSTREAM_FEATURE_QUIC)
 // One decoded audio frame from [`slipstream_connection_next_audio_pcm`]: interleaved 32-bit
 // float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
 // first `channels` of it). `samples` points at `frame_count * channels` floats and borrows
@@ -1569,7 +1568,6 @@ typedef struct {
     // Capture presentation timestamp (ns).
     uint64_t pts_ns;
 } SlipstreamAudioPcm;
-#endif
 
 #if defined(SLIPSTREAM_FEATURE_QUIC)
 // One DualSense HID-output feedback event a game wrote to the host's virtual pad
@@ -2362,7 +2360,6 @@ SlipstreamStatus slipstream_connection_next_audio(SlipstreamConnection *c,
 SlipstreamStatus slipstream_connection_audio_channels(SlipstreamConnection *c, uint8_t *out);
 #endif
 
-#if defined(SLIPSTREAM_FEATURE_QUIC)
 // Pull the next audio frame and **decode it in-core** to interleaved f32 PCM — for embedders
 // without a multistream-capable Opus decoder (e.g. Apple, whose AudioToolbox Opus path is
 // stereo-only). The decoder is built once from the negotiated channel count and handles 2/6/8
@@ -2377,7 +2374,6 @@ SlipstreamStatus slipstream_connection_audio_channels(SlipstreamConnection *c, u
 SlipstreamStatus slipstream_connection_next_audio_pcm(SlipstreamConnection *c,
                                                       SlipstreamAudioPcm *out,
                                                       uint32_t timeout_ms);
-#endif
 
 #if defined(SLIPSTREAM_FEATURE_QUIC)
 // Pull the next rumble (force-feedback) update, waiting up to `timeout_ms`. Amplitudes

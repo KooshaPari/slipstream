@@ -2510,9 +2510,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 mode_bitrate,
                 bitrate_auto,
                 bit_depth,
-                        plan.clone(),
-                        &quit,
-                        // The display this rebuild supersedes (retired below once the new pipeline is
+                plan.clone(),
+                &quit,
+                // The display this rebuild supersedes (retired below once the new pipeline is
                 // up)  -  its replacement inherits the group topology (Primary/Exclusive).
                 cur_display_gen,
                 // No first-frame shortening here: this direct call has no retry wrapper to
@@ -4093,9 +4093,9 @@ pub(super) fn prepare_display(
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
-                        plan.clone(),
-                        quit,
-                        stop,
+        plan.clone(),
+        quit,
+        stop,
         8,
         Some(trace),
     )?;

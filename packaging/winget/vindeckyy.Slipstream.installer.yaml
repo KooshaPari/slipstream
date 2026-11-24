@@ -10,7 +10,7 @@ InstallModes:
 - silentWithProgress
 Installers:
 - Architecture: x64
-  InstallerUrl: https://github.com/vindeckyy/slipstream/releases/download/v0.24.0/Slipstream.msi
+  InstallerUrl: https://github.com/KooshaPari/slipstream/releases/download/v0.24.0/Slipstream.msi
   InstallerSha256: 10fde2cf674c2996f1433f41d0db7eb4599405c77eec5d4c8ce2edadf2ec8a33
   # ProductCode read from the built MSI at
   # packaging\msi\bin\Slipstream.msi (9,199,616 bytes) via the WindowsInstaller COM Property

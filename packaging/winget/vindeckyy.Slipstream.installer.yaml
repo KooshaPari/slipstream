@@ -11,12 +11,12 @@ InstallModes:
 Installers:
 - Architecture: x64
   InstallerUrl: https://github.com/vindeckyy/slipstream/releases/download/v0.24.0/Slipstream.msi
-  InstallerSha256: PLACEHOLDER_REPLACE_WITH_REAL_SHA256_AFTER_MSI_BUILD
-  # TODO(operator): Fill ProductCode from the published MSI at submission. WiX auto-generates it
-  # per build in packaging/msi/Package.wxs; the published version must never be rebuilt, so that
-  # MSI has one fixed ProductCode. This well-formed but invalid GUID deliberately blocks submission
-  # until the real ProductCode from that exact MSI is inserted. Keep the UpgradeCode entry below.
-  ProductCode: "{00000000-0000-0000-0000-000000000000}"
+  InstallerSha256: 10fde2cf674c2996f1433f41d0db7eb4599405c77eec5d4c8ce2edadf2ec8a33
+  # ProductCode read from the built MSI at
+  # packaging\msi\bin\Slipstream.msi (9,199,616 bytes) via the WindowsInstaller COM Property
+  # table. Same artifact that produced the InstallerSha256 above; a published version is never
+  # rebuilt, so this pair stays valid.
+  ProductCode: "{67178ECC-A769-4C4C-92A7-13E9A7B6397B}"
   InstallerSwitches:
     Silent: /qn
     SilentWithProgress: /qb

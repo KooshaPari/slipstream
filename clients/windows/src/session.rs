@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use slipstream_core::config::{Mode, Role};
 use slipstream_core::input::InputEvent;
 use slipstream_core::packet::FLAG_PROBE;
-use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
+use slipstream_core::quic::{endpoint, io, Hello, RequestKeyframe, Start, Welcome};
 use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
 use slipstream_core::transport::UdpTransport;
 use slipstream_core::{Session, SlipstreamError};
@@ -22,6 +22,7 @@ use crate::connect::{self, Machine};
 use crate::identity;
 use crate::input::{InputSender, InputSenderGuard};
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
+use crate::recovery::{KeyframeRequest, RecoveryEvent, RecoveryState};
 use crate::{ff, mf, window, PipeStats};
 
 /// How long the client tolerates post-handshake silence before it says WHY it is still waiting.
@@ -256,6 +257,18 @@ fn validate_mode(mode: &Mode, codec: u8, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Feed one decode-loop event to the recovery policy.
+///
+/// Events alone never make a request due: each arm resets the timer its own request would fire
+/// from, so the value is intentionally dropped and requests are polled from the no-frame arm.
+fn note_recovery(recovery: &mut RecoveryState, event: RecoveryEvent) {
+    let due = recovery.advance(Some(event), Instant::now());
+    debug_assert!(
+        due.is_none(),
+        "recovery events never make a keyframe request due on their own"
+    );
+}
+
 /// Run one streaming session to completion, from handshake to final counters.
 pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let SessionConfig {
@@ -404,6 +417,38 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     )
     .await?;
 
+    // The host encodes an infinite GOP, so a lost opening IDR (or a restarted decoder replaying
+    // only deltas) leaves the picture black forever. `RequestKeyframe` is the protocol's recovery
+    // message; the policy in [`crate::recovery`] decides when it is due. The write itself happens
+    // on this control-stream task, never inside the blocking frame loop: `Handle::block_on` from
+    // the loop panics when the thread is already driving a future (the bug 5352687c fixes).
+    let (keyframe_tx, mut keyframe_rx) = tokio::sync::mpsc::unbounded_channel::<KeyframeRequest>();
+    // Written-request acks, drained by the frame loop so `mark_sent` counts real writes only.
+    let (keyframe_sent_tx, keyframe_sent_rx) = std::sync::mpsc::channel::<()>();
+    let keyframe_writer = {
+        let mut send = send;
+        tokio::spawn(async move {
+            while let Some(request) = keyframe_rx.recv().await {
+                match io::write_msg(&mut send, &RequestKeyframe.encode()).await {
+                    Ok(()) => {
+                        tracing::warn!(
+                            reason = request.reason.as_str(),
+                            attempted = request.attempted,
+                            "requested a keyframe — no decodable picture"
+                        );
+                        let _ = keyframe_sent_tx.send(());
+                    }
+                    Err(e) => tracing::warn!(
+                        reason = request.reason.as_str(),
+                        attempted = request.attempted,
+                        error = %e,
+                        "keyframe request failed"
+                    ),
+                }
+            }
+        })
+    };
+
     let host_udp = SocketAddr::new(remote.ip(), welcome.udp_port);
     let session_cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
@@ -498,8 +543,13 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         // The geometry we are currently sized for; starts at what the Welcome promised and moves
         // to whatever the host says it is actually delivering.
         let mut sized = (mode.width, mode.height);
+        let mut recovery = RecoveryState::default();
         let stop;
         loop {
+            // A due request counts as sent only once the control-stream task wrote it.
+            while keyframe_sent_rx.try_recv().is_ok() {
+                recovery.mark_sent();
+            }
             if presenter.closed() {
                 tracing::info!("window closed — ending the session");
                 stop = SessionStop::WindowClosed;
@@ -520,6 +570,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                     sized = (m.width, m.height);
                     decoder.resize(m.width, m.height);
                     presenter.resize(m.width, m.height);
+                    // The replacement decoder has no reference picture of its own, even if the
+                    // old one had produced frames: it needs a fresh IDR to produce anything.
+                    note_recovery(&mut recovery, RecoveryEvent::DecoderRestart);
                 }
             }
             if let Some(secs) = seconds {
@@ -559,6 +612,11 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                         stats.note_decoded();
                         presented += 1;
                         stats.note_presented();
+                        note_recovery(&mut recovery, RecoveryEvent::Output);
+                    } else {
+                        // An AU swallowed while the decoder is still unanchored is a stale
+                        // reference or decode error; the policy re-asks after its own patience.
+                        note_recovery(&mut recovery, RecoveryEvent::DecodeError);
                     }
                     let t_pres = Instant::now();
                     presenter.present(decoded.as_ref());
@@ -577,6 +635,17 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                     stats.tick();
                 }
                 Err(SlipstreamError::NoFrame) => {
+                    // No picture and nothing to decode: ask for a fresh IDR if the policy is due.
+                    // Sending is non-blocking; the writer task reports the write back above.
+                    if let Some(request) = recovery.advance(None, Instant::now()) {
+                        tracing::debug!(
+                            reason = request.reason.as_str(),
+                            attempted = recovery.attempted(),
+                            sent = recovery.sent(),
+                            "keyframe recovery is due — queued for the control stream"
+                        );
+                        let _ = keyframe_tx.send(request);
+                    }
                     let t_spin = Instant::now();
                     std::thread::sleep(Duration::from_micros(300));
                     spin_ns = t_spin.elapsed().as_nanos() as u64;
@@ -595,6 +664,10 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
         Ok((frames, bytes, presented, stop))
     })
     .await??;
+
+    // The frame loop ended and dropped its sender; let the control-stream task finish so its
+    // `send` handle is released before the connection closes.
+    let _ = keyframe_writer.await;
 
     conn.close(0u32.into(), b"quit");
     println!(

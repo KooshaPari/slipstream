@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use wayland_client::backend::WaylandError;
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
@@ -1040,10 +1041,41 @@ struct State {
     node_id: Option<u32>,
     failed: Option<String>,
     closed: bool,
+    /// Set when the `wl_display.sync` callback queued right after `get_registry` returns: KWin has
+    /// delivered every global it is going to offer. Without it, a missing *restricted* screencast
+    /// global is indistinguishable from a wedged registry, and users get "did not advertise its
+    /// globals" instead of the install/authorization guidance.
+    registry_done: bool,
     /// Every `wl_output` KWin advertises, keyed by the proxy, with its connector name once the
     /// `name` event arrives. Only the monitor-mirror path ([`stream_existing_output`]) needs these
     /// — `stream_output` takes a `wl_output` object, so the connector has to be resolved to one.
     outputs: Vec<(WlOutput, Option<String>)>,
+}
+
+/// Queue a `wl_display.sync` callback after the registry request.
+///
+/// Requests on a connection are processed in order, so the callback's `done` arrives only after the
+/// server has handled `get_registry` — i.e. after the initial global burst. That is the only way to
+/// tell "KWin advertised no screencast global" from "KWin has not answered yet", because the
+/// registry protocol has no completion event of its own.
+fn request_registry_done(conn: &Connection, qh: &QueueHandle<State>) {
+    conn.display().sync(qh, ());
+}
+
+// The sync callback's only event marks the registry burst complete.
+impl Dispatch<WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            state.registry_done = true;
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, ()> for State {
@@ -1206,18 +1238,19 @@ pub fn probe() -> Result<()> {
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
+    request_registry_done(&conn, &qh);
     let mut state = State::default();
     let ready = pump_until(
         &conn,
         &mut queue,
         &mut state,
         Instant::now() + SCREENCAST_BUDGET,
-        |s| s.screencast.is_some(),
+        |s| s.registry_done || s.screencast.is_some(),
     )
     .context("KWin registry roundtrip")?;
     if !ready {
         bail!(
-            "KWin did not advertise its Wayland globals within {}s",
+            "KWin did not answer the registry within {}s (is WAYLAND_DISPLAY a live KWin socket?)",
             SCREENCAST_BUDGET.as_secs()
         );
     }
@@ -1239,6 +1272,27 @@ pub fn is_available() -> bool {
     probe().is_ok()
 }
 
+/// Whether the connector wait in [`run_existing`] can stop.
+///
+/// Two conditions, both meaningful:
+/// - the *requested* connector has reported its `name`; or
+/// - every advertised output has reported one.
+///
+/// Waiting for *any* named output ended the wait on a second monitor's name while the target's slot
+/// was still empty, so a present target could be resolved as absent. Waiting only for the target
+/// would instead burn the whole budget when it is genuinely unplugged — with every output named the
+/// resolve below can name exactly what KWin has.
+fn outputs_settled<'a>(names: impl Iterator<Item = Option<&'a str>>, connector: &str) -> bool {
+    let names: Vec<Option<&str>> = names.collect();
+    if names
+        .iter()
+        .any(|n| n.is_some_and(|n| n.eq_ignore_ascii_case(connector)))
+    {
+        return true;
+    }
+    !names.is_empty() && names.iter().all(Option::is_some)
+}
+
 /// Stream an **existing** KWin output — the monitor-mirror path
 /// (`design/per-monitor-portal-capture.md` L1). Same privileged global and the same thread/keepalive
 /// shape as the virtual-output path; `stream_output` simply takes a `wl_output` instead of minting
@@ -1258,21 +1312,23 @@ fn run_existing(
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
+    request_registry_done(&conn, &qh);
 
     let mut state = State::default();
-    // Two roundtrips: the first processes the globals (binding screencast + every wl_output), the
-    // second drains each output's property burst — the `name` event we resolve the connector by.
+    // Two waits: the first processes the globals (binding screencast + every wl_output) and ends on
+    // the registry-completion sync, the second drains each output's property burst — the `name`
+    // event we resolve the connector by.
     let ready = pump_until(
         &conn,
         &mut queue,
         &mut state,
         Instant::now() + SCREENCAST_BUDGET,
-        |s| s.screencast.is_some(),
+        |s| s.registry_done || s.screencast.is_some(),
     )
     .context("KWin registry roundtrip")?;
     if !ready {
         bail!(
-            "KWin did not advertise its Wayland globals within {}s",
+            "KWin did not answer the registry within {}s (is WAYLAND_DISPLAY a live KWin socket?)",
             SCREENCAST_BUDGET.as_secs()
         );
     }
@@ -1281,12 +1337,12 @@ fn run_existing(
         &mut queue,
         &mut state,
         Instant::now() + SCREENCAST_BUDGET,
-        |s| s.outputs.iter().any(|(_, n)| n.is_some()),
+        |s| outputs_settled(s.outputs.iter().map(|(_, n)| n.as_deref()), connector),
     )
     .context("KWin wl_output property roundtrip")?;
     if !named_ready {
         bail!(
-            "KWin did not publish wl_output names within {}s — cannot mirror {connector:?}",
+            "KWin did not publish {connector:?}'s wl_output name within {}s — cannot mirror it",
             SCREENCAST_BUDGET.as_secs()
         );
     }
@@ -1405,14 +1461,17 @@ fn pinned_socket() -> Option<std::path::PathBuf> {
     static SOCKET: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     SOCKET
         .get_or_init(|| {
-            // NOTE: this reads the environment without holding ENV_LOCK, so it is only correct
-            // because warm_socket() runs at host startup before any session handshake can
-            // rewrite WAYLAND_DISPLAY. Any other entry point that connects first would pin an
-            // already-rewritten environment.
-            resolve_pinned_socket(
-                std::env::var_os("WAYLAND_DISPLAY"),
-                std::env::var_os("XDG_RUNTIME_DIR"),
-            )
+            // Sampled under ENV_LOCK: `apply_session_env` writes these two variables from another
+            // thread, and reading `environ` while it is being realloc'd is the race ENV_LOCK exists
+            // to prevent. `warm_socket()` still runs at host startup so the pin normally predates
+            // any handshake; the lock makes a lazy first connect (the fallback entry point) safe
+            // rather than only "usually first".
+            crate::with_env_lock(|| {
+                resolve_pinned_socket(
+                    std::env::var_os("WAYLAND_DISPLAY"),
+                    std::env::var_os("XDG_RUNTIME_DIR"),
+                )
+            })
         })
         .clone()
 }
@@ -1502,15 +1561,22 @@ fn peer_is(pid: i32) -> bool {
 
 /// Keep process-global Wayland variables pointed at the authenticated fallback socket so later
 /// diagnostics and child processes use the same compositor.
+///
+/// Both writes are process-global and every other session-env writer takes [`crate::ENV_LOCK`];
+/// without it a concurrent `apply_session_env` could interleave the two `set_var`s (glibc `environ`
+/// realloc is UB) and leave `WAYLAND_DISPLAY` naming one socket and `XDG_RUNTIME_DIR` another.
+/// Callers must not already hold the lock — it is not reentrant.
 fn repair_wayland_env(path: &std::path::Path) {
-    if let Some(runtime) = path.parent().filter(|p| p.is_absolute()) {
-        std::env::set_var("XDG_RUNTIME_DIR", runtime);
-        if let Some(name) = path.file_name() {
-            std::env::set_var("WAYLAND_DISPLAY", name);
+    crate::with_env_lock(|| {
+        if let Some(runtime) = path.parent().filter(|p| p.is_absolute()) {
+            std::env::set_var("XDG_RUNTIME_DIR", runtime);
+            if let Some(name) = path.file_name() {
+                std::env::set_var("WAYLAND_DISPLAY", name);
+            }
+        } else {
+            std::env::set_var("WAYLAND_DISPLAY", path);
         }
-    } else {
-        std::env::set_var("WAYLAND_DISPLAY", path);
-    }
+    });
 }
 
 /// Last-resort socket resolution: every `wayland-*` socket this uid owns under `XDG_RUNTIME_DIR`
@@ -1930,6 +1996,7 @@ fn run(
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
+    request_registry_done(&conn, &qh);
 
     let mut state = State::default();
     let ready = pump_until(
@@ -1937,12 +2004,12 @@ fn run(
         &mut queue,
         &mut state,
         Instant::now() + SCREENCAST_BUDGET,
-        |s| s.screencast.is_some(),
+        |s| s.registry_done || s.screencast.is_some(),
     )
     .context("KWin registry roundtrip")?;
     if !ready {
         bail!(
-            "KWin did not advertise its Wayland globals within {}s",
+            "KWin did not answer the registry within {}s (is WAYLAND_DISPLAY a live KWin socket?)",
             SCREENCAST_BUDGET.as_secs()
         );
     }
@@ -2051,7 +2118,7 @@ fn park_until_stopped(
 
 #[cfg(test)]
 mod tests {
-    use super::{modes_from_json, pick_custom_mode, KModeRow, MANAGED_PREFIX};
+    use super::{modes_from_json, outputs_settled, pick_custom_mode, KModeRow, MANAGED_PREFIX};
 
     fn row(id: &str, w: u32, h: u32, hz: f64) -> KModeRow {
         KModeRow {
@@ -2151,6 +2218,40 @@ mod tests {
             .filter(|n| !n.starts_with(MANAGED_PREFIX))
             .collect();
         assert_eq!(to_disable, vec!["eDP-1"]);
+    }
+
+    /// The monitor-mirror wait must not end because *some* output reported a name: a second
+    /// monitor's name used to satisfy it while the target's slot was still empty, so a present
+    /// target was then resolved as absent (thread 4638721236).
+    #[test]
+    fn connector_wait_ignores_other_monitors_names() {
+        let edp: Option<&str> = Some("eDP-1");
+        let dp2: Option<&str> = Some("DP-2");
+        let hdmi: Option<&str> = Some("HDMI-A-1");
+        assert!(
+            !outputs_settled([edp, None].into_iter(), "DP-2"),
+            "another monitor's name must not end the wait for DP-2"
+        );
+        assert!(
+            !outputs_settled([None, None].into_iter(), "DP-2"),
+            "nothing named yet is not settled"
+        );
+        assert!(
+            !outputs_settled(std::iter::empty::<Option<&str>>(), "DP-2"),
+            "no outputs at all is not settled"
+        );
+        assert!(
+            outputs_settled([edp, dp2].into_iter(), "DP-2"),
+            "the target reporting its own name ends the wait"
+        );
+        assert!(
+            outputs_settled([edp, dp2].into_iter(), "dp-2"),
+            "connector names compare case-insensitively"
+        );
+        assert!(
+            outputs_settled([edp, hdmi].into_iter(), "DP-2"),
+            "every output named lets the resolve report what KWin actually has"
+        );
     }
 }
 

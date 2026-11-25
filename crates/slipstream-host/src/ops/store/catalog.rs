@@ -262,7 +262,10 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
+            if let Ok((mut sock, _)) = listener
+                .accept()
+                .inspect_err(|e| panic!("loopback listener must accept: {e}"))
+            {
                 // Read the request before replying. Answering before the client has finished
                 // sending, or dropping the socket straight after the reply, makes Windows reset the
                 // connection instead of delivering the response: the client then reports
@@ -271,11 +274,15 @@ mod tests {
                 // is what must be made deterministic.
                 let mut req = [0u8; 1024];
                 let _ = std::io::Read::read(&mut sock, &mut req);
-                let _ = sock.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n");
-                let _ = sock.flush();
-                // Half-close so the client sees a clean end of stream, then wait for it to hang up
-                // before this socket is dropped.
+                sock.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\n")
+                    .expect("the 304 response must reach the client intact");
+                sock.flush().expect("flush the 304 response");
+                // Half-close so the client sees a clean end of stream, then drain until it hangs up
+                // before this socket is dropped — bounded by a read timeout so the join can't stall
+                // on a client that keeps its pooled connection open.
                 let _ = sock.shutdown(std::net::Shutdown::Write);
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("the drain must be bounded");
                 let mut sink = [0u8; 256];
                 while let Ok(n) = std::io::Read::read(&mut sock, &mut sink) {
                     if n == 0 {
@@ -285,14 +292,20 @@ mod tests {
             }
         });
 
-        let resp = ureq::get(&format!("http://{addr}/index.json"))
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        let resp = agent
+            .get(&format!("http://{addr}/index.json"))
             .set("If-None-Match", "\"x\"")
             .call();
-        let _ = server.join();
+        server
+            .join()
+            .expect("the loopback server thread must not panic");
 
         match resp {
             Ok(r) => assert_eq!(r.status(), 304, "304 must arrive as Ok, and be checked for"),
-            Err(e) => panic!("ureq now reports 304 as an error ({e}) — fetch() must be updated"),
+            Err(e) => panic!("the loopback 304 request failed ({e}) — an abort here is the harness resetting the socket, not ureq changing its 304 semantics"),
         }
     }
 

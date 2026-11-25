@@ -157,8 +157,6 @@ mod zerocopy {
 
 use anyhow::{bail, Context, Result};
 use encode::Codec;
-#[cfg(target_os = "windows")]
-use service::dispatch;
 use spike::{Options, Source};
 use std::path::PathBuf;
 

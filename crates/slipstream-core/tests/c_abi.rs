@@ -4,6 +4,12 @@
 //! link flags) is `tests/c/run.sh`; this mirrors it so `cargo test` alone covers the
 //! C boundary.
 
+// Unix-only: this harness hardcodes `libslipstream_core.a` and drives a `cc -std=c11` link line,
+// neither of which exists on MSVC (it emits `slipstream_core.lib` and uses `cl.exe`). The
+// portable path is `tests/c/run.sh`; gating here skips the file on Windows instead of failing it,
+// leaving Linux/macOS coverage unchanged.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

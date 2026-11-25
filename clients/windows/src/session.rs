@@ -130,6 +130,44 @@ fn known_codec(codec: u8) -> bool {
     matches!(codec, CODEC_H264 | CODEC_HEVC | CODEC_AV1)
 }
 
+/// The decode backend this session will use, from the same env var `run_stream` reads.
+///
+/// Kept next to the advertisement so the two cannot drift: a codec bit in `Hello` is a promise the
+/// client can decode that stream, and the promise is only good for the backend that will run.
+fn uses_mf_backend() -> bool {
+    std::env::var_os("SLIPSTREAM_WINDOWS_DECODER_MF").is_some()
+}
+
+/// Video codecs to advertise in `Hello`, derived from what the selected backend can decode.
+///
+/// This mirrors how the crate already decides codec support: each backend hard-codes its own
+/// `match` over the negotiated byte (`ff` accepts H.264/HEVC, `mf` adds AV1), so the advertisement
+/// asks the backend rather than assuming a fixed set. AV1 is special because its Media Foundation
+/// decoder is an optional Windows extension: `av1_probe` reports whether this install has one, so
+/// a machine without the AV1 Video Extension does not negotiate a stream it cannot decode.
+fn advertised_codecs(mf: bool, av1_probe: impl Fn() -> bool) -> u8 {
+    if !mf {
+        // Ask the backend, not a copied constant: `ff::supported_codecs` is the same list its
+        // `spawn` will accept, so the two cannot drift apart.
+        return ff::supported_codecs();
+    }
+    let mut codecs = CODEC_H264 | CODEC_HEVC;
+    if av1_probe() {
+        codecs |= CODEC_AV1;
+    }
+    codecs
+}
+
+/// The advertisement for this process: the default `ffmpeg.exe` backend has no AV1 demuxer
+/// mapping, so AV1 is not advertised unless the Media Foundation backend (probed) is selected.
+fn hello_codecs() -> u8 {
+    if uses_mf_backend() {
+        advertised_codecs(true, mf::supports_av1)
+    } else {
+        advertised_codecs(false, || false)
+    }
+}
+
 /// Reject a mode that cannot be a real encoded stream *before* anything is sized from it.
 ///
 /// `Welcome.mode` and `Reconfigured.mode` are decoded from bytes the peer controls: a corrupt or
@@ -213,13 +251,12 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             bitrate_kbps: args.bitrate_kbps,
             name: Some(args.name.clone()),
             launch: None,
-            // No decode backend yet: advertise no codec capability bits rather than claiming
-            // 10-bit/4:4:4 we cannot render.
+            // Advertise only what the decode backend that will actually run can decode: a host
+            // picks from this set, so a bit the backend refuses negotiates a stream the client
+            // cannot decode (AV1 on the default ffmpeg backend was exactly that).
             video_caps: 0,
             audio_channels: args.audio_channels,
-            video_codecs: slipstream_core::quic::CODEC_H264
-                | slipstream_core::quic::CODEC_HEVC
-                | slipstream_core::quic::CODEC_AV1,
+            video_codecs: hello_codecs(),
             preferred_codec: args.preferred_codec,
             display_hdr: slipstream_core::client::display_hdr_env_override(),
             client_caps: 0,
@@ -395,7 +432,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             // Default decode is the `ffmpeg.exe` child (see [`ff`]); the Media Foundation MFT is
             // opt-in because the Microsoft HEVC decoder is an async DXVA MFT that needs a D3D11
             // device manager before it emits anything.
-            let use_mf = std::env::var_os("SLIPSTREAM_WINDOWS_DECODER_MF").is_some();
+            let use_mf = uses_mf_backend();
             let dec: Box<dyn Decoder> = if use_mf {
                 Box::new(mf::MfDecoder::new(mode.width, mode.height, codec)?)
             } else {
@@ -533,6 +570,48 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: `Hello` used to advertise AV1 unconditionally while the default
+    /// `ffmpeg.exe` backend refuses it, so a host could pick a codec the client cannot decode.
+    #[test]
+    fn the_default_ffmpeg_backend_does_not_advertise_av1() {
+        let caps = advertised_codecs(false, || true);
+        assert_eq!(
+            caps & CODEC_AV1,
+            0,
+            "AV1 must not be advertised when the ffmpeg backend cannot decode it"
+        );
+        assert_eq!(caps & CODEC_H264, CODEC_H264);
+        assert_eq!(caps & CODEC_HEVC, CODEC_HEVC);
+        assert_eq!(
+            caps,
+            ff::supported_codecs(),
+            "the advertisement must be exactly what the backend accepts"
+        );
+    }
+
+    /// Media Foundation can decode AV1 only when the AV1 Video Extension is installed, so the
+    /// advertisement follows the probe instead of assuming the codec exists.
+    #[test]
+    fn the_mf_backend_advertises_av1_only_when_it_is_installed() {
+        assert_eq!(
+            advertised_codecs(true, || false) & CODEC_AV1,
+            0,
+            "no AV1 decoder means no AV1 in the offer"
+        );
+        assert_ne!(
+            advertised_codecs(true, || true) & CODEC_AV1,
+            0,
+            "an installed AV1 decoder means AV1 is offered"
+        );
+        for caps in [
+            advertised_codecs(true, || false),
+            advertised_codecs(true, || true),
+        ] {
+            assert_eq!(caps & CODEC_H264, CODEC_H264);
+            assert_eq!(caps & CODEC_HEVC, CODEC_HEVC);
+        }
+    }
 
     #[test]
     fn zero_frames_maps_to_zero_frames() {

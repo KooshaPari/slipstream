@@ -23,6 +23,16 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 const IMAGEMAGICK_FFMPEG: &str = r"C:\Program Files\ImageMagick-7.1.0-Q16-HDRI\ffmpeg.exe";
 
+/// Codec bytes this backend can decode.
+///
+/// AV1 is deliberately absent: [`FfmpegDecoder::spawn`] maps only HEVC and H.264 to demuxers and
+/// bails on anything else, so advertising AV1 would let a host negotiate a stream this process
+/// then refuses at decoder creation. Keep this in step with the `match` in `spawn`.
+pub fn supported_codecs() -> u8 {
+    use slipstream_core::quic::{CODEC_H264, CODEC_HEVC};
+    CODEC_H264 | CODEC_HEVC
+}
+
 fn find_ffmpeg() -> Result<String> {
     if let Some(p) = std::env::var_os("SLIPSTREAM_FFMPEG") {
         return Ok(p.to_string_lossy().into_owned());

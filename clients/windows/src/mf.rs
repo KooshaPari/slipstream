@@ -11,13 +11,13 @@
 
 use crate::present::{DecodedFrame, Decoder};
 use anyhow::{anyhow, bail, Context, Result};
+use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
 use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 
 /// The host's negotiated `CODEC_*` byte (from `slipstream_core::quic`), mapped to an MF subtype.
 fn subtype_for(codec: u8) -> Result<GUID> {
-    use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
     match codec {
         CODEC_HEVC => Ok(MFVideoFormat_HEVC),
         CODEC_H264 => Ok(MFVideoFormat_H264),
@@ -28,6 +28,79 @@ fn subtype_for(codec: u8) -> Result<GUID> {
 
 fn pack_size(width: u32, height: u32) -> u64 {
     ((width as u64) << 32) | height as u64
+}
+
+/// Human name of a negotiated codec byte, for the messages an operator has to act on.
+fn codec_name(codec: u8) -> &'static str {
+    match codec {
+        CODEC_HEVC => "HEVC",
+        CODEC_AV1 => "AV1",
+        _ => "H.264",
+    }
+}
+
+/// Enumerate a synchronous NV12 decoder MFT for `sub` and hand back the first activation.
+///
+/// Shared by [`MfDecoder::new`] and [`supports_av1`] so the `Hello` advertisement and the decoder
+/// that runs cannot disagree about what this install can decode. Every activation other than the
+/// returned one is released.
+fn find_decoder_activate(sub: GUID) -> Result<Option<IMFActivate>> {
+    let input_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: sub,
+    };
+    let output_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_NV12,
+    };
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            MFT_ENUM_FLAG_SYNCMFT,
+            Some(&input_info),
+            Some(&output_info),
+            &mut activates,
+            &mut count,
+        )
+    }
+    .context("MFTEnumEx(video decoder)")?;
+    // `activates` is a CoTaskMem array of `count` IMFActivate pointers, not a single pointer.
+    // Read it through a bounded slice so the count the API just reported is the only bound in
+    // play, then release every activation we were handed: CoTaskMemFree frees the *array*, not
+    // the COM objects it points at, so skipping any of them leaks a reference.
+    let mut chosen: Option<IMFActivate> = None;
+    if count > 0 && !activates.is_null() {
+        // SAFETY: `MFTEnumEx` succeeded, so it allocated `count` consecutive
+        // `IMFActivate*` slots at `activates`; `Option<IMFActivate>` is layout-compatible
+        // with that nullable COM pointer.
+        let slots: &[Option<IMFActivate>] =
+            unsafe { std::slice::from_raw_parts(activates, count as usize) };
+        chosen = slots.iter().find_map(|slot| slot.clone());
+    }
+    if count > 0 && !activates.is_null() {
+        for i in 0..count as usize {
+            // SAFETY: element `i` of the array described above; dropping it in place releases
+            // the reference the API transferred to us without moving it out of the array.
+            unsafe { std::ptr::drop_in_place(activates.add(i)) };
+        }
+    }
+    // Hand the CoTaskMem array back before any early return.
+    unsafe { CoTaskMemFree(Some(activates as *const _ as *const core::ffi::c_void)) };
+    Ok(chosen)
+}
+
+/// Whether this Windows install has an AV1 decoder MFT.
+///
+/// AV1 is not part of the base OS: decode needs the AV1 Video Extension, which may be absent. The
+/// `Hello` advertisement calls this so a machine without it never negotiates an AV1 stream. Every
+/// failure reads as "no AV1": the advertisement must not promise a decode the session cannot do.
+pub fn supports_av1() -> bool {
+    if unsafe { MFStartup(MF_VERSION, 0) }.is_err() {
+        return false;
+    }
+    matches!(find_decoder_activate(MFVideoFormat_AV1), Ok(Some(_)))
 }
 
 pub struct MfDecoder {
@@ -159,58 +232,16 @@ impl MfDecoder {
         let sub = subtype_for(codec)?;
         unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup")?;
 
-        // Ask for a *synchronous* decoder that outputs NV12 — the shape every MFT offers.
-        let input_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: sub,
-        };
-        let output_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_NV12,
-        };
-        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count = 0u32;
-        unsafe {
-            MFTEnumEx(
-                MFT_CATEGORY_VIDEO_DECODER,
-                MFT_ENUM_FLAG_SYNCMFT,
-                Some(&input_info),
-                Some(&output_info),
-                &mut activates,
-                &mut count,
-            )
-        }
-        .context("MFTEnumEx(video decoder)")?;
-        // `activates` is a CoTaskMem array of `count` IMFActivate pointers, not a single pointer.
-        // Read it through a bounded slice so the count the API just reported is the only bound in
-        // play, then release every activation we were handed: CoTaskMemFree frees the *array*, not
-        // the COM objects it points at, so skipping any of them leaks a reference.
-        let mut chosen: Option<IMFActivate> = None;
-        if count > 0 && !activates.is_null() {
-            // SAFETY: `MFTEnumEx` succeeded, so it allocated `count` consecutive
-            // `IMFActivate*` slots at `activates`; `Option<IMFActivate>` is layout-compatible
-            // with that nullable COM pointer.
-            let slots: &[Option<IMFActivate>] =
-                unsafe { std::slice::from_raw_parts(activates, count as usize) };
-            chosen = slots.iter().find_map(|slot| slot.clone());
-        }
-        if count > 0 && !activates.is_null() {
-            for i in 0..count as usize {
-                // SAFETY: element `i` of the array described above; dropping it in place releases
-                // the reference the API transferred to us without moving it out of the array.
-                unsafe { std::ptr::drop_in_place(activates.add(i)) };
-            }
-        }
-        // Hand the CoTaskMem array back before any early return.
-        unsafe { CoTaskMemFree(Some(activates as *const _ as *const core::ffi::c_void)) };
-        let activate = chosen.ok_or_else(|| {
+        // Ask for a *synchronous* decoder that outputs NV12 — the shape every MFT offers. The
+        // enumerator is shared with `supports_av1`, which is what the `Hello` advertisement uses.
+        let activate = find_decoder_activate(sub)?.ok_or_else(|| {
             anyhow!(
-                "no Media Foundation {} decoder on this Windows install (is the HEVC Video \
-                 Extension installed?)",
-                if sub == MFVideoFormat_HEVC {
-                    "HEVC"
+                "no Media Foundation {} decoder on this Windows install{}",
+                codec_name(codec),
+                if codec == CODEC_H264 {
+                    ""
                 } else {
-                    "H.264"
+                    " (is the matching Video Extension installed?)"
                 }
             )
         })?;
@@ -484,7 +515,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         mf_started();
         let buffer = unsafe { MFCreateMemoryBuffer(1024) }.expect("MFCreateMemoryBuffer");
-        let locked = lock_buffer(&buffer, 4, 16).expect("first lock");
+        let locked = lock_buffer(&buffer, 4, 2, 16).expect("first lock");
         assert!(
             !locked.released.load(Ordering::SeqCst),
             "released while held"
@@ -496,7 +527,7 @@ mod tests {
             "Drop did not release the lock"
         );
         assert!(
-            lock_buffer(&buffer, 4, 16).is_some(),
+            lock_buffer(&buffer, 4, 2, 16).is_some(),
             "the buffer is unusable after the release"
         );
     }
@@ -508,11 +539,11 @@ mod tests {
         mf_started();
         let buffer = unsafe { MFCreateMemoryBuffer(1024) }.expect("MFCreateMemoryBuffer");
         assert!(
-            lock_buffer(&buffer, 4, 4096).is_none(),
+            lock_buffer(&buffer, 4, 2, 4096).is_none(),
             "a 1024-byte buffer must not satisfy a 4096-byte read"
         );
         assert!(
-            lock_buffer(&buffer, 4, 16).is_some(),
+            lock_buffer(&buffer, 4, 2, 16).is_some(),
             "the refusal path leaked the lock"
         );
     }

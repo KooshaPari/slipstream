@@ -333,6 +333,45 @@ pub fn usage() -> &'static str {
 mod tests {
     use super::*;
 
+    /// The crate must never carry a real host address in source, tests or docs: an earlier revision
+    /// hardcoded a personal Tailscale address. This scan fails the build if it (or a copy in a
+    /// comment) comes back, and covers every `.rs`/`.md`/`.toml` file under the crate root.
+    #[test]
+    fn no_personal_host_address_anywhere_in_the_crate() {
+        // Split so this assertion itself is not a match.
+        const FORBIDDEN: &str = concat!("100.112.", "143.99");
+
+        fn scan(dir: &std::path::Path, seen: &mut usize, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    scan(&path, seen, hits);
+                } else if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "rs" | "md" | "toml"))
+                {
+                    let text = std::fs::read_to_string(&path).expect("read source file");
+                    *seen += 1;
+                    if text.contains(FORBIDDEN) {
+                        hits.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+
+        let mut seen = 0usize;
+        let mut hits = Vec::new();
+        scan(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+            &mut seen,
+            &mut hits,
+        );
+        assert!(hits.is_empty(), "personal host address present in {hits:?}");
+        // A crate this size has well over ten such files; a tiny count means the walk broke.
+        assert!(seen >= 10, "scan only reached {seen} files");
+    }
+
     fn p(s: &str) -> Result<Args, String> {
         parse(s.split_whitespace().map(String::from))
     }
@@ -375,8 +414,8 @@ mod tests {
 
     #[test]
     fn bare_positional_is_the_host() {
-        let a = p("100.112.143.99:9777").unwrap();
-        assert_eq!(a.connect.as_deref(), Some("100.112.143.99:9777"));
+        let a = p("192.0.2.10:9777").unwrap();
+        assert_eq!(a.connect.as_deref(), Some("192.0.2.10:9777"));
         assert_eq!(a.action(), Some(Action::Connect));
     }
 

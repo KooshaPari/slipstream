@@ -3,15 +3,16 @@
 //! This module owns the handshake, admission and receive/decode/present loop. It never exits the
 //! process: the CLI boundary in `main` decides what an outcome means for the process exit code.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use slipstream_core::config::Role;
+use slipstream_core::config::{Mode, Role};
 use slipstream_core::input::InputEvent;
 use slipstream_core::packet::FLAG_PROBE;
 use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
+use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
 use slipstream_core::transport::UdpTransport;
 use slipstream_core::{Session, SlipstreamError};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -40,9 +41,10 @@ pub(crate) fn hello_for(args: &Args) -> Hello {
         // render; claiming them early would have the host pick a mode this client cannot show.
         video_caps: 0,
         audio_channels: args.audio_channels,
-        video_codecs: slipstream_core::quic::CODEC_H264
-            | slipstream_core::quic::CODEC_HEVC
-            | slipstream_core::quic::CODEC_AV1,
+        // Advertise only what the decode backend that will actually run can decode: a host picks
+        // from this set, so a bit the backend refuses negotiates a stream the client cannot decode
+        // (AV1 on the default ffmpeg backend was exactly that).
+        video_codecs: hello_codecs(),
         preferred_codec: args.preferred_codec,
         display_hdr: slipstream_core::client::display_hdr_env_override(),
         client_caps: 0,
@@ -137,7 +139,111 @@ fn confirm_fingerprint(host: &str, fp_hex: &str) -> Result<bool> {
     ))
 }
 
-/// Run one streaming session to completion.
+// Peer-controlled geometry is validated below before it sizes a decoder or window.
+/// The largest geometry the wire contract allows. These mirror `ss-encode`'s
+/// `Codec::max_dimension` (4096 for H.264, 8192 for HEVC/AV1) — the host refuses anything above it,
+/// so the client accepts exactly that range. Kept as a local copy because the Windows client must
+/// not depend on the encoder stack; if the host limits change, this is the line to update.
+const MAX_DIM_H264: u32 = 4096;
+const MAX_DIM_HEVC_AV1: u32 = 8192;
+/// No current display drives more than this; a larger `refresh_hz` in an offer is corruption.
+const MAX_REFRESH_HZ: u32 = 1000;
+
+fn max_dimension(codec: u8) -> u32 {
+    if codec == CODEC_H264 {
+        MAX_DIM_H264
+    } else {
+        MAX_DIM_HEVC_AV1
+    }
+}
+
+fn known_codec(codec: u8) -> bool {
+    matches!(codec, CODEC_H264 | CODEC_HEVC | CODEC_AV1)
+}
+
+/// The decode backend this session will use, from the same env var `run_stream` reads.
+///
+/// Kept next to the advertisement so the two cannot drift: a codec bit in `Hello` is a promise the
+/// client can decode that stream, and the promise is only good for the backend that will run.
+fn uses_mf_backend() -> bool {
+    std::env::var_os("SLIPSTREAM_WINDOWS_DECODER_MF").is_some()
+}
+
+/// Video codecs to advertise in `Hello`, derived from what the selected backend can decode.
+///
+/// This mirrors how the crate already decides codec support: each backend hard-codes its own
+/// `match` over the negotiated byte (`ff` accepts H.264/HEVC, `mf` adds AV1), so the advertisement
+/// asks the backend rather than assuming a fixed set. AV1 is special because its Media Foundation
+/// decoder is an optional Windows extension: `av1_probe` reports whether this install has one, so
+/// a machine without the AV1 Video Extension does not negotiate a stream it cannot decode.
+fn advertised_codecs(mf: bool, av1_probe: impl Fn() -> bool) -> u8 {
+    if !mf {
+        // Ask the backend, not a copied constant: `ff::supported_codecs` is the same list its
+        // `spawn` will accept, so the two cannot drift apart.
+        return ff::supported_codecs();
+    }
+    let mut codecs = CODEC_H264 | CODEC_HEVC;
+    if av1_probe() {
+        codecs |= CODEC_AV1;
+    }
+    codecs
+}
+
+/// The advertisement for this process: the default `ffmpeg.exe` backend has no AV1 demuxer
+/// mapping, so AV1 is not advertised unless the Media Foundation backend (probed) is selected.
+fn hello_codecs() -> u8 {
+    if uses_mf_backend() {
+        advertised_codecs(true, mf::supports_av1)
+    } else {
+        advertised_codecs(false, || false)
+    }
+}
+
+/// Reject a mode that cannot be a real encoded stream *before* anything is sized from it.
+///
+/// `Welcome.mode` and `Reconfigured.mode` are decoded from bytes the peer controls: a corrupt or
+/// hostile host could otherwise make the client allocate a decoder and a window for a 0x0, odd, or
+/// absurd geometry. The dims are `u32` on the wire, so there is no non-finite value to reject; the
+/// failure modes are zero, odd (4:2:0 chroma is subsampled by two on both axes), and out of range.
+/// The message names the source (`Welcome` vs `Reconfigured`) so an operator can tell a broken host
+/// from a corrupt packet, and the codec byte is validated here too because it selects the limit.
+fn validate_mode(mode: &Mode, codec: u8, what: &str) -> Result<()> {
+    if !known_codec(codec) {
+        bail!("{what}: unknown negotiated codec byte {codec} (expected H.264, HEVC or AV1)");
+    }
+    if mode.width == 0 || mode.height == 0 {
+        bail!(
+            "{what}: mode {}x{}@{} has a zero dimension",
+            mode.width,
+            mode.height,
+            mode.refresh_hz
+        );
+    }
+    if !mode.width.is_multiple_of(2) || !mode.height.is_multiple_of(2) {
+        bail!(
+            "{what}: mode {}x{} is odd; 4:2:0 chroma needs even dimensions",
+            mode.width,
+            mode.height
+        );
+    }
+    let max = max_dimension(codec);
+    if mode.width > max || mode.height > max {
+        bail!(
+            "{what}: mode {}x{} exceeds the {max}px limit for codec byte {codec}",
+            mode.width,
+            mode.height
+        );
+    }
+    if mode.refresh_hz == 0 || mode.refresh_hz > MAX_REFRESH_HZ {
+        bail!(
+            "{what}: refresh {} Hz is outside 1..={MAX_REFRESH_HZ}",
+            mode.refresh_hz
+        );
+    }
+    Ok(())
+}
+
+/// Run one streaming session to completion, from handshake to final counters.
 pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let SessionConfig {
         remote,
@@ -179,6 +285,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             )
         })??;
     let welcome = Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
+    // The offer is peer-controlled bytes: reject an unusable codec byte or geometry before any
+    // decoder, window or frame buffer is sized from it.
+    validate_mode(&welcome.mode, welcome.codec, "host Welcome")?;
     tracing::info!(
         mode = ?welcome.mode,
         frames = welcome.frames,
@@ -245,6 +354,10 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     // gate is window focus, maintained by WM_ACTIVATE/WM_SETFOCUS/WM_KILLFOCUS in `window.rs`.
     let _input_guard = input.as_ref().map(|s| {
         s.set_enabled(true);
+        // Held-input releases go straight to the connection from here on. The pump task is
+        // cancelled when the session ends, which is exactly when a stuck key has to be freed, so a
+        // release must not depend on it.
+        s.attach_release_route(conn.clone());
         InputSenderGuard::new(s.clone())
     });
     if let (Some(sender), Some(rx)) = (&input, input_rx) {
@@ -292,7 +405,12 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                             refresh_hz = rc.mode.refresh_hz,
                             "host corrected the session mode"
                         );
-                        *delivered.lock().unwrap() = Some(rc.mode);
+                        match validate_mode(&rc.mode, codec, "host Reconfigured") {
+                            Ok(()) => *delivered.lock().unwrap() = Some(rc.mode),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ignoring a Reconfigured with an unusable mode")
+                            }
+                        }
                     }
                     Err(_) => tracing::debug!(len = msg.len(), "control message (not a mode ack)"),
                 }
@@ -327,7 +445,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             // Default decode is the `ffmpeg.exe` child (see [`ff`]); the Media Foundation MFT is
             // opt-in because the Microsoft HEVC decoder is an async DXVA MFT that needs a D3D11
             // device manager before it emits anything.
-            let use_mf = std::env::var_os("SLIPSTREAM_WINDOWS_DECODER_MF").is_some();
+            let use_mf = uses_mf_backend();
             let dec: Box<dyn Decoder> = if use_mf {
                 Box::new(mf::MfDecoder::new(mode.width, mode.height, codec)?)
             } else {
@@ -363,7 +481,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                 break;
             }
             if let Some(m) = delivered.lock().unwrap().take() {
-                if (m.width, m.height) != sized {
+                if let Err(e) = validate_mode(&m, codec, "delivered mode") {
+                    tracing::warn!(error = %e, "not adopting an invalid delivered mode");
+                } else if (m.width, m.height) != sized {
                     tracing::info!(
                         from_w = sized.0,
                         from_h = sized.1,
@@ -464,6 +584,48 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
 mod tests {
     use super::*;
 
+    /// The bug this guards: `Hello` used to advertise AV1 unconditionally while the default
+    /// `ffmpeg.exe` backend refuses it, so a host could pick a codec the client cannot decode.
+    #[test]
+    fn the_default_ffmpeg_backend_does_not_advertise_av1() {
+        let caps = advertised_codecs(false, || true);
+        assert_eq!(
+            caps & CODEC_AV1,
+            0,
+            "AV1 must not be advertised when the ffmpeg backend cannot decode it"
+        );
+        assert_eq!(caps & CODEC_H264, CODEC_H264);
+        assert_eq!(caps & CODEC_HEVC, CODEC_HEVC);
+        assert_eq!(
+            caps,
+            ff::supported_codecs(),
+            "the advertisement must be exactly what the backend accepts"
+        );
+    }
+
+    /// Media Foundation can decode AV1 only when the AV1 Video Extension is installed, so the
+    /// advertisement follows the probe instead of assuming the codec exists.
+    #[test]
+    fn the_mf_backend_advertises_av1_only_when_it_is_installed() {
+        assert_eq!(
+            advertised_codecs(true, || false) & CODEC_AV1,
+            0,
+            "no AV1 decoder means no AV1 in the offer"
+        );
+        assert_ne!(
+            advertised_codecs(true, || true) & CODEC_AV1,
+            0,
+            "an installed AV1 decoder means AV1 is offered"
+        );
+        for caps in [
+            advertised_codecs(true, || false),
+            advertised_codecs(true, || true),
+        ] {
+            assert_eq!(caps & CODEC_H264, CODEC_H264);
+            assert_eq!(caps & CODEC_HEVC, CODEC_HEVC);
+        }
+    }
+
     #[test]
     fn zero_frames_maps_to_zero_frames() {
         assert_eq!(
@@ -530,6 +692,74 @@ mod tests {
                 .monitor_id,
             None
         );
+    }
+
+    fn mode(w: u32, h: u32, hz: u32) -> Mode {
+        Mode {
+            width: w,
+            height: h,
+            refresh_hz: hz,
+        }
+    }
+
+    #[test]
+    fn a_normal_welcome_mode_is_accepted() {
+        assert!(validate_mode(&mode(2560, 1440, 240), CODEC_HEVC, "Welcome").is_ok());
+        assert!(validate_mode(&mode(1920, 1080, 144), CODEC_H264, "Welcome").is_ok());
+        // 8192 is the HEVC/AV1 limit and is inclusive; 4K is fine for H.264.
+        assert!(validate_mode(&mode(8192, 8192, 60), CODEC_AV1, "Welcome").is_ok());
+        assert!(validate_mode(&mode(4096, 2160, 60), CODEC_H264, "Welcome").is_ok());
+    }
+
+    #[test]
+    fn zero_geometry_is_rejected() {
+        for (w, h) in [(0, 1080), (1920, 0), (0, 0)] {
+            let err = validate_mode(&mode(w, h, 60), CODEC_HEVC, "Welcome").unwrap_err();
+            assert!(err.to_string().contains("zero dimension"), "{err}");
+            assert!(err.to_string().contains("Welcome"), "{err}");
+        }
+    }
+
+    #[test]
+    fn odd_geometry_is_rejected() {
+        for (w, h) in [(1921, 1080), (1920, 1081)] {
+            let err = validate_mode(&mode(w, h, 60), CODEC_HEVC, "Welcome").unwrap_err();
+            assert!(err.to_string().contains("odd"), "{err}");
+        }
+    }
+
+    #[test]
+    fn absurd_geometry_is_rejected_per_codec_limit() {
+        // HEVC/AV1 accept up to 8192, H.264 only to 4096.
+        assert!(validate_mode(&mode(8193, 2160, 60), CODEC_HEVC, "Welcome").is_err());
+        let err = validate_mode(&mode(8192, 2160, 60), CODEC_H264, "Welcome").unwrap_err();
+        assert!(err.to_string().contains("4096"), "{err}");
+        // u32::MAX is decoded from four peer-controlled bytes; it must not size a buffer.
+        assert!(validate_mode(&mode(u32::MAX, u32::MAX, 60), CODEC_AV1, "Welcome").is_err());
+    }
+
+    #[test]
+    fn out_of_range_refresh_is_rejected() {
+        assert!(validate_mode(&mode(1920, 1080, 0), CODEC_HEVC, "Welcome").is_err());
+        assert!(
+            validate_mode(&mode(1920, 1080, MAX_REFRESH_HZ + 1), CODEC_HEVC, "Welcome").is_err()
+        );
+        assert!(validate_mode(&mode(1920, 1080, MAX_REFRESH_HZ), CODEC_HEVC, "Welcome").is_ok());
+    }
+
+    #[test]
+    fn unknown_codec_byte_is_rejected() {
+        let err = validate_mode(&mode(1920, 1080, 60), 0x7f, "Welcome").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown negotiated codec byte"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reconfigured_mode_rejection_names_its_source() {
+        let err = validate_mode(&mode(0, 0, 0), CODEC_HEVC, "host Reconfigured").unwrap_err();
+        assert!(err.to_string().contains("host Reconfigured"), "{err}");
     }
 
     #[test]

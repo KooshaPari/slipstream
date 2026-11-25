@@ -11,13 +11,13 @@
 
 use crate::present::{DecodedFrame, Decoder};
 use anyhow::{anyhow, bail, Context, Result};
+use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
 use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 
 /// The host's negotiated `CODEC_*` byte (from `slipstream_core::quic`), mapped to an MF subtype.
 fn subtype_for(codec: u8) -> Result<GUID> {
-    use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
     match codec {
         CODEC_HEVC => Ok(MFVideoFormat_HEVC),
         CODEC_H264 => Ok(MFVideoFormat_H264),
@@ -28,6 +28,79 @@ fn subtype_for(codec: u8) -> Result<GUID> {
 
 fn pack_size(width: u32, height: u32) -> u64 {
     ((width as u64) << 32) | height as u64
+}
+
+/// Human name of a negotiated codec byte, for the messages an operator has to act on.
+fn codec_name(codec: u8) -> &'static str {
+    match codec {
+        CODEC_HEVC => "HEVC",
+        CODEC_AV1 => "AV1",
+        _ => "H.264",
+    }
+}
+
+/// Enumerate a synchronous NV12 decoder MFT for `sub` and hand back the first activation.
+///
+/// Shared by [`MfDecoder::new`] and [`supports_av1`] so the `Hello` advertisement and the decoder
+/// that runs cannot disagree about what this install can decode. Every activation other than the
+/// returned one is released.
+fn find_decoder_activate(sub: GUID) -> Result<Option<IMFActivate>> {
+    let input_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: sub,
+    };
+    let output_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: MFVideoFormat_NV12,
+    };
+    let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            MFT_ENUM_FLAG_SYNCMFT,
+            Some(&input_info),
+            Some(&output_info),
+            &mut activates,
+            &mut count,
+        )
+    }
+    .context("MFTEnumEx(video decoder)")?;
+    // `activates` is a CoTaskMem array of `count` IMFActivate pointers, not a single pointer.
+    // Read it through a bounded slice so the count the API just reported is the only bound in
+    // play, then release every activation we were handed: CoTaskMemFree frees the *array*, not
+    // the COM objects it points at, so skipping any of them leaks a reference.
+    let mut chosen: Option<IMFActivate> = None;
+    if count > 0 && !activates.is_null() {
+        // SAFETY: `MFTEnumEx` succeeded, so it allocated `count` consecutive
+        // `IMFActivate*` slots at `activates`; `Option<IMFActivate>` is layout-compatible
+        // with that nullable COM pointer.
+        let slots: &[Option<IMFActivate>] =
+            unsafe { std::slice::from_raw_parts(activates, count as usize) };
+        chosen = slots.iter().find_map(|slot| slot.clone());
+    }
+    if count > 0 && !activates.is_null() {
+        for i in 0..count as usize {
+            // SAFETY: element `i` of the array described above; dropping it in place releases
+            // the reference the API transferred to us without moving it out of the array.
+            unsafe { std::ptr::drop_in_place(activates.add(i)) };
+        }
+    }
+    // Hand the CoTaskMem array back before any early return.
+    unsafe { CoTaskMemFree(Some(activates as *const _ as *const core::ffi::c_void)) };
+    Ok(chosen)
+}
+
+/// Whether this Windows install has an AV1 decoder MFT.
+///
+/// AV1 is not part of the base OS: decode needs the AV1 Video Extension, which may be absent. The
+/// `Hello` advertisement calls this so a machine without it never negotiates an AV1 stream. Every
+/// failure reads as "no AV1": the advertisement must not promise a decode the session cannot do.
+pub fn supports_av1() -> bool {
+    if unsafe { MFStartup(MF_VERSION, 0) }.is_err() {
+        return false;
+    }
+    matches!(find_decoder_activate(MFVideoFormat_AV1), Ok(Some(_)))
 }
 
 pub struct MfDecoder {
@@ -57,6 +130,119 @@ enum InputFmt {
     LengthPrefixed,
 }
 
+/// A locked Media Foundation buffer that unlocks itself on drop.
+///
+/// `convert` used to call `Lock2D`/`Lock` and never unlock: the early returns (a failed lock, a
+/// null pointer) and the normal path all left the MFT's buffer locked for the life of the decoder.
+/// A guard makes the release unconditional on every path — including `?`, `return None`, and a
+/// panic — so it cannot be forgotten again.
+struct LockedBuffer<'a> {
+    buffer: &'a IMFMediaBuffer,
+    /// Present when the buffer exposed `IMF2DBuffer`; then `Unlock2D` is the matching release.
+    two_d: Option<IMF2DBuffer>,
+    ptr: *mut u8,
+    pitch: i32,
+    /// Test-only: set by `Drop`. `MFCreateMemoryBuffer`'s own `Lock`/`Unlock` do not enforce
+    /// exclusivity, so a test cannot observe the platform lock state — but it can observe that the
+    /// release ran, which is the property the old code lacked.
+    #[cfg(test)]
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for LockedBuffer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: both unlock calls pair with the lock taken in `lock_buffer`, on the same
+        // interface pointer, and run exactly once.
+        unsafe {
+            match self.two_d.as_ref() {
+                Some(b2) => {
+                    let _ = b2.Unlock2D();
+                }
+                None => {
+                    let _ = self.buffer.Unlock();
+                }
+            }
+        }
+        #[cfg(test)]
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a locked 2D plane spans the NV12 image the caller will read.
+///
+/// NV12 in one plane is `pitch * rows * 3/2` bytes: the luma plane at `pitch` bytes per row and the
+/// interleaved UV plane at the same stride for half as many rows. A locked buffer whose stride is
+/// too small (or a nonsensical zero/negative stride) is short, and reading `need_bytes` from it
+/// would cross the end of the allocation. `Lock2D` reports the stride but no length, so this is the
+/// only bound available on that path: the flat path checks `GetMaxLength` instead.
+fn lock2d_covers(pitch: i32, rows: usize, need_bytes: usize) -> bool {
+    let stride = pitch.unsigned_abs() as usize;
+    if stride == 0 || rows == 0 {
+        return false;
+    }
+    stride.saturating_mul(rows).saturating_mul(3) / 2 >= need_bytes
+}
+
+/// Lock `buffer` for reading, preferring `IMF2DBuffer` (which also reports the real stride).
+///
+/// `None` means the buffer could not be locked, its pointer was null, or a flat buffer reported
+/// fewer than `need_bytes` bytes (a short buffer must not be read past its allocation). Every
+/// failure path unlocks before returning, so callers cannot leak the lock.
+fn lock_buffer<'a>(
+    buffer: &'a IMFMediaBuffer,
+    fallback_stride: i32,
+    rows: usize,
+    need_bytes: usize,
+) -> Option<LockedBuffer<'a>> {
+    use windows::core::Interface;
+    // Prefer the 2D interface (it reports the real stride), but a plain memory buffer can expose
+    // `IMF2DBuffer` and still refuse `Lock2D`; that is not a failure, it means the flat path below
+    // is the right one. Giving up here was itself a way `convert` lost frames.
+    if let Ok(b2) = buffer.cast::<IMF2DBuffer>() {
+        let mut ptr = std::ptr::null_mut();
+        let mut pitch = 0i32;
+        // SAFETY: the interface came from this buffer; `Lock2D` fills both out-params.
+        if unsafe { b2.Lock2D(&mut ptr, &mut pitch) }.is_ok() && !ptr.is_null() {
+            // `Lock2D` reports the stride but not the length, so a buffer whose stride times rows
+            // is short of the image must be refused here or `nv12_to_bgra` reads past its end.
+            if lock2d_covers(pitch, rows, need_bytes) {
+                return Some(LockedBuffer {
+                    buffer,
+                    two_d: Some(b2),
+                    ptr,
+                    pitch,
+                    #[cfg(test)]
+                    released: Default::default(),
+                });
+            }
+            // Too short: release the 2D lock and let the flat path decide with its own bound.
+        }
+        let _ = unsafe { b2.Unlock2D() };
+    }
+    // `GetMaxLength` is the allocation size. `Lock`'s current-length out-param is 0 until data is
+    // written, so it cannot be used as the bound; checking before locking also means a refusal
+    // never takes a lock that would need releasing.
+    let max = unsafe { buffer.GetMaxLength() }.unwrap_or(0);
+    if (max as usize) < need_bytes {
+        return None;
+    }
+    let mut ptr = std::ptr::null_mut();
+    // SAFETY: `Lock` pairs with the `Unlock` in `Drop`.
+    if unsafe { buffer.Lock(&mut ptr, None, None) }.is_err() || ptr.is_null() {
+        let _ = unsafe { buffer.Unlock() };
+        return None;
+    }
+    Some(LockedBuffer {
+        buffer,
+        two_d: None,
+        ptr,
+        pitch: fallback_stride,
+        #[cfg(test)]
+        released: Default::default(),
+    })
+}
+
 impl MfDecoder {
     /// Build a decoder for `codec` at the negotiated `width`x`height`. Fails (never silently) when
     /// this Windows install has no decoder MFT for the codec.
@@ -67,58 +253,16 @@ impl MfDecoder {
         let sub = subtype_for(codec)?;
         unsafe { MFStartup(MF_VERSION, 0) }.context("MFStartup")?;
 
-        // Ask for a *synchronous* decoder that outputs NV12 — the shape every MFT offers.
-        let input_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: sub,
-        };
-        let output_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: MFVideoFormat_NV12,
-        };
-        let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count = 0u32;
-        unsafe {
-            MFTEnumEx(
-                MFT_CATEGORY_VIDEO_DECODER,
-                MFT_ENUM_FLAG_SYNCMFT,
-                Some(&input_info),
-                Some(&output_info),
-                &mut activates,
-                &mut count,
-            )
-        }
-        .context("MFTEnumEx(video decoder)")?;
-        // `activates` is a CoTaskMem array of `count` IMFActivate pointers, not a single pointer.
-        // Read it through a bounded slice so the count the API just reported is the only bound in
-        // play, then release every activation we were handed: CoTaskMemFree frees the *array*, not
-        // the COM objects it points at, so skipping any of them leaks a reference.
-        let mut chosen: Option<IMFActivate> = None;
-        if count > 0 && !activates.is_null() {
-            // SAFETY: `MFTEnumEx` succeeded, so it allocated `count` consecutive
-            // `IMFActivate*` slots at `activates`; `Option<IMFActivate>` is layout-compatible
-            // with that nullable COM pointer.
-            let slots: &[Option<IMFActivate>] =
-                unsafe { std::slice::from_raw_parts(activates, count as usize) };
-            chosen = slots.iter().find_map(|slot| slot.clone());
-        }
-        if count > 0 && !activates.is_null() {
-            for i in 0..count as usize {
-                // SAFETY: element `i` of the array described above; dropping it in place releases
-                // the reference the API transferred to us without moving it out of the array.
-                unsafe { std::ptr::drop_in_place(activates.add(i)) };
-            }
-        }
-        // Hand the CoTaskMem array back before any early return.
-        unsafe { CoTaskMemFree(Some(activates as *const _ as *const core::ffi::c_void)) };
-        let activate = chosen.ok_or_else(|| {
+        // Ask for a *synchronous* decoder that outputs NV12 — the shape every MFT offers. The
+        // enumerator is shared with `supports_av1`, which is what the `Hello` advertisement uses.
+        let activate = find_decoder_activate(sub)?.ok_or_else(|| {
             anyhow!(
-                "no Media Foundation {} decoder on this Windows install (is the HEVC Video \
-                 Extension installed?)",
-                if sub == MFVideoFormat_HEVC {
-                    "HEVC"
+                "no Media Foundation {} decoder on this Windows install{}",
+                codec_name(codec),
+                if codec == CODEC_H264 {
+                    ""
                 } else {
-                    "H.264"
+                    " (is the matching Video Extension installed?)"
                 }
             )
         })?;
@@ -293,36 +437,31 @@ impl MfDecoder {
 
     fn convert(&mut self, sample: &IMFSample) -> Option<DecodedFrame> {
         let buffer = unsafe { sample.GetBufferByIndex(0) }.ok()?;
-        use windows::core::Interface;
-        let (ptr, pitch) = match buffer.cast::<IMF2DBuffer>() {
-            Ok(b2) => {
-                let mut p = std::ptr::null_mut();
-                let mut pitch = 0i32;
-                unsafe { b2.Lock2D(&mut p, &mut pitch) }.ok()?;
-                (p, pitch)
-            }
-            Err(_) => {
-                let mut p = std::ptr::null_mut();
-                let mut len = 0u32;
-                unsafe { buffer.Lock(&mut p, None, Some(&mut len)) }.ok()?;
-                (p, self.out_stride.max(self.width as i32))
-            }
-        };
-        if ptr.is_null() {
-            return None;
-        }
+        // NV12 is 1.5 bytes/pixel; a flat buffer shorter than that is refused by `lock_buffer`.
+        let need = (self.out_w as usize)
+            .saturating_mul(self.out_h as usize)
+            .saturating_mul(3)
+            / 2;
+        // The guard unlocks on drop, so every return below (including `?`) releases the buffer.
+        let locked = lock_buffer(
+            &buffer,
+            self.out_stride.max(self.width as i32),
+            self.out_h as usize,
+            need,
+        )?;
         let n = (self.out_w as usize) * (self.out_h as usize) * 4;
         let mut pixels = std::mem::take(&mut self.scratch);
         pixels.resize(n, 0);
         unsafe {
             nv12_to_bgra(
-                ptr,
-                pitch,
+                locked.ptr,
+                locked.pitch,
                 self.out_w as usize,
                 self.out_h as usize,
                 &mut pixels,
             );
         }
+        drop(locked);
         self.frame_index = self.frame_index.wrapping_add(1);
         Some(DecodedFrame {
             width: self.out_w,
@@ -383,6 +522,58 @@ unsafe fn nv12_to_bgra(yuv: *const u8, pitch: i32, width: usize, height: usize, 
 mod tests {
     use super::*;
 
+    /// `MFStartup` is process-wide and reference-counted; start it once so the two lock tests do
+    /// not race each other's shutdown while a buffer is still alive.
+    fn mf_started() {
+        use std::sync::Once;
+        static START: Once = Once::new();
+        START.call_once(|| {
+            unsafe { MFStartup(MF_VERSION, 0) }.expect("MFStartup");
+        });
+    }
+
+    /// The property the old `convert` violated: the guard releases the lock when it goes away.
+    /// `MFCreateMemoryBuffer` does not enforce exclusivity on `Lock`/`Unlock`, so the platform lock
+    /// state is not observable; the guard's `released` flag (set by `Drop`) is, and the buffer is
+    /// lockable again afterwards.
+    #[test]
+    fn the_buffer_lock_is_released_when_the_guard_drops() {
+        use std::sync::atomic::Ordering;
+        mf_started();
+        let buffer = unsafe { MFCreateMemoryBuffer(1024) }.expect("MFCreateMemoryBuffer");
+        let locked = lock_buffer(&buffer, 4, 2, 16).expect("first lock");
+        assert!(
+            !locked.released.load(Ordering::SeqCst),
+            "released while held"
+        );
+        let released = locked.released.clone();
+        drop(locked);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "Drop did not release the lock"
+        );
+        assert!(
+            lock_buffer(&buffer, 4, 2, 16).is_some(),
+            "the buffer is unusable after the release"
+        );
+    }
+
+    /// A flat buffer smaller than the NV12 image is refused *and* left unlocked, so the refusal
+    /// path cannot leak the lock either.
+    #[test]
+    fn a_short_flat_buffer_is_refused_and_left_unlocked() {
+        mf_started();
+        let buffer = unsafe { MFCreateMemoryBuffer(1024) }.expect("MFCreateMemoryBuffer");
+        assert!(
+            lock_buffer(&buffer, 4, 2, 4096).is_none(),
+            "a 1024-byte buffer must not satisfy a 4096-byte read"
+        );
+        assert!(
+            lock_buffer(&buffer, 4, 2, 16).is_some(),
+            "the refusal path leaked the lock"
+        );
+    }
+
     #[test]
     fn annexb_converts_to_length_prefixed() {
         let au = [0, 0, 0, 1, 0x40, 0x01, 0, 0, 1, 0x42, 0x02, 0x03];
@@ -391,6 +582,22 @@ mod tests {
         assert_eq!(&lp[4..6], &[0x40, 0x01]);
         assert_eq!(&lp[6..10], &3u32.to_be_bytes());
         assert_eq!(&lp[10..13], &[0x42, 0x02, 0x03]);
+    }
+
+    /// `Lock2D` reports a stride but no length, so the stride is the only bound available: a
+    /// 4x2 NV12 image needs 12 bytes, and a stride narrower than the image width does not span it.
+    #[test]
+    fn a_short_2d_plane_fails_the_pitch_check() {
+        let need = 4 * 2 * 3 / 2; // 4x2 NV12
+        assert!(lock2d_covers(4, 2, need), "exact stride and rows must pass");
+        assert!(lock2d_covers(8, 2, need), "padded strides are fine");
+        assert!(lock2d_covers(-4, 2, need), "bottom-up strides are fine");
+        assert!(
+            !lock2d_covers(2, 2, need),
+            "a stride narrower than the image must be refused"
+        );
+        assert!(!lock2d_covers(0, 2, need), "a zero stride must be refused");
+        assert!(!lock2d_covers(4, 0, need), "zero rows must be refused");
     }
 
     #[test]

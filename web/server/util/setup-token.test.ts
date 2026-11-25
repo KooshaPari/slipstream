@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
-import { isLoopbackAddress, setupToken, verifySetupToken } from "./auth";
+import { isLoopbackAddress, ensureSetupToken, setupToken, verifySetupToken } from "./auth";
 
 const ENV_KEYS = [
 	"SLIPSTREAM_UI_SETUP_TOKEN",
@@ -90,6 +90,25 @@ describe("first-run setup token", () => {
 		writeFileSync(join(otherDir, "web-setup-token"), `${"a".repeat(64)}\n`);
 		const otherToken = readFileSync(join(otherDir, "web-setup-token"), "utf8").trim();
 		strictEqual(verifySetupToken(otherToken), false);
+		strictEqual(verifySetupToken(setupToken()), true);
+	});
+
+	test("the setup page creates the first-run token before it shows the form", () => {
+		// Static guard: `setupToken` used to be created lazily and ONLY by the POST handler, so a fresh
+		// install served a form telling the operator to read a file nothing had written yet. The
+		// middleware that serves /setup must create it; removing that call re-opens the dead pointer.
+		const middleware = readFileSync(
+			join(__dirname, "..", "middleware", "auth.ts"),
+			"utf8",
+		);
+		strictEqual(
+			middleware.includes("ensureSetupToken()"),
+			true,
+			"the /setup branch must create the token",
+		);
+		// The helper is best-effort and cache-aware: it never throws, and the token it guarantees is
+		// the one a submission is checked against (file-level creation is pinned by the first test).
+		ensureSetupToken();
 		strictEqual(verifySetupToken(setupToken()), true);
 	});
 

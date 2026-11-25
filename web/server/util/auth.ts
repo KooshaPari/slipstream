@@ -274,6 +274,25 @@ export function setupToken(): string {
 	}
 }
 
+/**
+ * Make sure the first-run token EXISTS, for the request that serves the setup page.
+ *
+ * `setupToken` is created lazily on first use, and the only other caller is the POST handler that
+ * checks a submission. So on a fresh install nothing had created the file when the page told the
+ * operator to read it: the documented path simply did not exist yet. Serving the page is the right
+ * moment - it is the first look at the token the operator is meant to copy.
+ *
+ * Best-effort: an unwritable config directory must not turn the setup page into a 500. The page
+ * still renders, and the POST handler's `setupToken` reports the real failure to whoever submits.
+ */
+export function ensureSetupToken(): void {
+	try {
+		setupToken();
+	} catch {
+		// Leave it to the POST handler, which surfaces the failure with a status code.
+	}
+}
+
 /** Constant-time check of a submitted setup token. Empty submissions never pass. */
 export function verifySetupToken(candidate: string): boolean {
 	const expected = setupToken();

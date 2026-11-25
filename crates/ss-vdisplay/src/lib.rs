@@ -520,6 +520,86 @@ pub fn open_mirror(compositor: Compositor, connector: &str) -> Result<Box<dyn Vi
     )?))
 }
 
+/// Which backend [`open_for_monitor`] builds for a session. Pure and public so the decision — that a
+/// per-session head is passed through **verbatim** to the open, and that an absent one keeps the
+/// host-wide path — is testable without a live compositor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DisplayTarget {
+    /// No per-session request: [`open`]'s host-wide (`capture_monitor` pin, else virtual output)
+    /// decision, byte-for-byte unchanged.
+    HostDefault,
+    /// A per-session head, named by its bare connector (`\\.\DISPLAY1`, `HDMI-A-2`, …).
+    Head(String),
+}
+
+/// Classify a per-session monitor request (`Hello::monitor_id`, already resolved to a bare
+/// connector by the handshake) into the open decision. `None`/blank is the legacy host-wide path.
+pub fn display_target(monitor: Option<&str>) -> DisplayTarget {
+    match monitor.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(connector) => DisplayTarget::Head(connector.to_string()),
+        None => DisplayTarget::HostDefault,
+    }
+}
+
+/// Open the display backend for a session, honouring a **per-session** streamed-head request
+/// (`Hello::monitor_id`) over the host-wide [`capture_monitor`] pin.
+///
+/// `None` returns exactly [`open`] — no per-session request means the pinned/virtual decision is
+/// untouched, which is what every pre-existing caller and every client that omits `--monitor` gets.
+/// `Some(connector)` streams that head instead: the **mirror** backend on Linux (the head's own
+/// PipeWire node, which is what `capture_virtual_output` consumes) and the named-head mirror on
+/// Windows (whose `VirtualOutput::windows_head` then aims WGC/DXGI at it).
+///
+/// The id has already been validated against the enumerated heads by the handshake
+/// (`slipstream_host::capture::resolve_session_monitor_id`), so an unknown name is a caller bug
+/// here; the backend still refuses it by name rather than silently streaming another screen.
+///
+/// **Limitation, by design of the shared-desktop backends:** the absolute-input anchor is
+/// host-lifetime and host-wide (`ss_inject::set_absolute_anchor`, `design/per-monitor-portal-capture.md`
+/// §7.2), so a per-session head that differs from the pinned/anchored one streams correctly but
+/// *absolute* pointer input stays aimed at the host anchor (relative/capture-mode input is
+/// unaffected). Re-aiming the shared injector per session is a shared-desktop redesign, not a seam.
+pub fn open_for_monitor(
+    compositor: Compositor,
+    monitor: Option<&str>,
+) -> Result<Box<dyn VirtualDisplay>> {
+    match display_target(monitor) {
+        DisplayTarget::HostDefault => open(compositor),
+        DisplayTarget::Head(connector) => open_head(compositor, &connector),
+    }
+}
+
+/// Open the mirror backend for one named head — the `DisplayTarget::Head` arm of
+/// [`open_for_monitor`].
+fn open_head(compositor: Compositor, connector: &str) -> Result<Box<dyn VirtualDisplay>> {
+    #[cfg(target_os = "linux")]
+    {
+        // Same backend `open_mirror` builds. No pin degradation here on purpose: the caller asked
+        // for THIS head, and a differing screen is the failure worth refusing over (§5.2), so a
+        // missing/empty head list surfaces the backend's own error instead of a virtual output the
+        // client never asked for.
+        Ok(Box::new(mirror::MirrorDisplay::new(
+            compositor,
+            connector.to_string(),
+        )?))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match compositor {
+            Compositor::Windows => Ok(Box::new(windows::WindowsMirrorDisplay::new_for(connector)?)),
+            other => anyhow::bail!(
+                "compositor '{}' is Linux-only on this host (Windows drives the windows backend)",
+                other.id(),
+            ),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (compositor, connector);
+        anyhow::bail!("no virtual-display backend on this platform yet")
+    }
+}
+
 /// Readiness probe for `compositor`: is it up and able to create a virtual output *right
 /// now*? A session-bringup script polls this (via `slipstream-host probe-compositor`) to gate
 /// on actual readiness instead of racing the compositor with a blind sleep.
@@ -832,6 +912,25 @@ pub use headless::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-session head must reach the open decision verbatim, and an absent/blank request must
+    /// stay on the host-wide path (`open`'s `capture_monitor` pin, else the virtual output) — the
+    /// pre-existing behaviour every caller and every `--monitor`-less client gets.
+    #[test]
+    fn a_per_session_head_reaches_the_open_decision_and_absence_keeps_the_host_path() {
+        assert_eq!(
+            display_target(Some("HDMI-A-2")),
+            DisplayTarget::Head("HDMI-A-2".into())
+        );
+        // Resolved ids arrive trimmed by the handshake; trimming again is idempotent and keeps a
+        // stray wrapper from turning into a head name that backend resolution would then miss.
+        assert_eq!(
+            display_target(Some("  \\\\.\\DISPLAY2 ")),
+            DisplayTarget::Head("\\\\.\\DISPLAY2".into())
+        );
+        assert_eq!(display_target(None), DisplayTarget::HostDefault);
+        assert_eq!(display_target(Some("   ")), DisplayTarget::HostDefault);
+    }
 
     #[test]
     fn exclusive_is_downgraded_when_a_physical_head_is_present_or_unknown() {

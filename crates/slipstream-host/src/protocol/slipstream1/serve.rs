@@ -298,8 +298,15 @@ pub(super) async fn serve_session(
         // Read once here, like the identity above: this session opened its display under whatever
         // the pin said at bring-up, so a console change mid-session must not retroactively change
         // what THIS session answers a Reconfigure with.
-        let mirrored =
-            source == Slipstream1Source::Virtual && crate::vdisplay::capture_monitor().is_some();
+        // A client's per-session `Hello::monitor_id` selects the same kind of mirror (a physical
+        // head we don't own), so it is gated the same way — the head runs at its owner's mode and
+        // the mirror backend ignores the requested one.
+        let per_session_head = hello
+            .monitor_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        let mirrored = source == Slipstream1Source::Virtual
+            && (crate::vdisplay::capture_monitor().is_some() || per_session_head);
         reconfig_allowed(compositor, per_client_mode_identity, mirrored)
     };
     // Negotiated codec (HEVC / H.264 / AV1), derived from the Welcome. `Copy`, so the control task's

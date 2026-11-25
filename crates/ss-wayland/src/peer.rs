@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use wayland_client::Connection;
 
 /// The `/proc` mount, for callers with no reason to read another tree.
@@ -265,16 +266,39 @@ pub fn peer_is(pid: i32, rule: PeerRule, proc_root: &Path) -> bool {
 /// Resolve the Wayland socket named by the process environment, without connecting.
 ///
 /// Absolute `WAYLAND_DISPLAY` wins outright; a relative one joins `XDG_RUNTIME_DIR`. `None` when
-/// either is missing or the display name is empty — the caller decides whether that is fatal.
+/// either is missing, the display name is empty, or a *relative* `XDG_RUNTIME_DIR` would have to be
+/// joined — the caller decides whether that is fatal.
+///
+/// The relative-runtime-dir refusal is deliberate: the XDG base-directory spec requires
+/// `XDG_RUNTIME_DIR` to be absolute, and joining a relative one would root the socket path at
+/// whatever this process's working directory happens to be, making a caller-controlled tree the
+/// runtime root.
 pub fn env_socket_path() -> Option<PathBuf> {
-    let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY")?);
+    resolve_env_socket(
+        std::env::var_os("WAYLAND_DISPLAY"),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+    )
+}
+
+/// The pure half of [`env_socket_path`]: same rules, but fed the two variables explicitly so the
+/// relative/absolute decisions are unit-testable without mutating the process environment.
+fn resolve_env_socket(
+    display: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let display = PathBuf::from(display?);
     if display.as_os_str().is_empty() {
         return None;
     }
     if display.is_absolute() {
         return Some(display);
     }
-    Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join(display))
+    let runtime = PathBuf::from(runtime?);
+    if !runtime.is_absolute() {
+        tracing::debug!("XDG_RUNTIME_DIR is not absolute; ignoring the environment Wayland socket");
+        return None;
+    }
+    Some(runtime.join(display))
 }
 
 /// Connect to `path` and hand out the connection only if the peer passes `rule`.
@@ -380,16 +404,64 @@ pub fn connect_env(rule: PeerRule, proc_root: &Path) -> Result<Connection> {
     }
 }
 
+/// Set by whichever connection attempt adopts the inherited `WAYLAND_SOCKET` descriptor.
+///
+/// Reading and removing an environment variable is not atomic, so two concurrent [`connect_env`]
+/// calls can both observe the value and both wrap the same descriptor number in an owning
+/// `UnixStream`. The first drop would then close a descriptor the second still believes it owns —
+/// the launcher's compositor socket, out from under a live session. This flag makes exactly one
+/// attempt the winner; a loser fails closed instead of taking ownership of a descriptor it must not
+/// close (or use) a second time.
+static INHERITED_FD_ADOPTED: AtomicBool = AtomicBool::new(false);
+
+/// Claim the right to adopt the inherited descriptor, or report that another attempt already did.
+fn claim_inherited_fd() -> Result<()> {
+    if INHERITED_FD_ADOPTED.swap(true, Ordering::SeqCst) {
+        bail!("WAYLAND_SOCKET was already adopted by an earlier connection attempt");
+    }
+    Ok(())
+}
+
+/// Mark `fd` close-on-exec.
+///
+/// The adopted compositor socket is a live, authenticated connection to KWin (or the session
+/// compositor) for the rest of the process's life; without `FD_CLOEXEC` every child this process
+/// `exec`s inherits it and can speak the host's Wayland session (`exit(2)`-style fd leak). Rust's
+/// `UnixStream::connect` sets this on sockets it opens itself; a descriptor that arrives from the
+/// launcher does not.
+fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: `fcntl` with `F_GETFD`/`F_SETFD` reads and writes only this descriptor's own flag
+    // word; `fd` is a live descriptor supplied by the caller and no user memory is involved.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if flags & libc::FD_CLOEXEC != 0 {
+        return Ok(());
+    }
+    // SAFETY: as above; `F_SETFD` only stores `arg` into the descriptor's flag word, and
+    // `flags | FD_CLOEXEC` preserves every flag that was already set.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Authenticate and adopt the connected socket passed in `WAYLAND_SOCKET`.
 ///
-/// The variable is removed before the fd is used, so a second connect cannot inherit the same
-/// descriptor. Ownership is taken with `from_raw_fd`, matching `wayland-client`'s own contract for
-/// this variable; an authentication failure drops the stream (closing the fd) and returns an error.
+/// Three things happen before the descriptor is used. A process-wide claim (see
+/// [`INHERITED_FD_ADOPTED`]) makes exactly one attempt the owner, because removing the variable is
+/// not atomic and cannot do that by itself. `FD_CLOEXEC` is set so the authenticated compositor
+/// socket is not inherited across `exec`. Only then is ownership taken with `from_raw_fd`, matching
+/// `wayland-client`'s own contract for this variable; an authentication failure drops the stream
+/// (closing the fd once) and returns an error.
 fn connect_inherited_fd(
     fd: &std::ffi::OsStr,
     rule: PeerRule,
     proc_root: &Path,
 ) -> Result<Connection> {
+    claim_inherited_fd()?;
     let parsed = fd
         .to_str()
         .and_then(|text| text.parse::<i32>().ok())
@@ -400,10 +472,20 @@ fn connect_inherited_fd(
     // ever constructing the owned stream that would close it.
     let credentials = peer_credentials_fd(parsed)
         .context("WAYLAND_SOCKET is not a connected Unix socket with peer credentials")?;
+    if let Err(error) = set_cloexec(parsed) {
+        // This attempt is the one claimed owner and the number is proven to be a connected Unix
+        // socket, so closing it here cannot touch an unrelated descriptor.
+        // SAFETY: as in the `from_raw_fd` below — owned by this attempt, closed exactly once here.
+        unsafe {
+            libc::close(parsed);
+        }
+        return Err(anyhow::Error::from(error)).context("mark WAYLAND_SOCKET close-on-exec");
+    }
     // SAFETY: `WAYLAND_SOCKET` carries a connected socket the launcher handed this process, and
     // taking ownership of it exactly once is this variable's documented contract. The number is
-    // proven to be a connected Unix socket above, and the peer is authenticated below before the
-    // connection is used; on that failure the stream is dropped, closing the descriptor once.
+    // proven to be a connected Unix socket above, the claim above makes this the only owner, and
+    // the peer is authenticated below before the connection is used; on that failure the stream is
+    // dropped, closing the descriptor once.
     let stream = unsafe { UnixStream::from_raw_fd(parsed) };
     authenticate_with(credentials, rule, proc_root, "WAYLAND_SOCKET")
         .map_err(anyhow::Error::msg)?;
@@ -613,5 +695,81 @@ mod tests {
         assert_eq!(wrote, 1);
         // SAFETY: `fds[1]` is still owned by this test and is closed exactly once here.
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+    }
+
+    /// A relative `XDG_RUNTIME_DIR` must never be joined: the join would root the socket at this
+    /// process's working directory, so a caller-controlled tree would become the runtime root.
+    #[test]
+    fn a_relative_runtime_dir_is_refused() {
+        assert_eq!(
+            resolve_env_socket(
+                Some(std::ffi::OsString::from("wayland-0")),
+                Some(std::ffi::OsString::from("run/user/1000"))
+            ),
+            None,
+            "a relative XDG_RUNTIME_DIR must not be used as the socket root"
+        );
+    }
+
+    #[test]
+    fn an_absolute_display_ignores_a_relative_runtime_dir() {
+        assert_eq!(
+            resolve_env_socket(
+                Some(std::ffi::OsString::from("/tmp/wayland-9")),
+                Some(std::ffi::OsString::from("run/user/1000"))
+            ),
+            Some(PathBuf::from("/tmp/wayland-9"))
+        );
+    }
+
+    #[test]
+    fn a_relative_display_joins_an_absolute_runtime_dir() {
+        assert_eq!(
+            resolve_env_socket(
+                Some(std::ffi::OsString::from("wayland-0")),
+                Some(std::ffi::OsString::from("/run/user/1000"))
+            ),
+            Some(PathBuf::from("/run/user/1000/wayland-0"))
+        );
+    }
+
+    /// The adopted descriptor outlives the session and must not cross `exec`: `FD_CLOEXEC` is set
+    /// before the socket is wrapped, so a child of this process cannot speak the compositor session.
+    #[test]
+    fn an_adopted_descriptor_is_close_on_exec() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `socketpair(2)` writes exactly two descriptors into the two-element array; both
+        // ends are owned by this test and closed exactly once at the end.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        // The same pre-flight check `connect_inherited_fd` runs: a connected Unix socket.
+        assert!(peer_credentials_fd(fds[0]).is_some());
+        set_cloexec(fds[0]).unwrap();
+        // SAFETY: `fcntl` reads the descriptor flags of `fds[0]`, a live descriptor owned here.
+        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "an adopted compositor socket must be close-on-exec"
+        );
+        // SAFETY: both ends were created by the `socketpair(2)` above and are owned by this test,
+        // which closes each exactly once.
+        unsafe {
+            assert_eq!(libc::close(fds[0]), 0);
+            assert_eq!(libc::close(fds[1]), 0);
+        }
+    }
+
+    /// Reading and removing `WAYLAND_SOCKET` is not atomic, so exactly one attempt may adopt the
+    /// descriptor; a second must fail closed rather than double-own (and double-close) the number.
+    #[test]
+    fn the_inherited_fd_has_a_single_winner() {
+        assert!(claim_inherited_fd().is_ok(), "the first attempt claims it");
+        let second = claim_inherited_fd();
+        assert!(second.is_err(), "a second attempt must not adopt it again");
+        assert!(
+            format!("{:#}", second.unwrap_err()).contains("already adopted"),
+            "the refusal explains itself"
+        );
     }
 }

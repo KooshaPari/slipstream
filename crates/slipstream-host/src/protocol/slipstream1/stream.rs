@@ -1513,6 +1513,37 @@ fn session_watcher_loop(tx: std::sync::mpsc::Sender<SessionSwitch>, stop: Arc<At
     }
 }
 
+/// How long teardown waits for a submission already in flight to leave the submit gate before
+/// releasing the display anyway. Bounded on purpose: the whole point of abandoning a thread is
+/// that a wedged driver call must not hold the session slot hostage, so a submit that never
+/// returns is reported and stepped over, exactly as the stream thread itself is.
+pub(super) const SUBMIT_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Take `gate` once, giving an in-flight submission up to `budget` to finish, and drop it again.
+///
+/// Called by teardown after `abandoned` is set: returning `true` proves no submission is running
+/// and (because the flag is already visible to every check made under this gate) that none can
+/// start, which is what makes the display release that follows safe. `false` = a submission is
+/// still inside the driver call; the caller logs it and proceeds.
+pub(super) async fn wait_submit_idle(
+    gate: &std::sync::Mutex<()>,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        // Poisoning means a holder panicked; the gate is a bare `()`, so it carries no state to
+        // distrust and taking it is safe.
+        match gate.try_lock() {
+            Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => return true,
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+}
+
 /// All per-session inputs for [`virtual_stream`], bundled so the session entry
 /// is one moved value instead of a 13-positional-argument `#[allow(too_many_arguments)]` signature
 /// (Goal-1 stage 4, plan §2.4). Everything is **owned**  -  the receivers move in (`virtual_stream` is their
@@ -1533,6 +1564,13 @@ pub(super) struct SessionContext {
     /// submission so an abandoned thread stops touching the encoder and drops it promptly instead
     /// of racing the driver as the process tears down.
     pub(super) abandoned: Arc<AtomicBool>,
+    /// The gate that makes `abandoned` bite. The flag alone is advisory: it is read at the top of
+    /// a submission, and teardown can release the capture between that read and the driver call
+    /// that copies from it. This mutex closes that window: the encode loop holds it across the
+    /// check AND `submit`, and teardown sets `abandoned` and then takes it once before releasing
+    /// anything (`wait_submit_idle`). After that point every later check sees `true`, so no
+    /// submission can start, and any submission already past its check has returned.
+    pub(super) submit_gate: Arc<std::sync::Mutex<()>>,
     /// Deliberate-quit flag (set when the client closed with `QUIT_CODE`): the display lease reads it
     /// on teardown to skip the keep-alive linger for a user "stop" (vs. an unwanted disconnect).
     pub(super) quit: Arc<AtomicBool>,
@@ -1843,6 +1881,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         seconds,
         stop,
         abandoned,
+        submit_gate,
         quit,
         reconfig,
         keyframe,
@@ -3616,17 +3655,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // assign next. The RFI backends pin their frame numbering to it.
         let wire_index = au_seq.wrapping_add(inflight.len() as u32);
         // An abandoned thread (see `SessionContext::abandoned`) must not submit: the session's
-        // virtual output — and with it the capture buffers this frame points at — is already
+        // virtual output - and with it the capture buffers this frame points at - is already
         // released by teardown, and copying from those unmapped dmabufs is the teardown SIGSEGV
-        // in `NvencCudaEncoder::submit`. Returning here drops the encoder on its owning thread,
-        // which is the ordering the fix is about (not a `catch_unwind` around the driver call).
-        if abandoned.load(Ordering::Relaxed) {
-            return Err(anyhow!(
-                "session abandoned: stream thread outlived the stop grace — dropping the encoder \
-                 instead of submitting against a released capture"
-            ));
-        }
-        if let Err(e) = enc.submit_indexed(&frame, wire_index) {
+        // in `NvencCudaEncoder::submit`. The check and the submit are ONE critical section against
+        // teardown, which takes the same gate before it releases anything: a bare flag leaves the
+        // window between "read false" and "copy from the frame" open, and teardown can win it.
+        // Returning here drops the encoder on its owning thread, which is the ordering the fix is
+        // about (not a `catch_unwind` around the driver call).
+        let submitted = {
+            let _gate = submit_gate.lock().unwrap_or_else(|e| e.into_inner());
+            if abandoned.load(Ordering::Acquire) {
+                return Err(anyhow!(
+                    "session abandoned: stream thread outlived the stop grace - dropping the \
+                     encoder instead of submitting against a released capture"
+                ));
+            }
+            enc.submit_indexed(&frame, wire_index)
+        };
+        if let Err(e) = submitted {
             // A typed-terminal error is a deterministic configuration failure  -  the identical
             // wall on every attempt, so rebuilds can't help. End the session at once with the
             // carried cause (observed: a stale SLIPSTREAM_ENCODER pin vs. the selected adapter

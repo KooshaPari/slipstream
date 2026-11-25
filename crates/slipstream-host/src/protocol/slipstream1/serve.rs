@@ -783,6 +783,11 @@ pub(super) async fn serve_session(
     // flips it on a wedged teardown) can reach the same flag.
     let abandoned = Arc::new(AtomicBool::new(false));
     let abandoned_watch = abandoned.clone();
+    // The gate that pairs with `abandoned` (see `SessionContext::submit_gate`): the stream thread
+    // holds it across the abandon check AND its encoder submit, and teardown takes it once (below)
+    // before it releases the display and its capture buffers.
+    let submit_gate = Arc::new(std::sync::Mutex::new(()));
+    let submit_gate_dp = submit_gate.clone();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
             // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
@@ -845,6 +850,7 @@ pub(super) async fn serve_session(
                     let ctx = SessionContext {
                         session,
                         abandoned,
+                        submit_gate: submit_gate_dp,
                         mode,
                         seconds,
                         stop: stop_stream,
@@ -980,6 +986,19 @@ pub(super) async fn serve_session(
         tracing::warn!(
             grace_s = SIDE_THREAD_JOIN_GRACE.as_secs(),
             "audio/input threads did not exit after the connection closed — detaching them"
+        );
+    }
+    // No submission may still be in flight when the display (and the capture buffers it backs) goes
+    // away. A normal return proves that on its own - the stream thread is the only submitter and it
+    // has joined - but the ABANDONED path does not: that thread is still running, and `abandoned`
+    // alone only tells it to stop, it cannot recall a submit already past the check. Taking the gate
+    // once makes the two orderings exclusive: every later check (made under the same gate) sees the
+    // flag, and any submit that got in first has returned.
+    if !super::stream::wait_submit_idle(&submit_gate, super::stream::SUBMIT_RELEASE_WAIT).await {
+        tracing::warn!(
+            wait_ms = super::stream::SUBMIT_RELEASE_WAIT.as_millis() as u64,
+            "stream thread still inside an encoder submit at teardown - releasing the display \
+             anyway (that submit is the wedged thread's own; see the abandonment log above)"
         );
     }
     // The capture (and our gamescope session's VirtualOutput) are gone by here. If this was the

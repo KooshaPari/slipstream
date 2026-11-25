@@ -82,7 +82,7 @@ the id). Exit code `3` means the session was admitted but the host published zer
 cargo test -p slipstream-windows
 ```
 
-46 tests cover argument parsing, `host:port`/IPv6 handling, TXT advert decoding (fail-closed
+68 tests cover argument parsing, `host:port`/IPv6 handling, TXT advert decoding (fail-closed
 pairing policy), the admission table, every connection phase transition, and `--monitor` validation.
 
 ## Layout

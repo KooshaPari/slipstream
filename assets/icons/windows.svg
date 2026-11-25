@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="windowsGrad" x1="16" y1="16" x2="240" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0B6FB5"/>
+      <stop offset="1" stop-color="#062747"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#windowsGrad)"/>
+  <rect x="52" y="64" width="152" height="104" rx="14" fill="none" stroke="#F2FBFF" stroke-width="16"/>
+  <path d="M112 168 L112 188" fill="none" stroke="#F2FBFF" stroke-width="16" stroke-linecap="round"/>
+  <path d="M84 190 H172" fill="none" stroke="#F2FBFF" stroke-width="16" stroke-linecap="round"/>
+  <path d="M114 92 L146 116 L114 140 Z" fill="#32C3F5"/>
+</svg>

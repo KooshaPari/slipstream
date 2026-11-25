@@ -85,6 +85,8 @@ pub struct FfmpegDecoder {
     /// AUs fed since the last (re)spawn, kept so a fallback can replay them into the new child —
     /// without the opening keyframe's parameter sets the replacement decodes nothing.
     replay: Vec<Vec<u8>>,
+    /// Bytes currently held in `replay`, kept alongside it so the cap is O(1) per AU.
+    replay_bytes: usize,
     pub decoded: u64,
     pub eof: bool,
 }
@@ -107,6 +109,61 @@ const QUEUE_BOUND: usize = 3;
 /// eat memory. Dropping is the correct failure mode — ffmpeg needs a keyframe to resync, and the
 /// host's recovery path supplies one.
 const AU_BACKLOG_MAX: usize = 32 << 20;
+
+/// The protocol's largest legal mode is 8192 px per axis (`ss-encode`'s `Codec::max_dimension` for
+/// HEVC/AV1; 4096 for H.264), so the largest BGRA frame a legal host can send is 8192² × 4 bytes.
+/// A geometry above this is corrupt or hostile: `width * height * 4` is peer-influenced and must
+/// not be used as an allocation size without checking it.
+const MAX_PROTOCOL_DIMENSION: u32 = 8192;
+const MAX_FRAME_BYTES: usize =
+    MAX_PROTOCOL_DIMENSION as usize * MAX_PROTOCOL_DIMENSION as usize * 4;
+
+/// One access unit above this is not video. A live 1440p AU is ~14 KB (see [`AU_BACKLOG_MAX`]) and
+/// a 4K IDR is a few hundred KB; 16 MiB is ~1000× a typical AU, far above any legitimate frame, and
+/// small enough that a hostile length cannot make the writer channel buffer forever.
+const MAX_AU_BYTES: usize = 16 << 20;
+
+/// Bytes retained for the hwaccel-fallback replay. Same budget as the input backlog, so the
+/// decoder's total buffered input — outstanding plus replay — stays bounded at 64 MiB.
+const MAX_REPLAY_BYTES: usize = AU_BACKLOG_MAX;
+
+/// Ceiling on the frames one end-of-input [`FfmpegDecoder::finish`] flush may accumulate. The flush
+/// carries only what ffmpeg already decoded at EOF (its reorder tail, well under a second of video),
+/// and a local `--play` file is drained frame by frame beforehand, so reaching this means a wedged
+/// or hostile decoder. 256 MiB is ~32 1080p BGRA frames.
+const MAX_FINISH_BYTES: usize = 256 << 20;
+
+/// BGRA bytes for `width`x`height`, rejecting a geometry the protocol cannot produce. The products
+/// are checked, so a wrapped pair of `u32`s is an error rather than an under-sized allocation.
+fn checked_frame_bytes(width: u32, height: u32) -> Result<usize> {
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .with_context(|| format!("ffmpeg decoder: {width}x{height} BGRA size overflows usize"))?;
+    if bytes == 0 {
+        bail!("ffmpeg decoder: {width}x{height} has a zero dimension");
+    }
+    if bytes > MAX_FRAME_BYTES {
+        bail!(
+            "ffmpeg decoder: {width}x{height} BGRA is {bytes} bytes, above the {MAX_FRAME_BYTES} \
+             byte frame cap (largest legal mode is {MAX_PROTOCOL_DIMENSION}px per axis)"
+        );
+    }
+    Ok(bytes)
+}
+
+/// Refuse an access unit larger than [`MAX_AU_BYTES`] before it is cloned into the writer channel.
+fn check_au_size(len: usize) -> Result<()> {
+    if len > MAX_AU_BYTES {
+        bail!("ffmpeg decoder: access unit of {len} bytes exceeds the {MAX_AU_BYTES} byte AU cap");
+    }
+    Ok(())
+}
+
+/// Whether an AU of `len` bytes still fits the replay budget with `have` bytes already buffered.
+fn replay_fits(have: usize, len: usize) -> bool {
+    have.saturating_add(len) <= MAX_REPLAY_BYTES
+}
 
 impl FfmpegDecoder {
     pub fn new(width: u32, height: u32, codec_u8: u8) -> Result<Self> {
@@ -175,7 +232,7 @@ impl FfmpegDecoder {
         let (tx, frames) = mpsc::sync_channel::<Vec<u8>>(QUEUE_BOUND);
         let queued = std::sync::Arc::new(AtomicUsize::new(0));
         let queued_reader = queued.clone();
-        let frame_bytes = width as usize * height as usize * 4;
+        let frame_bytes = checked_frame_bytes(width, height)?;
         // Writer thread: owns stdin, drains AUs at whatever rate ffmpeg accepts them, and accounts
         // for the bytes still outstanding so the session thread can stay non-blocking.
         let (au_tx, au_rx) = mpsc::channel::<Vec<u8>>();
@@ -253,6 +310,7 @@ impl FfmpegDecoder {
             fed: 0,
             fell_back: false,
             replay: Vec::new(),
+            replay_bytes: 0,
             decoded: 0,
             eof: false,
         })
@@ -265,6 +323,8 @@ impl FfmpegDecoder {
     /// frames are collected as they appear; only the newest is presented, so a decoder slower than
     /// the stream cannot grow an unbounded queue of 8 MB frames.
     pub fn decode_one(&mut self, au: &[u8]) -> Result<Option<DecodedFrame>> {
+        // Reject an oversized AU before it is cloned into the writer channel or the replay buffer.
+        check_au_size(au.len())?;
         let mut frame = self.try_next();
         if let Some(tx) = self.au_tx.as_ref() {
             // Never blocks on the pipe: the bound below is ffmpeg's own input backlog.
@@ -291,7 +351,10 @@ impl FfmpegDecoder {
             bail!("write AU to ffmpeg: pipe closed");
         }
         self.fed += 1;
-        if self.replay.len() < HWACCEL_GRACE_AUS as usize * 2 {
+        if self.replay.len() < HWACCEL_GRACE_AUS as usize * 2
+            && replay_fits(self.replay_bytes, au.len())
+        {
+            self.replay_bytes += au.len();
             self.replay.push(au.to_vec());
         }
         // A hwaccel that never produces a frame (unsupported profile, no free GPU session) must not
@@ -329,6 +392,7 @@ impl FfmpegDecoder {
                     }
                 }
                 d.fed = buffered.len() as u32;
+                d.replay_bytes = buffered.iter().map(Vec::len).sum();
                 d.replay = buffered;
                 *self = d;
             }
@@ -352,7 +416,20 @@ impl FfmpegDecoder {
             let _ = w.join();
         }
         let mut out = Vec::new();
+        let mut out_bytes = 0usize;
         while let Ok(frame) = self.frames.recv() {
+            if out_bytes.saturating_add(frame.len()) > MAX_FINISH_BYTES {
+                // Bound what we hold at EOF too. Nothing legitimate approaches the cap (ffmpeg's
+                // reorder tail is a few frames), so stop rather than grow without bound on a
+                // wedged decoder.
+                tracing::warn!(
+                    bytes = out_bytes,
+                    cap = MAX_FINISH_BYTES,
+                    "ffmpeg flush exceeded the byte cap — dropping the remaining tail"
+                );
+                break;
+            }
+            out_bytes += frame.len();
             self.frame_index = self.frame_index.wrapping_add(1);
             self.decoded += 1;
             out.push(DecodedFrame {
@@ -427,6 +504,7 @@ impl FfmpegDecoder {
             }
         }
         d.fed = buffered.len() as u32;
+        d.replay_bytes = buffered.iter().map(Vec::len).sum();
         d.replay = buffered;
         d.fell_back = self.fell_back;
         *self = d;
@@ -483,5 +561,45 @@ impl Decoder for FfmpegDecoder {
 
     fn flow_stats(&self) -> (usize, u64) {
         (self.max_queued, self.blocked_ns / 1_000_000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_bytes_are_capped_at_the_protocol_maximum() {
+        assert_eq!(checked_frame_bytes(1920, 1080).unwrap(), 1920 * 1080 * 4);
+        // The largest legal mode is exactly at the cap; one pixel wider is over it.
+        assert!(
+            checked_frame_bytes(MAX_PROTOCOL_DIMENSION, MAX_PROTOCOL_DIMENSION).is_ok(),
+            "the protocol's largest mode must still decode"
+        );
+        let err =
+            checked_frame_bytes(MAX_PROTOCOL_DIMENSION + 1, MAX_PROTOCOL_DIMENSION).unwrap_err();
+        assert!(err.to_string().contains("frame cap"), "{err}");
+    }
+
+    #[test]
+    fn zero_and_overflowing_geometry_are_rejected() {
+        assert!(checked_frame_bytes(0, 1080).is_err());
+        // 2^32-1 squared overflows usize on 64-bit; it must be an error, not a wrapped allocation.
+        assert!(checked_frame_bytes(u32::MAX, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn au_size_cap_rejects_only_oversized_units() {
+        assert!(check_au_size(0).is_ok());
+        assert!(check_au_size(MAX_AU_BYTES).is_ok(), "the cap is inclusive");
+        let err = check_au_size(MAX_AU_BYTES + 1).unwrap_err();
+        assert!(err.to_string().contains("AU cap"), "{err}");
+    }
+
+    #[test]
+    fn replay_budget_is_enforced() {
+        assert!(replay_fits(0, MAX_REPLAY_BYTES));
+        assert!(!replay_fits(1, MAX_REPLAY_BYTES));
+        assert!(!replay_fits(usize::MAX, 1), "saturating add must not wrap");
     }
 }

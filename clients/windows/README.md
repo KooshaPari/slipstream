@@ -44,15 +44,19 @@ slipstream-windows --discover
 slipstream-windows --discover 8
 
 :: pair once (reads the PIN the host prints when pairing is armed)
-slipstream-windows 100.112.143.99:9777 --pair 1234
+slipstream-windows 192.0.2.10:9777 --pair 1234
 :: -> PAIRED — host fingerprint <hex>   (use it as --pin from now on)
 
 :: stream for 12 s and record the elementary stream
-slipstream-windows 100.112.143.99:9777 --pin <hex> --seconds 12 --record out.h265
+slipstream-windows 192.0.2.10:9777 --pin <hex> --seconds 12 --record out.h265
 
 :: unpinned: trust-on-first-use, the observed fingerprint is logged for pinning
 slipstream-windows 192.0.2.10:9777 --seconds 30
 ```
+
+Every example above uses `192.0.2.10`, which RFC 5737 reserves for documentation (TEST-NET-1),
+so it names no real machine. The client has no default host: it only connects to the `HOST[:PORT]`
+you pass as a positional or with `--connect` (a bare host defaults to port `9777`).
 
 Flags: `--connect HOST[:PORT]` (or a bare positional), `--pin HEX`, `--pair PIN`,
 `--discover [SECS]`, `--name LABEL`, `--mode WxHxFPS` (default `1920x1080x144`),
@@ -67,7 +71,7 @@ Flags: `--connect HOST[:PORT]` (or a bare positional), `--pin HEX`, `--pair PIN`
 cargo test -p slipstream-windows
 ```
 
-30 pure-logic tests cover argument parsing, `host:port`/IPv6 handling, TXT advert decoding
+Pure-logic tests cover argument parsing, `host:port`/IPv6 handling, TXT advert decoding
 (fail-closed pairing policy), the admission table, and every connection phase transition.
 
 ## Layout

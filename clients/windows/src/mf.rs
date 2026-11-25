@@ -57,6 +57,98 @@ enum InputFmt {
     LengthPrefixed,
 }
 
+/// A locked Media Foundation buffer that unlocks itself on drop.
+///
+/// `convert` used to call `Lock2D`/`Lock` and never unlock: the early returns (a failed lock, a
+/// null pointer) and the normal path all left the MFT's buffer locked for the life of the decoder.
+/// A guard makes the release unconditional on every path — including `?`, `return None`, and a
+/// panic — so it cannot be forgotten again.
+struct LockedBuffer<'a> {
+    buffer: &'a IMFMediaBuffer,
+    /// Present when the buffer exposed `IMF2DBuffer`; then `Unlock2D` is the matching release.
+    two_d: Option<IMF2DBuffer>,
+    ptr: *mut u8,
+    pitch: i32,
+    /// Test-only: set by `Drop`. `MFCreateMemoryBuffer`'s own `Lock`/`Unlock` do not enforce
+    /// exclusivity, so a test cannot observe the platform lock state — but it can observe that the
+    /// release ran, which is the property the old code lacked.
+    #[cfg(test)]
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for LockedBuffer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: both unlock calls pair with the lock taken in `lock_buffer`, on the same
+        // interface pointer, and run exactly once.
+        unsafe {
+            match self.two_d.as_ref() {
+                Some(b2) => {
+                    let _ = b2.Unlock2D();
+                }
+                None => {
+                    let _ = self.buffer.Unlock();
+                }
+            }
+        }
+        #[cfg(test)]
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Lock `buffer` for reading, preferring `IMF2DBuffer` (which also reports the real stride).
+///
+/// `None` means the buffer could not be locked, its pointer was null, or a flat buffer reported
+/// fewer than `need_bytes` bytes (a short buffer must not be read past its allocation). Every
+/// failure path unlocks before returning, so callers cannot leak the lock.
+fn lock_buffer<'a>(
+    buffer: &'a IMFMediaBuffer,
+    fallback_stride: i32,
+    need_bytes: usize,
+) -> Option<LockedBuffer<'a>> {
+    use windows::core::Interface;
+    // Prefer the 2D interface (it reports the real stride), but a plain memory buffer can expose
+    // `IMF2DBuffer` and still refuse `Lock2D`; that is not a failure, it means the flat path below
+    // is the right one. Giving up here was itself a way `convert` lost frames.
+    if let Ok(b2) = buffer.cast::<IMF2DBuffer>() {
+        let mut ptr = std::ptr::null_mut();
+        let mut pitch = 0i32;
+        // SAFETY: the interface came from this buffer; `Lock2D` fills both out-params.
+        if unsafe { b2.Lock2D(&mut ptr, &mut pitch) }.is_ok() && !ptr.is_null() {
+            return Some(LockedBuffer {
+                buffer,
+                two_d: Some(b2),
+                ptr,
+                pitch,
+                #[cfg(test)]
+                released: Default::default(),
+            });
+        }
+        let _ = unsafe { b2.Unlock2D() };
+    }
+    // `GetMaxLength` is the allocation size. `Lock`'s current-length out-param is 0 until data is
+    // written, so it cannot be used as the bound; checking before locking also means a refusal
+    // never takes a lock that would need releasing.
+    let max = unsafe { buffer.GetMaxLength() }.unwrap_or(0);
+    if (max as usize) < need_bytes {
+        return None;
+    }
+    let mut ptr = std::ptr::null_mut();
+    // SAFETY: `Lock` pairs with the `Unlock` in `Drop`.
+    if unsafe { buffer.Lock(&mut ptr, None, None) }.is_err() || ptr.is_null() {
+        let _ = unsafe { buffer.Unlock() };
+        return None;
+    }
+    Some(LockedBuffer {
+        buffer,
+        two_d: None,
+        ptr,
+        pitch: fallback_stride,
+        #[cfg(test)]
+        released: Default::default(),
+    })
+}
+
 impl MfDecoder {
     /// Build a decoder for `codec` at the negotiated `width`x`height`. Fails (never silently) when
     /// this Windows install has no decoder MFT for the codec.
@@ -293,36 +385,26 @@ impl MfDecoder {
 
     fn convert(&mut self, sample: &IMFSample) -> Option<DecodedFrame> {
         let buffer = unsafe { sample.GetBufferByIndex(0) }.ok()?;
-        use windows::core::Interface;
-        let (ptr, pitch) = match buffer.cast::<IMF2DBuffer>() {
-            Ok(b2) => {
-                let mut p = std::ptr::null_mut();
-                let mut pitch = 0i32;
-                unsafe { b2.Lock2D(&mut p, &mut pitch) }.ok()?;
-                (p, pitch)
-            }
-            Err(_) => {
-                let mut p = std::ptr::null_mut();
-                let mut len = 0u32;
-                unsafe { buffer.Lock(&mut p, None, Some(&mut len)) }.ok()?;
-                (p, self.out_stride.max(self.width as i32))
-            }
-        };
-        if ptr.is_null() {
-            return None;
-        }
+        // NV12 is 1.5 bytes/pixel; a flat buffer shorter than that is refused by `lock_buffer`.
+        let need = (self.out_w as usize)
+            .saturating_mul(self.out_h as usize)
+            .saturating_mul(3)
+            / 2;
+        // The guard unlocks on drop, so every return below (including `?`) releases the buffer.
+        let locked = lock_buffer(&buffer, self.out_stride.max(self.width as i32), need)?;
         let n = (self.out_w as usize) * (self.out_h as usize) * 4;
         let mut pixels = std::mem::take(&mut self.scratch);
         pixels.resize(n, 0);
         unsafe {
             nv12_to_bgra(
-                ptr,
-                pitch,
+                locked.ptr,
+                locked.pitch,
                 self.out_w as usize,
                 self.out_h as usize,
                 &mut pixels,
             );
         }
+        drop(locked);
         self.frame_index = self.frame_index.wrapping_add(1);
         Some(DecodedFrame {
             width: self.out_w,
@@ -382,6 +464,52 @@ unsafe fn nv12_to_bgra(yuv: *const u8, pitch: i32, width: usize, height: usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `MFStartup` is process-wide and reference-counted; start it once so the two lock tests do
+    /// not race each other's shutdown while a buffer is still alive.
+    fn mf_started() {
+        use std::sync::Once;
+        static START: Once = Once::new();
+        START.call_once(|| {
+            unsafe { MFStartup(MF_VERSION, 0) }.expect("MFStartup");
+        });
+    }
+
+    /// The property the old `convert` violated: the guard releases the lock when it goes away.
+    /// `MFCreateMemoryBuffer` does not enforce exclusivity on `Lock`/`Unlock`, so the platform lock
+    /// state is not observable; the guard's `released` flag (set by `Drop`) is, and the buffer is
+    /// lockable again afterwards.
+    #[test]
+    fn the_buffer_lock_is_released_when_the_guard_drops() {
+        use std::sync::atomic::Ordering;
+        mf_started();
+        let buffer = unsafe { MFCreateMemoryBuffer(1024) }.expect("MFCreateMemoryBuffer");
+        let locked = lock_buffer(&buffer, 4, 16).expect("first lock");
+        assert!(!locked.released.load(Ordering::SeqCst), "released while held");
+        let released = locked.released.clone();
+        drop(locked);
+        assert!(released.load(Ordering::SeqCst), "Drop did not release the lock");
+        assert!(
+            lock_buffer(&buffer, 4, 16).is_some(),
+            "the buffer is unusable after the release"
+        );
+    }
+
+    /// A flat buffer smaller than the NV12 image is refused *and* left unlocked, so the refusal
+    /// path cannot leak the lock either.
+    #[test]
+    fn a_short_flat_buffer_is_refused_and_left_unlocked() {
+        mf_started();
+        let buffer = unsafe { MFCreateMemoryBuffer(1024) }.expect("MFCreateMemoryBuffer");
+        assert!(
+            lock_buffer(&buffer, 4, 4096).is_none(),
+            "a 1024-byte buffer must not satisfy a 4096-byte read"
+        );
+        assert!(
+            lock_buffer(&buffer, 4, 16).is_some(),
+            "the refusal path leaked the lock"
+        );
+    }
 
     #[test]
     fn annexb_converts_to_length_prefixed() {

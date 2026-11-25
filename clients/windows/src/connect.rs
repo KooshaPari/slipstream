@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn failures_return_to_idle_with_actionable_text() {
         let mut m = Machine::new();
-        m.connect("100.112.143.99:9777").unwrap();
+        m.connect("192.0.2.10:9777").unwrap();
         let t = m.failed(&ConnectOutcome::ApprovalTimeout);
         match t {
             Transition::DropAndIdle(msg) => {

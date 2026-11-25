@@ -3,15 +3,16 @@
 //! This module owns the handshake, admission and receive/decode/present loop. It never exits the
 //! process: the CLI boundary in `main` decides what an outcome means for the process exit code.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use slipstream_core::config::Role;
+use slipstream_core::config::{Mode, Role};
 use slipstream_core::input::InputEvent;
 use slipstream_core::packet::FLAG_PROBE;
 use slipstream_core::quic::{endpoint, io, Hello, Start, Welcome};
+use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
 use slipstream_core::transport::UdpTransport;
 use slipstream_core::{Session, SlipstreamError};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -107,7 +108,73 @@ fn confirm_fingerprint(host: &str, fp_hex: &str) -> Result<bool> {
     ))
 }
 
-/// Run one streaming session to completion.
+// Peer-controlled geometry is validated below before it sizes a decoder or window.
+/// The largest geometry the wire contract allows. These mirror `ss-encode`'s
+/// `Codec::max_dimension` (4096 for H.264, 8192 for HEVC/AV1) — the host refuses anything above it,
+/// so the client accepts exactly that range. Kept as a local copy because the Windows client must
+/// not depend on the encoder stack; if the host limits change, this is the line to update.
+const MAX_DIM_H264: u32 = 4096;
+const MAX_DIM_HEVC_AV1: u32 = 8192;
+/// No current display drives more than this; a larger `refresh_hz` in an offer is corruption.
+const MAX_REFRESH_HZ: u32 = 1000;
+
+fn max_dimension(codec: u8) -> u32 {
+    if codec == CODEC_H264 {
+        MAX_DIM_H264
+    } else {
+        MAX_DIM_HEVC_AV1
+    }
+}
+
+fn known_codec(codec: u8) -> bool {
+    matches!(codec, CODEC_H264 | CODEC_HEVC | CODEC_AV1)
+}
+
+/// Reject a mode that cannot be a real encoded stream *before* anything is sized from it.
+///
+/// `Welcome.mode` and `Reconfigured.mode` are decoded from bytes the peer controls: a corrupt or
+/// hostile host could otherwise make the client allocate a decoder and a window for a 0x0, odd, or
+/// absurd geometry. The dims are `u32` on the wire, so there is no non-finite value to reject; the
+/// failure modes are zero, odd (4:2:0 chroma is subsampled by two on both axes), and out of range.
+/// The message names the source (`Welcome` vs `Reconfigured`) so an operator can tell a broken host
+/// from a corrupt packet, and the codec byte is validated here too because it selects the limit.
+fn validate_mode(mode: &Mode, codec: u8, what: &str) -> Result<()> {
+    if !known_codec(codec) {
+        bail!("{what}: unknown negotiated codec byte {codec} (expected H.264, HEVC or AV1)");
+    }
+    if mode.width == 0 || mode.height == 0 {
+        bail!(
+            "{what}: mode {}x{}@{} has a zero dimension",
+            mode.width,
+            mode.height,
+            mode.refresh_hz
+        );
+    }
+    if !mode.width.is_multiple_of(2) || !mode.height.is_multiple_of(2) {
+        bail!(
+            "{what}: mode {}x{} is odd; 4:2:0 chroma needs even dimensions",
+            mode.width,
+            mode.height
+        );
+    }
+    let max = max_dimension(codec);
+    if mode.width > max || mode.height > max {
+        bail!(
+            "{what}: mode {}x{} exceeds the {max}px limit for codec byte {codec}",
+            mode.width,
+            mode.height
+        );
+    }
+    if mode.refresh_hz == 0 || mode.refresh_hz > MAX_REFRESH_HZ {
+        bail!(
+            "{what}: refresh {} Hz is outside 1..={MAX_REFRESH_HZ}",
+            mode.refresh_hz
+        );
+    }
+    Ok(())
+}
+
+/// Run one streaming session to completion, from handshake to final counters.
 pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let SessionConfig {
         remote,
@@ -172,6 +239,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
             )
         })??;
     let welcome = Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
+    // The offer is peer-controlled bytes: reject an unusable codec byte or geometry before any
+    // decoder, window or frame buffer is sized from it.
+    validate_mode(&welcome.mode, welcome.codec, "host Welcome")?;
     tracing::info!(
         mode = ?welcome.mode,
         frames = welcome.frames,
@@ -285,7 +355,12 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                             refresh_hz = rc.mode.refresh_hz,
                             "host corrected the session mode"
                         );
-                        *delivered.lock().unwrap() = Some(rc.mode);
+                        match validate_mode(&rc.mode, codec, "host Reconfigured") {
+                            Ok(()) => *delivered.lock().unwrap() = Some(rc.mode),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ignoring a Reconfigured with an unusable mode")
+                            }
+                        }
                     }
                     Err(_) => tracing::debug!(len = msg.len(), "control message (not a mode ack)"),
                 }
@@ -356,7 +431,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                 break;
             }
             if let Some(m) = delivered.lock().unwrap().take() {
-                if (m.width, m.height) != sized {
+                if let Err(e) = validate_mode(&m, codec, "delivered mode") {
+                    tracing::warn!(error = %e, "not adopting an invalid delivered mode");
+                } else if (m.width, m.height) != sized {
                     tracing::info!(
                         from_w = sized.0,
                         from_h = sized.1,
@@ -487,6 +564,69 @@ mod tests {
             SessionOutcome::from_result(true, SessionStop::WindowClosed, 10),
             SessionOutcome::WindowClosed
         );
+    }
+
+    fn mode(w: u32, h: u32, hz: u32) -> Mode {
+        Mode {
+            width: w,
+            height: h,
+            refresh_hz: hz,
+        }
+    }
+
+    #[test]
+    fn a_normal_welcome_mode_is_accepted() {
+        assert!(validate_mode(&mode(2560, 1440, 240), CODEC_HEVC, "Welcome").is_ok());
+        assert!(validate_mode(&mode(1920, 1080, 144), CODEC_H264, "Welcome").is_ok());
+        // 8192 is the HEVC/AV1 limit and is inclusive; 4K is fine for H.264.
+        assert!(validate_mode(&mode(8192, 8192, 60), CODEC_AV1, "Welcome").is_ok());
+        assert!(validate_mode(&mode(4096, 2160, 60), CODEC_H264, "Welcome").is_ok());
+    }
+
+    #[test]
+    fn zero_geometry_is_rejected() {
+        for (w, h) in [(0, 1080), (1920, 0), (0, 0)] {
+            let err = validate_mode(&mode(w, h, 60), CODEC_HEVC, "Welcome").unwrap_err();
+            assert!(err.to_string().contains("zero dimension"), "{err}");
+            assert!(err.to_string().contains("Welcome"), "{err}");
+        }
+    }
+
+    #[test]
+    fn odd_geometry_is_rejected() {
+        for (w, h) in [(1921, 1080), (1920, 1081)] {
+            let err = validate_mode(&mode(w, h, 60), CODEC_HEVC, "Welcome").unwrap_err();
+            assert!(err.to_string().contains("odd"), "{err}");
+        }
+    }
+
+    #[test]
+    fn absurd_geometry_is_rejected_per_codec_limit() {
+        // HEVC/AV1 accept up to 8192, H.264 only to 4096.
+        assert!(validate_mode(&mode(8193, 2160, 60), CODEC_HEVC, "Welcome").is_err());
+        let err = validate_mode(&mode(8192, 2160, 60), CODEC_H264, "Welcome").unwrap_err();
+        assert!(err.to_string().contains("4096"), "{err}");
+        // u32::MAX is decoded from four peer-controlled bytes; it must not size a buffer.
+        assert!(validate_mode(&mode(u32::MAX, u32::MAX, 60), CODEC_AV1, "Welcome").is_err());
+    }
+
+    #[test]
+    fn out_of_range_refresh_is_rejected() {
+        assert!(validate_mode(&mode(1920, 1080, 0), CODEC_HEVC, "Welcome").is_err());
+        assert!(validate_mode(&mode(1920, 1080, MAX_REFRESH_HZ + 1), CODEC_HEVC, "Welcome").is_err());
+        assert!(validate_mode(&mode(1920, 1080, MAX_REFRESH_HZ), CODEC_HEVC, "Welcome").is_ok());
+    }
+
+    #[test]
+    fn unknown_codec_byte_is_rejected() {
+        let err = validate_mode(&mode(1920, 1080, 60), 0x7f, "Welcome").unwrap_err();
+        assert!(err.to_string().contains("unknown negotiated codec byte"), "{err}");
+    }
+
+    #[test]
+    fn reconfigured_mode_rejection_names_its_source() {
+        let err = validate_mode(&mode(0, 0, 0), CODEC_HEVC, "host Reconfigured").unwrap_err();
+        assert!(err.to_string().contains("host Reconfigured"), "{err}");
     }
 
     #[test]

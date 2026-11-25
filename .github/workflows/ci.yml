@@ -81,6 +81,31 @@ jobs:
       - name: Build the Windows host
         run: cargo build -p slipstream-host --locked --target x86_64-pc-windows-gnu
 
+  windows-client:
+    name: Windows client compile and test
+    runs-on: windows-2022
+    # `clients/windows` (slipstream-windows) is a native MSVC crate: the mingw cross job above
+    # cannot build it, and the Rust checks job deliberately stays on the portable core crates.
+    # Without this gate the Windows client has no compile or test coverage in CI at all.
+    env:
+      # `audiopus_sys` (pulled in by slipstream-core's `quic` feature) builds libopus through
+      # CMake. CMake 4 rejects the policy floor in libopus' CMakeLists, and the image's default
+      # generator can point at a newer VS than the installed one. Same overrides the documented
+      # local Windows build uses (clients/windows/README.md).
+      CMAKE_GENERATOR: Visual Studio 17 2022
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, pinned
+        with:
+          toolchain: 1.96.0
+
+      - run: cargo check -p slipstream-windows --locked
+      - run: cargo test -p slipstream-windows --locked
+
   linux-client:
     name: Linux client compile
     runs-on: ubuntu-24.04

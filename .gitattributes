@@ -12,3 +12,9 @@
 # core.autocrlf must not rewrite either. Measured on Windows: blob 116 bytes vs worktree 123 (7
 # converted line endings), which breaks verification while Linux CI passes.
 plugin-index/**/*.json -text
+
+# cbindgen regenerates this header with LF endings on every build. With core.autocrlf=true the
+# checkout would otherwise be CRLF, so each build shows a spurious "modified" file whose only
+# difference is line endings. Pin it to LF in both the index and the working tree so a build
+# leaves the tree clean.
+include/slipstream_core.h text eol=lf

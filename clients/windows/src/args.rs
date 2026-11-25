@@ -212,10 +212,14 @@ fn parse_monitor_id(raw: &str) -> Result<String, String> {
         ));
     };
     if backend.trim().is_empty() {
-        return Err(format!("--monitor needs a backend before the ':', got {id:?}"));
+        return Err(format!(
+            "--monitor needs a backend before the ':', got {id:?}"
+        ));
     }
     if name.trim().is_empty() {
-        return Err(format!("--monitor needs a monitor name after the ':', got {id:?}"));
+        return Err(format!(
+            "--monitor needs a monitor name after the ':', got {id:?}"
+        ));
     }
     Ok(id.to_string())
 }

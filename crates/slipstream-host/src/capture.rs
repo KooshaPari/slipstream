@@ -124,7 +124,8 @@ mod monitor_id_tests {
         let decoded_missing = Hello::decode(&missing.encode()).expect("hello decodes");
         let err = format!(
             "{:#}",
-            resolve_session_monitor_id(decoded_missing.monitor_id.as_deref(), &monitors).unwrap_err()
+            resolve_session_monitor_id(decoded_missing.monitor_id.as_deref(), &monitors)
+                .unwrap_err()
         );
         assert!(err.contains("no monitor named"), "{err}");
 
@@ -395,7 +396,10 @@ pub fn capture_virtual_output(
     // logging one backend and capturing with another. A backend this path cannot serve fails
     // loudly rather than silently falling back to WGC.
     let backend = virtual_output_backend(capture)?;
-    tracing::info!(backend = backend.as_str(), "virtual-output capture selected");
+    tracing::info!(
+        backend = backend.as_str(),
+        "virtual-output capture selected"
+    );
     match backend {
         crate::session_plan::CaptureBackend::Wgc => {
             ss_capture::open_wgc_desktop_for_monitor(Some(&head))
@@ -410,7 +414,12 @@ pub fn capture_virtual_output(
         ),
     }
     .map(|c| c as Box<dyn Capturer>)
-    .with_context(|| format!("capture the mirrored Windows head with {}", backend.as_str()))
+    .with_context(|| {
+        format!(
+            "capture the mirrored Windows head with {}",
+            backend.as_str()
+        )
+    })
 }
 
 /// Which capturer the Windows virtual-output path opens for a resolved plan.
@@ -446,11 +455,11 @@ mod windows_virtual_output_backend_tests {
     fn opener_agrees_with_the_resolved_plan_for_every_spelling() {
         // (operator value, plan backend, opener accepts it)
         let cases: [(Option<&str>, CaptureBackend, bool); 6] = [
-            (None, CaptureBackend::Wgc, true),               // unset -> auto -> WGC
-            (Some("auto"), CaptureBackend::Wgc, true),       // auto -> WGC
-            (Some("wgc"), CaptureBackend::Wgc, true),        // explicit primary
-            (Some("DXGI"), CaptureBackend::Dxgi, true),      // explicit, case-insensitive
-            (Some("nonsense"), CaptureBackend::Wgc, true),   // unknown -> auto -> WGC
+            (None, CaptureBackend::Wgc, true),          // unset -> auto -> WGC
+            (Some("auto"), CaptureBackend::Wgc, true),  // auto -> WGC
+            (Some("wgc"), CaptureBackend::Wgc, true),   // explicit primary
+            (Some("DXGI"), CaptureBackend::Dxgi, true), // explicit, case-insensitive
+            (Some("nonsense"), CaptureBackend::Wgc, true), // unknown -> auto -> WGC
             (Some("portal"), CaptureBackend::Portal, false), // Linux backend: loud refusal
         ];
         for (value, expected_plan, accepts) in cases {

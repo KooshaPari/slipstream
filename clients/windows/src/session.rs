@@ -166,11 +166,7 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
 
     let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
     let mut recv = io::MsgReader::new(recv);
-    io::write_msg(
-        &mut send,
-        &hello_for(&args).encode(),
-    )
-    .await?;
+    io::write_msg(&mut send, &hello_for(&args).encode()).await?;
     // A host that completes the QUIC handshake but never sends `Welcome` (wedged encoder/parked
     // session) must fail, not hang the client forever.
     let welcome_msg = tokio::time::timeout(Duration::from_secs(15), recv.read_msg())
@@ -529,7 +525,9 @@ mod tests {
         let plain = hello_for(&p(&["--connect", "h"]));
         assert_eq!(plain.monitor_id, None);
         assert_eq!(
-            Hello::decode(&plain.encode()).expect("hello decodes").monitor_id,
+            Hello::decode(&plain.encode())
+                .expect("hello decodes")
+                .monitor_id,
             None
         );
     }

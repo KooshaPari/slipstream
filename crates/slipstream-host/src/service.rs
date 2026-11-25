@@ -24,8 +24,8 @@ use windows::Win32::Foundation::{HANDLE, NO_ERROR};
 use windows::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
     SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
-    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
-    SERVICE_STATUS_CURRENT_STATE, SERVICE_TABLE_ENTRYW,
+    SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_STATUS, SERVICE_STATUS_CURRENT_STATE,
+    SERVICE_STATUS_HANDLE, SERVICE_TABLE_ENTRYW,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
@@ -174,9 +174,9 @@ unsafe extern "system" fn handler_ex(
     match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             report_state(SERVICE_STATUS_CURRENT_STATE(3), 0, 2, 30_000); // STOP_PENDING
-            // The control handler must return immediately. The blocking waiter performs
-            // the same graceful sequence as the console's SIGTERM path: stop sessions
-            // deliberately and hand the display back before the serve future unwinds.
+                                                                         // The control handler must return immediately. The blocking waiter performs
+                                                                         // the same graceful sequence as the console's SIGTERM path: stop sessions
+                                                                         // deliberately and hand the display back before the serve future unwinds.
             if let Some(event) = stop_event_handle() {
                 // SAFETY: `event` is the live auto-reset handle; SetEvent is callable
                 // from a service control handler and never blocks.
@@ -199,7 +199,12 @@ unsafe extern "system" fn handler_ex(
     }
 }
 
-fn report_state(state: SERVICE_STATUS_CURRENT_STATE, exit_code: u32, checkpoint: u32, wait_ms: u32) {
+fn report_state(
+    state: SERVICE_STATUS_CURRENT_STATE,
+    exit_code: u32,
+    checkpoint: u32,
+    wait_ms: u32,
+) {
     CURRENT_STATE.store(state.0, Ordering::SeqCst);
     if let Some(handle) = status_handle() {
         // SAFETY: handle is the live registration from ServiceMain; SERVICE_STATUS

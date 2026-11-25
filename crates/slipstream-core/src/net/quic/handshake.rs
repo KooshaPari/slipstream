@@ -292,7 +292,13 @@ impl Hello {
             b.push(self.video_caps);
         }
         // audio_channels: emitted when non-stereo OR a later field follows.
-        if ac_present || vcodecs_present || pref_present || hdr_present || ccaps_present || monitor_present {
+        if ac_present
+            || vcodecs_present
+            || pref_present
+            || hdr_present
+            || ccaps_present
+            || monitor_present
+        {
             b.push(self.audio_channels);
         }
         // video_codecs: emitted when non-zero OR a later field follows.

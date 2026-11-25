@@ -529,9 +529,15 @@ mod readback_tests {
     #[test]
     fn a_named_head_beats_primary_and_pin() {
         let heads = [head(r"\\.\DISPLAY1", true), head(r"\\.\DISPLAY2", false)];
-        assert_eq!(resolve_head(&heads, Some(r"\\.\DISPLAY2")).unwrap(), r"\\.\DISPLAY2");
+        assert_eq!(
+            resolve_head(&heads, Some(r"\\.\DISPLAY2")).unwrap(),
+            r"\\.\DISPLAY2"
+        );
         // Connector matching is case-insensitive on a fold, same as the pin's resolution.
-        assert_eq!(resolve_head(&heads, Some(r"\\.\display2")).unwrap(), r"\\.\DISPLAY2");
+        assert_eq!(
+            resolve_head(&heads, Some(r"\\.\display2")).unwrap(),
+            r"\\.\DISPLAY2"
+        );
     }
 
     /// A name this host does not have is refused with the heads it does — never silently replaced
@@ -539,7 +545,10 @@ mod readback_tests {
     #[test]
     fn an_unknown_named_head_lists_what_is_attached() {
         let heads = [head(r"\\.\DISPLAY1", true)];
-        let err = format!("{:#}", resolve_head(&heads, Some(r"\\.\DISPLAY9")).unwrap_err());
+        let err = format!(
+            "{:#}",
+            resolve_head(&heads, Some(r"\\.\DISPLAY9")).unwrap_err()
+        );
         assert!(err.contains("no monitor named"), "{err}");
         assert!(err.contains(r"\\.\DISPLAY1"), "{err}");
     }

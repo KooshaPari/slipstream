@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-    TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -99,7 +98,13 @@ impl Scanner {
                     continue; // predates this launch, so it is never ours (rule 1)
                 }
             }
-            if matches(&image, &entry.exe_name, exe.as_deref(), dir.as_deref(), spec) {
+            if matches(
+                &image,
+                &entry.exe_name,
+                exe.as_deref(),
+                dir.as_deref(),
+                spec,
+            ) {
                 out.push(ProcRef {
                     pid: entry.pid,
                     start: start_key(start),
@@ -221,7 +226,9 @@ fn image_path(handle: HANDLE) -> Option<PathBuf> {
         )
     };
     if ok.is_ok() && len > 0 {
-        return Some(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])));
+        return Some(PathBuf::from(String::from_utf16_lossy(
+            &buf[..len as usize],
+        )));
     }
     // SAFETY: as above, with the older K32 API that writes the image name into the buffer.
     let n = unsafe { K32GetProcessImageFileNameW(handle, &mut buf) };
@@ -270,7 +277,8 @@ fn normalize(p: &Path) -> PathBuf {
 
 /// Case-insensitive full-path equality for Windows.
 fn eq_path(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 /// Case-insensitive, component-wise prefix test for Windows.
@@ -337,13 +345,25 @@ mod tests {
             exe: Some(PathBuf::from(r"c:\games\tunic\tunic.exe")),
             ..Default::default()
         };
-        assert!(matches(image, "tunic.exe", spec.exe.as_deref(), None, &spec));
+        assert!(matches(
+            image,
+            "tunic.exe",
+            spec.exe.as_deref(),
+            None,
+            &spec
+        ));
         // A different binary under the same folder must not match.
         let other = DetectSpec {
             exe: Some(PathBuf::from(r"c:\games\tunic\other.exe")),
             ..Default::default()
         };
-        assert!(!matches(image, "tunic.exe", other.exe.as_deref(), None, &other));
+        assert!(!matches(
+            image,
+            "tunic.exe",
+            other.exe.as_deref(),
+            None,
+            &other
+        ));
     }
 
     #[test]
@@ -426,7 +446,8 @@ mod tests {
     /// killing a copy of the game the player already had open.
     #[test]
     fn pre_launch_processes_are_never_adopted() {
-        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        let comspec =
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
         let sleeper = |tag: &str| {
             std::process::Command::new(&comspec)
                 .args(["/c", "ping -n 20 127.0.0.1 >nul"])
@@ -453,7 +474,11 @@ mod tests {
             process_name: Some("cmd.exe".into()),
             ..Default::default()
         };
-        let found: Vec<u32> = scanner.find(&spec, Some(stamp)).iter().map(|p| p.pid).collect();
+        let found: Vec<u32> = scanner
+            .find(&spec, Some(stamp))
+            .iter()
+            .map(|p| p.pid)
+            .collect();
 
         let post_pid = post.id();
         let pre_pid = pre.id();
@@ -494,7 +519,11 @@ mod tests {
         );
         // Whatever the harness is, its own stamp must round-trip through `alive`.
         if let Some(entry) = live.iter().find(|p| p.pid == me) {
-            assert_eq!(scanner.alive(&[*entry]).len(), 1, "own process must verify as alive");
+            assert_eq!(
+                scanner.alive(&[*entry]).len(),
+                1,
+                "own process must verify as alive"
+            );
             let mut wrong = *entry;
             wrong.start = wrong.start.wrapping_add(1);
             assert!(
@@ -508,4 +537,3 @@ mod tests {
         }
     }
 }
-

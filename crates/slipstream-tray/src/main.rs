@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 //! slipstream-tray — a small per-user system-tray companion for the slipstream host service.
 //!
 //! Shows at a glance whether the host is running, stopped, degraded, or failed, and offers one-click

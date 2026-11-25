@@ -48,5 +48,10 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "windows")'.build-dependencies]
+# Windows-only: embeds assets/slipstream.ico plus ProductName/FileDescription/FileVersion into
+# the exe, so Explorer, the taskbar and Alt-Tab show the product icon instead of the generic one.
+winresource = "0.1"
+
 [lints]
 workspace = true

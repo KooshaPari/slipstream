@@ -438,13 +438,13 @@ impl GdiPresenter {
         }
     }
 
-    fn pump(&mut self, mut msg: MSG) {
-        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            unsafe {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+    /// Drain everything queued and report whether anything was.
+    ///
+    /// One drain helper for every path: the per-present pump and the idle pump while the session
+    /// waits for a frame. Delegates to [`drain_window_messages`] so the idle path and the tests
+    /// share the exact loop the presenter uses.
+    fn drain_messages(&mut self) -> bool {
+        drain_window_messages()
     }
 
     fn blit(&mut self) {
@@ -506,11 +506,39 @@ impl GdiPresenter {
     }
 }
 
+/// Drain every pending window and thread message, reporting whether any was seen.
+///
+/// A `WM_CLOSE` posted to the thread (`PostThreadMessageW`) never reaches [`wndproc`]: Windows
+/// discards thread messages in `DispatchMessageW`. Observing it here is what lets a close posted
+/// while no frame is arriving still end the session.
+fn drain_window_messages() -> bool {
+    let mut msg = MSG::default();
+    let mut seen = false;
+    while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+        seen = true;
+        if msg.message == WM_CLOSE {
+            CLOSED.store(true, Ordering::Relaxed);
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    seen
+}
+
 impl Presenter for GdiPresenter {
+    /// Service messages while the stream has no frame for us, then yield briefly.
+    ///
+    /// The session loop's `NoFrame` branch calls this instead of sleeping blindly, so a stalled or
+    /// ended stream cannot leave the window unresponsive: close and Esc are still handled.
+    fn pump_idle(&mut self) {
+        let _ = self.drain_messages();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
     fn present(&mut self, frame: Option<&DecodedFrame>) {
-        let mut msg = MSG::default();
-        self.pump(msg);
-        let _ = &mut msg;
+        let _ = self.drain_messages();
         if let Some(f) = frame {
             self.frames += 1;
             self.bytes += f.pixels.len() as u64;
@@ -703,5 +731,71 @@ mod tests {
         );
         assert_eq!(state.held_buttons, 0);
         assert!(state.last_point.is_none());
+    }
+
+    /// The bug this guards: the `NoFrame` branch slept bare, so a pending close sat unhandled for
+    /// as long as the stream stalled. A presenter that pumps messages while idle must observe a
+    /// posted `WM_CLOSE` within 100 ms. The close is posted to the thread (as `wndproc` does for
+    /// Esc), which `DispatchMessageW` discards, so only the drain's own check can see it.
+    #[test]
+    fn no_frame_idle_pump_observes_close_within_100ms() {
+        use std::time::Duration;
+
+        struct CountingPresenter {
+            polls: u32,
+            closed: bool,
+        }
+        impl Presenter for CountingPresenter {
+            fn present(&mut self, _: Option<&DecodedFrame>) {}
+            fn status(&mut self, _: &str) {}
+            fn pump_idle(&mut self) {
+                self.polls += 1;
+                let _ = drain_window_messages();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            fn closed(&self) -> bool {
+                self.closed
+            }
+        }
+
+        CLOSED.store(false, Ordering::Relaxed);
+        let mut p = CountingPresenter {
+            polls: 0,
+            closed: false,
+        };
+        let start = Instant::now();
+        let mut posted = false;
+        // A stream that returns NoFrame forever, with a close already pending.
+        while !p.closed && start.elapsed() < Duration::from_millis(100) {
+            if !posted {
+                unsafe {
+                    let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                        tid,
+                        WM_CLOSE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                posted = true;
+            }
+            p.pump_idle();
+            if CLOSED.load(Ordering::Relaxed) {
+                p.closed = true;
+            }
+        }
+        let elapsed = start.elapsed();
+        CLOSED.store(false, Ordering::Relaxed);
+
+        assert!(posted, "the test never posted the close");
+        assert!(
+            p.closed,
+            "posted WM_CLOSE not observed while NoFrame repeated"
+        );
+        assert!(
+            elapsed <= Duration::from_millis(100),
+            "the idle pump took {elapsed:?}"
+        );
+        assert!(p.polls >= 1, "the idle pump was never called");
     }
 }

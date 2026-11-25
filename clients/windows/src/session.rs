@@ -647,7 +647,9 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
                         let _ = keyframe_tx.send(request);
                     }
                     let t_spin = Instant::now();
-                    std::thread::sleep(Duration::from_micros(300));
+                    // Not a bare sleep: a stalled stream must not stop the window servicing
+                    // messages, or close/Esc go unhandled until a frame arrives.
+                    presenter.pump_idle();
                     spin_ns = t_spin.elapsed().as_nanos() as u64;
                     stats.spins += 1;
                     // Poll+spin without a frame still costs the same wall time; attribute it to

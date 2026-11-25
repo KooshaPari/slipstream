@@ -72,6 +72,31 @@ Native Windows builds need the same pinned Rust toolchain plus VS Build Tools (M
 SDK), CMake, NASM (openh264/libopus vendored builds), and pkg-config; FFmpeg (`ffmpeg-next`)
 and Vulkan Video stay Linux-only and are never probed on Windows.
 
+#### audiopus_sys and CMake on native Windows
+
+`audiopus_sys` v0.2.2 builds a vendored libopus, and that build is the usual native-Windows
+failure point. The working recipe is environmental, not a code change:
+
+- Use the toolchain pinned in `rust-toolchain.toml` (1.96.0 at time of writing).
+- Build with the CMake that ships with VS 18 Build Tools (4.3.1-msvc1) and put its `bin`
+  directory first on `PATH`. System CMake 4.0.3 rejects the auto-detected `Visual Studio 18
+  2026` generator that Build Tools installs.
+- Set `CMAKE_POLICY_VERSION_MINIMUM=3.5`: the vendored libopus declares a pre-3.5
+  `cmake_minimum_required`, which newer CMake refuses.
+- After changing the CMake in use or the generator, delete the stale `audiopus` build directory
+  under `CARGO_TARGET_DIR`. The cached generator survives and keeps failing otherwise.
+- Point `CARGO_TARGET_DIR` outside the checkout when the source volume is small.
+
+```sh
+set CMAKE_POLICY_VERSION_MINIMUM=3.5
+cargo test -p slipstream-core --features quic --locked
+cargo test -p ss-host-config -p ss-update-check --locked
+cargo check -p slipstream-host --locked
+```
+
+The Linux-only crates (FFmpeg, PipeWire, Wayland) are not expected to build natively on Windows;
+CI covers them on Ubuntu.
+
 ## Before you push
 
 Enable the repo git hooks once per clone. They run the exact rustfmt gates CI runs on every

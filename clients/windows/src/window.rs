@@ -26,8 +26,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    SetDIBitsToDevice, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HBITMAP, HDC, HGDIOBJ, SRCCOPY,
+    SetDIBitsToDevice, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
+    HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -257,13 +257,53 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// The DIB the memory DC has selected, and the one handle that is safe to restore on drop.
+///
+/// `SelectObject` returns the object it replaced. On the first selection that is the DC's stock
+/// bitmap, which lives as long as the DC. On a resize it is the previous DIB, which the resize
+/// then deletes, so storing that return value as the restore handle (the old `_old` field did)
+/// leaves `Drop` re-selecting a deleted handle. `restore` therefore only ever holds the handle
+/// captured at construction, and every handle a resize replaces is deleted, never restored.
+#[derive(Debug)]
+struct DibHandles {
+    restore: HGDIOBJ,
+    current: HGDIOBJ,
+}
+
+impl DibHandles {
+    fn new(restore: HGDIOBJ, first: HGDIOBJ) -> Self {
+        Self {
+            restore,
+            current: first,
+        }
+    }
+
+    /// Swap in `dib` and return the handle it replaced: the caller must delete that handle.
+    ///
+    /// Deliberately does not touch `restore`; see the type comment for why the returned handle is
+    /// not a valid restore target.
+    fn swap(&mut self, dib: HGDIOBJ) -> HGDIOBJ {
+        let replaced = self.current;
+        self.current = dib;
+        replaced
+    }
+
+    /// The handle `Drop` may select back into the memory DC (`None` when nothing was restored).
+    fn restore_target(&self) -> Option<HGDIOBJ> {
+        if self.restore.0.is_null() {
+            None
+        } else {
+            Some(self.restore)
+        }
+    }
+}
+
 pub struct GdiPresenter {
     hwnd: HWND,
     hdc_mem: HDC,
-    dib: HBITMAP,
+    /// The DIB currently selected into `hdc_mem`, plus the handle to restore on drop.
+    dibs: DibHandles,
     bits: *mut core::ffi::c_void,
-    /// The DIB that was selected into the memory DC before ours (restored on drop).
-    _old: HGDIOBJ,
     width: u32,
     height: u32,
     pub frames: u64,
@@ -343,13 +383,15 @@ impl GdiPresenter {
         let bmi = Self::bitmap_info(width, height);
         let dib = unsafe { CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }
             .context("CreateDIBSection")?;
-        let old = unsafe { SelectObject(hdc_mem, HGDIOBJ(dib.0)) };
+        // The first selection replaces the DC's stock bitmap: that handle, not the DIB, is what a
+        // drop restores.
+        let stock = unsafe { SelectObject(hdc_mem, HGDIOBJ(dib.0)) };
 
         tracing::info!(width, height, "window created");
         Ok(Self {
             hwnd,
             hdc_mem,
-            dib,
+            dibs: DibHandles::new(stock, HGDIOBJ(dib.0)),
             bits,
             width,
             height,
@@ -359,7 +401,6 @@ impl GdiPresenter {
             blit_ns: 0,
             started: Instant::now(),
             last_report: Instant::now(),
-            _old: old,
         })
     }
 
@@ -509,13 +550,13 @@ impl Presenter for GdiPresenter {
                 return;
             }
         };
-        let old = unsafe { SelectObject(self.hdc_mem, HGDIOBJ(dib.0)) };
+        // Selecting the new DIB returns the one it replaces. That handle is deleted here, so it
+        // must not be kept as a restore target: `Drop` would re-select a dead DIB.
+        let replaced = self.dibs.swap(HGDIOBJ(dib.0));
         unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.dib.0));
+            let _ = DeleteObject(replaced);
         }
-        self.dib = dib;
         self.bits = bits;
-        self._old = old;
         self.width = width;
         self.height = height;
         let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
@@ -554,9 +595,61 @@ impl Drop for GdiPresenter {
     fn drop(&mut self) {
         remove_state(self.hwnd);
         unsafe {
-            let _ = SelectObject(self.hdc_mem, self._old);
-            let _ = DeleteObject(HGDIOBJ(self.dib.0));
+            // Restore the handle captured at construction, never one a resize deleted, then
+            // release the DIB that is actually selected.
+            if let Some(restore) = self.dibs.restore_target() {
+                let _ = SelectObject(self.hdc_mem, restore);
+            }
+            let _ = DeleteObject(self.dibs.current);
             let _ = DeleteDC(self.hdc_mem);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handle value only ever compared, never passed to GDI.
+    fn handle(n: usize) -> HGDIOBJ {
+        HGDIOBJ(n as *mut core::ffi::c_void)
+    }
+
+    /// The bug this guards: a resize stored the handle `SelectObject` returned, which is the DIB
+    /// the same resize then deletes, and `Drop` re-selected it. The restore target must stay the
+    /// handle captured at construction.
+    #[test]
+    fn a_resize_never_turns_a_deleted_dib_into_the_restore_handle() {
+        let stock = handle(1);
+        let mut dibs = DibHandles::new(stock, handle(2));
+
+        // First resize: `SelectObject` returns DIB 2, which the resize deletes.
+        let replaced = dibs.swap(handle(3));
+        assert_eq!(
+            replaced.0 as usize, 2,
+            "swap must report the DIB it replaced"
+        );
+        assert_eq!(
+            dibs.restore_target().map(|h| h.0 as usize),
+            Some(1),
+            "drop must restore the construction handle, not a deleted DIB"
+        );
+
+        // Second resize: the handle it returns is again the one about to be deleted.
+        let replaced = dibs.swap(handle(4));
+        assert_eq!(replaced.0 as usize, 3);
+        assert_ne!(
+            dibs.restore_target().map(|h| h.0 as usize),
+            Some(3),
+            "a deleted DIB must never become the restore target"
+        );
+        assert_eq!(dibs.current.0 as usize, 4);
+    }
+
+    #[test]
+    fn no_restore_handle_is_offered_when_the_first_select_failed() {
+        let mut dibs = DibHandles::new(HGDIOBJ(std::ptr::null_mut()), handle(2));
+        dibs.swap(handle(3));
+        assert!(dibs.restore_target().is_none());
     }
 }

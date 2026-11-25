@@ -201,44 +201,12 @@ async fn h_launch(
                 session.height = h;
                 session.fps = f;
             }
-            // A new session starts undecided: whatever ended the last one says nothing about this
-            // one (see `AppState::quit`). The game this launch reclaims — if this client left one
-            // waiting out its reconnect window — is reprieved by the stream thread, which resolves
-            // the title anyway and so needs no second library scan here.
-            st.quit.store(false, std::sync::atomic::Ordering::SeqCst);
-            // Commit under the lock, re-deciding against whatever is live *now*. The admission
-            // check above is advisory (it also avoids starting an encoder for an obvious reject);
-            // between that check and this point another launch can store a session, and blindly
-            // overwriting it here would admit a second client past the single-session rule.
-            let (width, height, fps, rikeyid) = {
-                let mut slot = st.launch.lock().unwrap();
-                let live = slot
-                    .as_ref()
-                    .map(|s| (s.owner_fp, (s.width, s.height, s.fps)));
-                match gamestream_admission(
-                    live,
-                    req_fp,
-                    crate::vdisplay::admission::effective_conflict(),
-                ) {
-                    GsDecision::Serve => {}
-                    GsDecision::Join((w, h, f)) => {
-                        tracing::info!(
-                            "GameStream launch JOIN — admitting at the live session's mode {w}x{h}@{f}"
-                        );
-                        session.width = w;
-                        session.height = h;
-                        session.fps = f;
-                    }
-                    GsDecision::Reject => {
-                        tracing::warn!(
-                            "GameStream launch REJECTED — another launch claimed the session first"
-                        );
-                        return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml())).into_response();
-                    }
-                }
-                let committed = (session.width, session.height, session.fps, session.rikeyid);
-                *slot = Some(session);
-                committed
+            let Some((width, height, fps, rikeyid)) = commit_launch(
+                &st,
+                session,
+                crate::vdisplay::admission::effective_conflict(),
+            ) else {
+                return (StatusCode::SERVICE_UNAVAILABLE, xml(error_xml())).into_response();
             };
             tracing::info!(
                 w = width,
@@ -255,6 +223,55 @@ async fn h_launch(
             xml(error_xml()).into_response()
         }
     }
+}
+
+/// Commit a validated launch into [`AppState::launch`], re-deciding against whatever is live
+/// *now*.
+///
+/// The admission check in [`h_launch`] is advisory (and it also avoids starting an encoder for an
+/// obvious reject): between that check and here another launch can store a session, so the decision
+/// is re-taken under the launch lock and a blind overwrite cannot admit a second client past the
+/// single-session rule. Returns the committed `(w, h, fps, rikeyid)`, or `None` when the slot was
+/// taken by another client first.
+///
+/// The deliberate-quit mark is cleared HERE and only on success: it is this session's state, so a
+/// launch that loses the slot (or is refused) must not erase the mark the LIVE client's teardown
+/// depends on to skip the keep-alive linger.
+fn commit_launch(
+    st: &AppState,
+    mut session: super::LaunchSession,
+    conflict: crate::vdisplay::policy::ModeConflict,
+) -> Option<(u32, u32, u32, i32)> {
+    let mut slot = st.launch.lock().unwrap();
+    let live = slot
+        .as_ref()
+        .map(|s| (s.owner_fp, (s.width, s.height, s.fps)));
+    match gamestream_admission(live, session.owner_fp, conflict) {
+        GsDecision::Serve => {}
+        GsDecision::Join((w, h, f)) => {
+            tracing::info!(
+                w,
+                h,
+                f,
+                "GameStream launch JOIN - admitting at the live session's mode"
+            );
+            session.width = w;
+            session.height = h;
+            session.fps = f;
+        }
+        GsDecision::Reject => {
+            tracing::warn!("GameStream launch REJECTED - another launch claimed the session first");
+            return None;
+        }
+    }
+    let committed = (session.width, session.height, session.fps, session.rikeyid);
+    // A new session starts undecided: whatever ended the last one says nothing about this one (see
+    // `AppState::quit`). The game this launch reclaims - if this client left one waiting out its
+    // reconnect window - is reprieved by the stream thread, which resolves the title anyway and so
+    // needs no second library scan here.
+    st.quit.store(false, std::sync::atomic::Ordering::SeqCst);
+    *slot = Some(session);
+    Some(committed)
 }
 
 async fn h_resume(
@@ -512,6 +529,55 @@ mod tests {
         assert!(
             !peer_is_paired(&other, &st),
             "a non-pinned cert stays rejected"
+        );
+    }
+
+    #[test]
+    fn commit_launch_clears_the_quit_mark_only_when_it_commits() {
+        use crate::vdisplay::policy::ModeConflict;
+        use std::sync::atomic::Ordering;
+
+        let st = test_state();
+        let session = |owner: Option<[u8; 32]>| super::super::LaunchSession {
+            gcm_key: [0u8; 16],
+            rikeyid: 7,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            appid: 0,
+            peer_ip: None,
+            owner_fp: owner,
+        };
+
+        // A live session owned by ANOTHER client, whose teardown has been marked deliberate.
+        *st.launch.lock().unwrap() = Some(session(Some([1u8; 32])));
+        st.quit.store(true, Ordering::SeqCst);
+
+        // `reject` refuses the second client at commit time: nothing is overwritten and, crucially,
+        // the live client's deliberate-quit mark survives. (It used to be cleared BEFORE the check.)
+        assert!(commit_launch(&st, session(Some([2u8; 32])), ModeConflict::Reject).is_none());
+        assert!(
+            st.quit.load(Ordering::SeqCst),
+            "a rejected launch must not clear another client's deliberate-quit mark"
+        );
+        assert_eq!(
+            st.launch.lock().unwrap().as_ref().map(|s| s.owner_fp),
+            Some(Some([1u8; 32])),
+            "the live session is untouched"
+        );
+
+        // A committed session starts undecided, so the mark IS cleared here.
+        let committed = commit_launch(&st, session(Some([2u8; 32])), ModeConflict::Steal)
+            .expect("steal commits over the previous session");
+        assert_eq!(committed, (1280, 720, 60, 7));
+        assert!(
+            !st.quit.load(Ordering::SeqCst),
+            "a committed launch is a new, undecided session"
+        );
+        assert_eq!(
+            st.launch.lock().unwrap().as_ref().map(|s| s.owner_fp),
+            Some(Some([2u8; 32])),
+            "the new session owns the slot"
         );
     }
 

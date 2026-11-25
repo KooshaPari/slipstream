@@ -169,6 +169,21 @@ impl Drop for LockedBuffer<'_> {
     }
 }
 
+/// Whether a locked 2D plane spans the NV12 image the caller will read.
+///
+/// NV12 in one plane is `pitch * rows * 3/2` bytes: the luma plane at `pitch` bytes per row and the
+/// interleaved UV plane at the same stride for half as many rows. A locked buffer whose stride is
+/// too small (or a nonsensical zero/negative stride) is short, and reading `need_bytes` from it
+/// would cross the end of the allocation. `Lock2D` reports the stride but no length, so this is the
+/// only bound available on that path: the flat path checks `GetMaxLength` instead.
+fn lock2d_covers(pitch: i32, rows: usize, need_bytes: usize) -> bool {
+    let stride = pitch.unsigned_abs() as usize;
+    if stride == 0 || rows == 0 {
+        return false;
+    }
+    stride.saturating_mul(rows).saturating_mul(3) / 2 >= need_bytes
+}
+
 /// Lock `buffer` for reading, preferring `IMF2DBuffer` (which also reports the real stride).
 ///
 /// `None` means the buffer could not be locked, its pointer was null, or a flat buffer reported
@@ -177,6 +192,7 @@ impl Drop for LockedBuffer<'_> {
 fn lock_buffer<'a>(
     buffer: &'a IMFMediaBuffer,
     fallback_stride: i32,
+    rows: usize,
     need_bytes: usize,
 ) -> Option<LockedBuffer<'a>> {
     use windows::core::Interface;
@@ -188,14 +204,19 @@ fn lock_buffer<'a>(
         let mut pitch = 0i32;
         // SAFETY: the interface came from this buffer; `Lock2D` fills both out-params.
         if unsafe { b2.Lock2D(&mut ptr, &mut pitch) }.is_ok() && !ptr.is_null() {
-            return Some(LockedBuffer {
-                buffer,
-                two_d: Some(b2),
-                ptr,
-                pitch,
-                #[cfg(test)]
-                released: Default::default(),
-            });
+            // `Lock2D` reports the stride but not the length, so a buffer whose stride times rows
+            // is short of the image must be refused here or `nv12_to_bgra` reads past its end.
+            if lock2d_covers(pitch, rows, need_bytes) {
+                return Some(LockedBuffer {
+                    buffer,
+                    two_d: Some(b2),
+                    ptr,
+                    pitch,
+                    #[cfg(test)]
+                    released: Default::default(),
+                });
+            }
+            // Too short: release the 2D lock and let the flat path decide with its own bound.
         }
         let _ = unsafe { b2.Unlock2D() };
     }
@@ -422,7 +443,12 @@ impl MfDecoder {
             .saturating_mul(3)
             / 2;
         // The guard unlocks on drop, so every return below (including `?`) releases the buffer.
-        let locked = lock_buffer(&buffer, self.out_stride.max(self.width as i32), need)?;
+        let locked = lock_buffer(
+            &buffer,
+            self.out_stride.max(self.width as i32),
+            self.out_h as usize,
+            need,
+        )?;
         let n = (self.out_w as usize) * (self.out_h as usize) * 4;
         let mut pixels = std::mem::take(&mut self.scratch);
         pixels.resize(n, 0);
@@ -556,6 +582,22 @@ mod tests {
         assert_eq!(&lp[4..6], &[0x40, 0x01]);
         assert_eq!(&lp[6..10], &3u32.to_be_bytes());
         assert_eq!(&lp[10..13], &[0x42, 0x02, 0x03]);
+    }
+
+    /// `Lock2D` reports a stride but no length, so the stride is the only bound available: a
+    /// 4x2 NV12 image needs 12 bytes, and a stride narrower than the image width does not span it.
+    #[test]
+    fn a_short_2d_plane_fails_the_pitch_check() {
+        let need = 4 * 2 * 3 / 2; // 4x2 NV12
+        assert!(lock2d_covers(4, 2, need), "exact stride and rows must pass");
+        assert!(lock2d_covers(8, 2, need), "padded strides are fine");
+        assert!(lock2d_covers(-4, 2, need), "bottom-up strides are fine");
+        assert!(
+            !lock2d_covers(2, 2, need),
+            "a stride narrower than the image must be refused"
+        );
+        assert!(!lock2d_covers(0, 2, need), "a zero stride must be refused");
+        assert!(!lock2d_covers(4, 0, need), "zero rows must be refused");
     }
 
     #[test]

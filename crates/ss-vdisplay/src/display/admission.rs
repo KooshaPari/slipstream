@@ -177,6 +177,14 @@ pub struct Claimed {
     /// What the connecting session should do, resolved against the tenants that were
     /// already present. Never computed against this claim itself.
     pub decision: Admission,
+    /// The mode this claim is RECORDED at: the requested mode, or the live display's mode when
+    /// [`decide`] resolved [`Admission::Join`]. The caller must stream at this mode.
+    ///
+    /// Resolved HERE, under the same lock as the insert, because the alternative - inserting the
+    /// requested mode and correcting it with [`set_mode`] afterwards - leaves a window in which the
+    /// table advertises a mode the session is not going to use, and a concurrent claim resolving
+    /// `join`/`reject` against it reads the wrong one.
+    pub mode: (u32, u32, u32),
     /// This identity's own prior sessions (a genuine reconnect's zombies). The caller
     /// signals these AFTER this call returns, so the table lock is never held across a
     /// sleep.
@@ -209,19 +217,40 @@ pub fn claim(
     // Decide against the table as it stands — never against the entry we are about to add.
     let decision = decide(conflict, req_identity, &live);
     let own_zombies = same_identity_stops(req_identity, &live);
+    // Store the mode this session will actually serve, not the one it asked for: a `join` is an
+    // honest downgrade, and a claim that recorded the REQUEST would mislead the next decision
+    // (a concurrent claim resolving `join`/`reject` reads whatever is in the table).
+    let claimed_mode = match &decision {
+        Admission::Join(m) => *m,
+        _ => mode,
+    };
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     live.push(LiveSession {
         id,
         identity: req_identity,
-        mode,
+        mode: claimed_mode,
         stop,
         label,
     });
     Claimed {
         decision,
+        mode: claimed_mode,
         own_zombies,
         guard: LiveGuard { id },
     }
+}
+
+/// Whether the live entry that owns `stop` has been removed - i.e. that session has actually
+/// released its display. A preempting session polls this instead of sleeping a fixed grace: the stop
+/// flag is ADVISORY (a session inside its first pipeline build does not look at it until the build
+/// returns, seconds later), so "signalled" and "released" are different instants, and acquiring a
+/// display in between is exactly the second-display bug preemption exists to prevent.
+pub fn released(stop: &Arc<AtomicBool>) -> bool {
+    !table()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| Arc::ptr_eq(&s.stop, stop))
 }
 
 /// Update a claim's recorded mode once the session has negotiated one (e.g. after an
@@ -460,5 +489,94 @@ mod tests {
             "neither Hello has registered, so neither is visible to the other"
         );
         assert_eq!(live_len(), 0, "nothing was registered by admission alone");
+    }
+
+    /// A `join` claim must record the mode it will actually serve, at insert time.
+    ///
+    /// The defect this pins down: `claim` used to store the client's REQUESTED mode and the
+    /// handshake corrected it with `set_mode` after the lock was released, so a concurrent claim
+    /// in that window resolved `join`/`reject` against a mode no session was using.
+    #[test]
+    fn claim_records_the_join_resolved_mode_under_the_lock() {
+        let _serial = CLAIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(live_len(), 0);
+
+        let primary = claim(
+            ModeConflict::Separate,
+            fp(1),
+            (2560, 1440, 60),
+            Arc::new(AtomicBool::new(false)),
+            "primary".into(),
+        );
+
+        // A different client asks for a different mode; `join` downgrades it to the live one, and
+        // the claim itself reports that mode back to the caller that must serve at it.
+        let joined = claim(
+            ModeConflict::Join,
+            fp(2),
+            (1280, 720, 120),
+            Arc::new(AtomicBool::new(false)),
+            "joiner".into(),
+        );
+        assert!(matches!(joined.decision, Admission::Join((2560, 1440, 60))));
+        assert_eq!(
+            joined.mode,
+            (2560, 1440, 60),
+            "the claim must report the mode it will serve"
+        );
+
+        // ...and the TABLE holds it: a third claim resolving against the table must see the join
+        // mode, not the joiner's request. This is what the set_mode-after-unlock ordering broke.
+        let third = claim(
+            ModeConflict::Join,
+            fp(3),
+            (640, 480, 30),
+            Arc::new(AtomicBool::new(false)),
+            "third".into(),
+        );
+        assert!(
+            matches!(third.decision, Admission::Join((2560, 1440, 60))),
+            "the joiner's RESOLVED mode, not its request, is what the next claim sees: {:?}",
+            third.decision
+        );
+
+        drop((primary, joined, third));
+        assert_eq!(live_len(), 0);
+    }
+
+    /// `released` is the observable a preempting session waits on: it must stay false until the
+    /// preempted session ends (its guard drops), not merely until its stop flag is set.
+    #[test]
+    fn released_tracks_the_guard_not_the_stop_flag() {
+        let _serial = CLAIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(live_len(), 0);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let claimed = claim(
+            ModeConflict::Separate,
+            fp(4),
+            (1920, 1080, 60),
+            Arc::clone(&stop),
+            "victim".into(),
+        );
+        assert!(!released(&stop), "the session is still live");
+
+        // Signalling the stop flag is what a `steal`/reconnect does FIRST; it does not release
+        // anything, and a preemptor must keep waiting.
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            !released(&stop),
+            "a signalled session that has not ended still holds its display"
+        );
+
+        drop(claimed);
+        assert!(
+            released(&stop),
+            "the entry is gone, so the display is released"
+        );
+        assert!(
+            released(&Arc::new(AtomicBool::new(false))),
+            "an entry nobody owns is trivially released"
+        );
     }
 }

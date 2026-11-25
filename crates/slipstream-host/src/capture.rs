@@ -139,6 +139,42 @@ mod monitor_id_tests {
             None
         );
     }
+
+    /// An unknown head must FAIL with an actionable message — the heads this host does have — not be
+    /// logged and dropped. The plan's resolve propagates this error, so the session is rejected with
+    /// it (previously `--monitor drm:DP-9` silently streamed the pinned head).
+    #[test]
+    fn unknown_head_error_lists_the_available_heads() {
+        let monitors = [mon("HDMI-A-2"), mon("DP-1")];
+        let err = format!(
+            "{:#}",
+            resolve_session_monitor_id(Some("drm:DP-9"), &monitors).unwrap_err()
+        );
+        assert!(err.contains("no monitor named"), "{err}");
+        assert!(
+            err.contains("HDMI-A-2") && err.contains("DP-1"),
+            "the error must name the heads the host has: {err}"
+        );
+    }
+
+    /// The resolver's answer must arrive at the display open unchanged, and an absent id must keep
+    /// the host-wide path. This is the seam that used to be dead: `SessionPlan::monitor_id` was
+    /// assigned and never read, so `--monitor` never reached `ss_vdisplay::open`.
+    #[test]
+    fn a_resolved_head_reaches_the_display_open_seam() {
+        let monitors = [mon("HDMI-A-2")];
+        let resolved = resolve_session_monitor_id(Some("drm:hdmi-a-2"), &monitors).unwrap();
+        assert_eq!(
+            ss_vdisplay::display_target(resolved.as_deref()),
+            ss_vdisplay::DisplayTarget::Head("HDMI-A-2".to_string()),
+            "the bare connector resolved from the client id must be what the open is asked for"
+        );
+        assert_eq!(
+            ss_vdisplay::display_target(None),
+            ss_vdisplay::DisplayTarget::HostDefault,
+            "no request must keep the pinned/virtual path"
+        );
+    }
 }
 
 /// Validate a per-session `backend:name` monitor id and return its bare monitor name.

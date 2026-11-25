@@ -4,6 +4,8 @@
 //! The session plan resolves the Linux capture, topology, and encoder decisions once and passes
 //! one typed record through the capture and encode pipeline.
 
+use anyhow::Context;
+
 /// Where a session's frames come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureBackend {
@@ -296,6 +298,14 @@ pub struct SessionPlan {
 impl SessionPlan {
     /// Resolve the whole plan once from [`config`](crate::config) + the negotiated `bit_depth`,
     /// `chroma`, and `codec`.
+    ///
+    /// `monitor_id` is the client's per-session `Hello::monitor_id` (`--monitor BACKEND:NAME`). It
+    /// is **rejected** when this host cannot serve it: the resolver's own error already names the
+    /// heads this compositor does have, and streaming the pinned head to a client that asked for
+    /// another screen is the failure worth refusing over (the Windows client documents the same
+    /// contract: "the host validates the id against its own monitor list, so an unknown head fails
+    /// there with a clear message"). It used to be logged and dropped here, which meant
+    /// `--monitor` silently streamed the pin.
     pub fn resolve(
         bit_depth: u8,
         chroma: crate::encode::ChromaFormat,
@@ -305,21 +315,23 @@ impl SessionPlan {
         cursor_blend: bool,
         cursor_forward: bool,
         multi_slice: bool,
-    ) -> Self {
-        let monitors = ss_vdisplay::monitors::list(compositor).unwrap_or_default();
-        let monitor_id = match crate::capture::resolve_session_monitor_id(monitor_id, &monitors) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                // Unknown/malformed client input is NOT a handshake failure: log and fall back to
-                // the host-wide pin, which remains the appliance override.
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "invalid per-session monitor_id — using the host monitor pin"
-                );
-                None
+    ) -> anyhow::Result<Self> {
+        // Only enumerate when the client actually named a head: an absent request must not turn a
+        // compositor-enumeration failure into a session failure (it never did — the historical
+        // `unwrap_or_default` was unreachable from the resolver's point of view).
+        let monitor_id = match monitor_id.map(str::trim).filter(|id| !id.is_empty()) {
+            None => None,
+            Some(_) => {
+                let monitors = ss_vdisplay::monitors::list(compositor).with_context(|| {
+                    format!(
+                        "enumerate this host's monitors to resolve the session's monitor_id \
+                         {monitor_id:?}"
+                    )
+                })?;
+                crate::capture::resolve_session_monitor_id(monitor_id, &monitors)?
             }
         };
-        SessionPlan {
+        Ok(SessionPlan {
             capture: CaptureBackend::resolve(),
             topology: resolve_topology(),
             encoder: resolve_encoder(),
@@ -335,7 +347,7 @@ impl SessionPlan {
             // non-gamescope plan unchanged.
             gamescope_cursor: false,
             max_slices: if multi_slice { 32 } else { 1 },
-        }
+        })
     }
 
     /// The capturer's target output format (Goal-1 stage 5): `gpu` from the already-resolved `encoder`
@@ -492,6 +504,53 @@ mod tests {
         assert_eq!(wlroots.candidates[0], CaptureBackend::Wlr);
         assert_eq!(mutter.candidates[0], CaptureBackend::Portal);
         assert_ne!(wlroots.candidates, mutter.candidates);
+    }
+}
+
+/// `SessionPlan::resolve`'s monitor_id contract, independent of platform: a request this host
+/// cannot serve is an ERROR the caller propagates (the session is refused), and an absent one is
+/// still `None` (the host-wide pin path) reached without enumerating heads at all.
+#[cfg(test)]
+mod plan_monitor_tests {
+    use super::SessionPlan;
+    use crate::vdisplay::Compositor;
+
+    #[test]
+    fn an_unservable_head_is_an_error_not_a_silent_pin() {
+        // `Compositor::Windows` on a Linux test runner fails at enumeration, on Windows it
+        // enumerates and then misses the name — either way the resolve must be an Err that says
+        // `monitor_id`, never a plan that quietly streams the pin.
+        let err = format!(
+            "{:#}",
+            SessionPlan::resolve(
+                8,
+                crate::encode::ChromaFormat::Yuv420,
+                crate::encode::Codec::H264,
+                Some("drm:DP-9"),
+                Compositor::Windows,
+                false,
+                false,
+                false,
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("monitor_id"), "{err}");
+    }
+
+    #[test]
+    fn an_absent_head_resolves_to_the_host_path() {
+        let plan = SessionPlan::resolve(
+            8,
+            crate::encode::ChromaFormat::Yuv420,
+            crate::encode::Codec::H264,
+            None,
+            Compositor::Windows,
+            false,
+            false,
+            false,
+        )
+        .expect("no monitor_id request must never fail on monitor enumeration");
+        assert_eq!(plan.monitor_id, None);
     }
 }
 

@@ -104,9 +104,32 @@ impl WindowsMirrorDisplay {
     /// hard error — streaming the wrong screen is worse than refusing), else primary,
     /// else the first attached head.
     pub fn new() -> Result<Self> {
-        let heads = list_monitors()?;
-        let head = match crate::capture_monitor() {
-            Some(want) => crate::monitors::resolve(&heads, &want)?.connector.clone(),
+        Self::open(resolve_head(&list_monitors()?, None)?)
+    }
+
+    /// Mirror one **named** head — the per-session `Hello::monitor_id` path
+    /// ([`crate::open_for_monitor`]). A name this host does not have is a hard error listing the
+    /// heads it does (streaming a different screen than the client asked for is worse than
+    /// refusing), and the pin is deliberately bypassed: the session named its own target.
+    pub fn new_for(connector: &str) -> Result<Self> {
+        Self::open(resolve_head(&list_monitors()?, Some(connector))?)
+    }
+
+    fn open(head: String) -> Result<Self> {
+        Ok(WindowsMirrorDisplay { device: head })
+    }
+}
+
+/// Choose the head to mirror. Pure so the decision (pin/primary/fallback vs an explicit name) is
+/// testable without GDI: `Some(want)` resolves that connector and refuses a miss by name, `None`
+/// keeps the historical pin → primary → first chain.
+fn resolve_head(heads: &[PhysicalMonitor], want: Option<&str>) -> Result<String> {
+    match want {
+        // A per-session request: an unknown head is refused with the available names, never
+        // downgraded to the pin or the primary.
+        Some(want) => Ok(crate::monitors::resolve(heads, want)?.connector.clone()),
+        None => Ok(match crate::capture_monitor() {
+            Some(pin) => crate::monitors::resolve(heads, &pin)?.connector.clone(),
             None => heads
                 .iter()
                 .find(|m| m.primary)
@@ -114,8 +137,7 @@ impl WindowsMirrorDisplay {
                 .context("no attached monitors")?
                 .connector
                 .clone(),
-        };
-        Ok(WindowsMirrorDisplay { device: head })
+        }),
     }
 }
 
@@ -484,6 +506,43 @@ fn wide_to_string(buf: &[u16]) -> String {
 #[cfg(test)]
 mod readback_tests {
     use super::{decide_mode_readback, ModeReadback};
+    use super::{resolve_head, PhysicalMonitor};
+
+    fn head(connector: &str, primary: bool) -> PhysicalMonitor {
+        PhysicalMonitor {
+            connector: connector.into(),
+            description: String::new(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            primary,
+            enabled: true,
+            managed: false,
+        }
+    }
+
+    /// A per-session `Hello::monitor_id` must choose THAT head — not the primary, not the pin — so
+    /// the mirror opened for a client's `--monitor` captures the screen it asked for.
+    #[test]
+    fn a_named_head_beats_primary_and_pin() {
+        let heads = [head(r"\\.\DISPLAY1", true), head(r"\\.\DISPLAY2", false)];
+        assert_eq!(resolve_head(&heads, Some(r"\\.\DISPLAY2")).unwrap(), r"\\.\DISPLAY2");
+        // Connector matching is case-insensitive on a fold, same as the pin's resolution.
+        assert_eq!(resolve_head(&heads, Some(r"\\.\display2")).unwrap(), r"\\.\DISPLAY2");
+    }
+
+    /// A name this host does not have is refused with the heads it does — never silently replaced
+    /// by the primary, which would stream the wrong screen.
+    #[test]
+    fn an_unknown_named_head_lists_what_is_attached() {
+        let heads = [head(r"\\.\DISPLAY1", true)];
+        let err = format!("{:#}", resolve_head(&heads, Some(r"\\.\DISPLAY9")).unwrap_err());
+        assert!(err.contains("no monitor named"), "{err}");
+        assert!(err.contains(r"\\.\DISPLAY1"), "{err}");
+    }
 
     /// The panel's native mode: asked for `2560x1440@144`, held it (measured: 410 frames / 10 s).
     #[test]

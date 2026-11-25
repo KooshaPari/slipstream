@@ -1821,7 +1821,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         ),
         ctx.cursor_forward,
         ctx.multi_slice,
-    );
+    )?;
     // gamescope: the XFixes cursor source feeds the host-side composite (Phase C)  -  unless the
     // spawned gamescope paints the pointer into its node itself, in which case the reader would
     // produce a second one. Set after resolve so the flag stays a pure function of the compositor
@@ -1862,6 +1862,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         chroma: _,
         // Likewise the codec  -  `plan.codec` (resolved from `ctx.codec`) is the source of truth below.
         codec: _,
+        // Carried by `plan.monitor_id` (resolved above); the display open reads it from the plan.
         monitor_id: _,
         probe_rx,
         probe_result_tx,
@@ -1969,8 +1970,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         Some(p) => (p.vd, p.pipeline),
         None => {
             // Open the backend before creating the virtual output. The backend does not perform
-            // monitor work until the pipeline is built.
-            let mut vd = crate::vdisplay::open(compositor)?;
+            // monitor work until the pipeline is built. A client that named a head
+            // (`Hello::monitor_id`, already validated by the plan's resolve) mirrors THAT head;
+            // `None` keeps the host-wide pin/virtual decision exactly as before.
+            let mut vd = crate::vdisplay::open_for_monitor(compositor, plan.monitor_id.as_deref())?;
             // Pass the connecting client's identity to the backend when it supports stable output
             // allocation. Anonymous clients leave this unset.
             vd.set_client_identity(endpoint::peer_fingerprint(&conn));
@@ -2462,7 +2465,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // brief compositor-coexistence race during a switch); on failure keep the old.
                 let rebuilt =
                     (|| -> Result<(Box<dyn crate::vdisplay::VirtualDisplay>, Pipeline)> {
-                        let mut new_vd = crate::vdisplay::open(sw.compositor)?;
+                        // Same per-session head as the original open: a switch rebuilds the
+                        // backend, not the client's target.
+                        let mut new_vd = crate::vdisplay::open_for_monitor(
+                            sw.compositor,
+                            plan.monitor_id.as_deref(),
+                        )?;
                         // The switch re-resolved the sub-mode; give it to the NEW instance, the
                         // same way the initial build does. Without this the rebuilt backend would
                         // have no route and fall through to a bare spawn.
@@ -3222,7 +3230,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                 ) {
                                     crate::vdisplay::settle_desktop_portal(c);
                                 }
-                                match crate::vdisplay::open(c) {
+                                match crate::vdisplay::open_for_monitor(
+                                    c,
+                                    plan.monitor_id.as_deref(),
+                                ) {
                                     Ok(v) => {
                                         tracing::info!(from = compositor.id(), to = c.id(),
                                             "capture loss: active session switched compositor  -  retargeting");
@@ -4295,13 +4306,15 @@ pub(super) fn prepare_display(
         ),
         cursor_forward,
         multi_slice,
-    );
+    )?;
     plan.gamescope_cursor =
         crate::session_plan::gamescope_cursor_for(compositor == ss_vdisplay::Compositor::Gamescope);
     if codec == crate::encode::Codec::PyroWave {
         plan.wire_chunk = Some(shard_payload as usize);
     }
-    let mut vd = crate::vdisplay::open(compositor)?;
+    // A per-session `monitor_id` mirrors the head the client named; absent keeps the host-wide
+    // pin/virtual decision (see `ss_vdisplay::open_for_monitor`).
+    let mut vd = crate::vdisplay::open_for_monitor(compositor, plan.monitor_id.as_deref())?;
     vd.set_client_identity(client_identity);
     vd.set_client_hdr(client_hdr);
     vd.set_hdr(bit_depth >= 10);

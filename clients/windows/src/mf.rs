@@ -485,10 +485,16 @@ mod tests {
         mf_started();
         let buffer = unsafe { MFCreateMemoryBuffer(1024) }.expect("MFCreateMemoryBuffer");
         let locked = lock_buffer(&buffer, 4, 16).expect("first lock");
-        assert!(!locked.released.load(Ordering::SeqCst), "released while held");
+        assert!(
+            !locked.released.load(Ordering::SeqCst),
+            "released while held"
+        );
         let released = locked.released.clone();
         drop(locked);
-        assert!(released.load(Ordering::SeqCst), "Drop did not release the lock");
+        assert!(
+            released.load(Ordering::SeqCst),
+            "Drop did not release the lock"
+        );
         assert!(
             lock_buffer(&buffer, 4, 16).is_some(),
             "the buffer is unusable after the release"

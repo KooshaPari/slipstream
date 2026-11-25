@@ -613,14 +613,19 @@ mod tests {
     #[test]
     fn out_of_range_refresh_is_rejected() {
         assert!(validate_mode(&mode(1920, 1080, 0), CODEC_HEVC, "Welcome").is_err());
-        assert!(validate_mode(&mode(1920, 1080, MAX_REFRESH_HZ + 1), CODEC_HEVC, "Welcome").is_err());
+        assert!(
+            validate_mode(&mode(1920, 1080, MAX_REFRESH_HZ + 1), CODEC_HEVC, "Welcome").is_err()
+        );
         assert!(validate_mode(&mode(1920, 1080, MAX_REFRESH_HZ), CODEC_HEVC, "Welcome").is_ok());
     }
 
     #[test]
     fn unknown_codec_byte_is_rejected() {
         let err = validate_mode(&mode(1920, 1080, 60), 0x7f, "Welcome").unwrap_err();
-        assert!(err.to_string().contains("unknown negotiated codec byte"), "{err}");
+        assert!(
+            err.to_string().contains("unknown negotiated codec byte"),
+            "{err}"
+        );
     }
 
     #[test]

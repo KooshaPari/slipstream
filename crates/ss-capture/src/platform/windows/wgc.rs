@@ -85,11 +85,23 @@ impl WgcCapturer {
                 .context("wgc: IDirect3DDevice")?;
             inspectable.cast().context("wgc: IDirect3DDevice cast")?
         };
+        // Which adapter the capture device landed on decides whether WGC can hand frames over on
+        // the presenting GPU or has to copy them across adapters every frame. This box has five
+        // display adapters (3090 Ti, 2080 Ti, and three root-enumerated virtual displays), so
+        // "the runtime's default" is not obviously the monitor's adapter. Logged, not fatal.
+        if let Err(e) = log_capture_adapter(&device) {
+            tracing::warn!(error = %format!("{e:#}"), "wgc: capture adapter unknown");
+        }
         let size = item.Size().context("wgc: item size")?;
+        // Four buffers, not the documented minimum two: the drain thread holds one frame while
+        // the materialiser maps and copies it, so with two there is no headroom for the frame
+        // WGC is writing, and a full pool silently stops production -- invisible to the slot
+        // counters, which count slot overwrites rather than pool starvation. ~29 MB more GPU
+        // memory at 2560x1440 BGRA.
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &direct_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            4,
             size,
         )
         .context("wgc: frame pool")?;
@@ -256,6 +268,33 @@ fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
         device.context("wgc: no D3D11 device")?,
         ctx.context("wgc: no immediate context")?,
     ))
+}
+
+/// Report the DXGI adapter the capture device was created on.
+///
+/// Hang-safe by construction: it reads the adapter the device already holds
+/// (`IDXGIDevice::GetAdapter`) and never walks the adapter chain. `EnumAdapters1` is not called
+/// anywhere in this path because it blocks for 45+ s on this machine (faulted virtual display
+/// driver in the chain).
+fn log_capture_adapter(device: &ID3D11Device) -> Result<()> {
+    let dxgi: IDXGIDevice = device.cast().context("wgc: IDXGIDevice")?;
+    // SAFETY: `dxgi` is our live device; `GetAdapter` is a synchronous getter and the returned
+    // adapter is reference-counted for exactly this scope.
+    let adapter: IDXGIAdapter = unsafe { dxgi.GetAdapter() }.context("wgc: GetAdapter")?;
+    // SAFETY: `adapter` is live; `GetDesc` returns its description struct by value (it carries
+    // the LUID, so no IDXGIAdapter1 projection is needed).
+    let desc = unsafe { adapter.GetDesc() }.context("wgc: GetDesc")?;
+    let name = String::from_utf16_lossy(&desc.Description)
+        .trim_end_matches('\0')
+        .to_string();
+    tracing::info!(
+        adapter = %name,
+        luid_low = desc.AdapterLuid.LowPart,
+        luid_high = desc.AdapterLuid.HighPart,
+        dedicated_vram_mb = desc.DedicatedVideoMemory / (1024 * 1024),
+        "wgc: capture D3D11 adapter"
+    );
+    Ok(())
 }
 
 /// The WGC worker: wait for arrivals, drain every queued frame, publish the freshest.

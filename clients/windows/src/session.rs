@@ -24,6 +24,19 @@ use crate::input::{InputSender, InputSenderGuard};
 use crate::present::{ConsolePresenter, Decoder, PassthroughDecoder, Presenter};
 use crate::{ff, mf, window, PipeStats};
 
+/// How long the client tolerates post-handshake silence before it says WHY it is still waiting.
+/// An unpaired device's first knock is parked host-side for delegated approval (host:
+/// `PENDING_APPROVAL_WAIT = 180 s`, `crates/slipstream-host/src/protocol/slipstream1.rs:757`),
+/// and the host holds the connection open and silent for that whole window before it sends
+/// `Welcome`. Silence past this point is therefore expected for a first pairing, not a fault.
+const FIRST_OFFER_WAIT: Duration = Duration::from_secs(15);
+/// Extra wait after `FIRST_OFFER_WAIT`, bringing the total ceiling to 210 s. Strictly greater
+/// than the host's 180 s park plus room for the approval round trip, so a human who sees the
+/// console row and clicks Approve is admitted on the SAME connection with no reconnect. A
+/// genuinely wedged capture/encode pipeline still fails, just later (the Mac client's shipped
+/// equivalent is 185 s, `SessionModel.swift:365`).
+const APPROVAL_WAIT: Duration = Duration::from_secs(195);
+
 /// The `Hello` this client sends, built from the parsed arguments.
 ///
 /// Extracted so the handshake shape, the per-session `monitor_id` in particular, is exercised against
@@ -273,17 +286,29 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     let (mut send, recv) = conn.open_bi().await.context("open control stream")?;
     let mut recv = io::MsgReader::new(recv);
     io::write_msg(&mut send, &hello_for(&args).encode()).await?;
-    // A host that completes the QUIC handshake but never sends `Welcome` (wedged encoder/parked
-    // session) must fail, not hang the client forever.
-    let welcome_msg = tokio::time::timeout(Duration::from_secs(15), recv.read_msg())
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "host {remote} accepted the QUIC handshake but sent no session offer within 15 s \
-                 (the host's capture/encode pipeline is stalled, or the session is parked for \
-                 approval) — this is a host-side condition, not a client one"
-            )
-        })??;
+    // Tell the truth while waiting: 15 s of silence usually means the host parked this device for
+    // approval, so name that likely cause and keep waiting past the host's own park window. A
+    // genuinely stalled capture/encode pipeline still surfaces the same diagnosis, just later.
+    let welcome_msg = match tokio::time::timeout(FIRST_OFFER_WAIT, recv.read_msg()).await {
+        Ok(msg) => msg?,
+        Err(_) => {
+            tracing::warn!(
+                host = %remote,
+                wait_secs = APPROVAL_WAIT.as_secs(),
+                "no session offer after 15 s - the host has parked this device for approval; \
+                 approve it in the host console - still waiting"
+            );
+            tokio::time::timeout(APPROVAL_WAIT, recv.read_msg())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "host {remote} accepted the QUIC handshake but sent no session offer \
+                         within 210 s (the host's capture/encode pipeline is stalled, or this \
+                         device's pairing request was never approved in the host console)"
+                    )
+                })??
+        }
+    };
     let welcome = Welcome::decode(&welcome_msg).map_err(|e| anyhow!("Welcome decode: {e:?}"))?;
     // The offer is peer-controlled bytes: reject an unusable codec byte or geometry before any
     // decoder, window or frame buffer is sized from it.
@@ -583,6 +608,25 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirrors the host's park window (`PENDING_APPROVAL_WAIT`,
+    /// `crates/slipstream-host/src/protocol/slipstream1.rs:757`). If the host widens its park, the
+    /// client ceiling must move with it or a first pairing becomes unapprovable by hand again.
+    const HOST_PENDING_APPROVAL_WAIT: Duration = Duration::from_secs(180);
+    /// An unpaired device's first knock is held silent host-side, so the client must keep the
+    /// connection past the park instead of failing at the first 15 s of silence.
+    #[test]
+    fn offer_wait_outlasts_the_hosts_pairing_park() {
+        let total = FIRST_OFFER_WAIT + APPROVAL_WAIT;
+        assert!(
+            total > HOST_PENDING_APPROVAL_WAIT + Duration::from_secs(15),
+            "client gives up at {total:?}, not comfortably past the host's {HOST_PENDING_APPROVAL_WAIT:?} park"
+        );
+        assert!(
+            FIRST_OFFER_WAIT < APPROVAL_WAIT,
+            "the narrated wait must be shorter than the extra grace it announces"
+        );
+    }
 
     /// The bug this guards: `Hello` used to advertise AV1 unconditionally while the default
     /// `ffmpeg.exe` backend refuses it, so a host could pick a codec the client cannot decode.

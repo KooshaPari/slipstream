@@ -733,6 +733,70 @@ mod tests {
         assert!(state.last_point.is_none());
     }
 
+    /// Focus loss must release a held mouse button, not only held keys (5f81c2f5): a button pressed
+    /// when the window goes inactive would otherwise stay down on the host.
+    #[test]
+    fn focus_loss_releases_held_mouse_buttons() {
+        let (sender, mut rx) = InputSender::channel();
+        sender.set_enabled(true);
+        sender.set_focused(true);
+        let state = Arc::new(Mutex::new(InputState {
+            sender: Some(sender),
+            held_keys: [0; 4],
+            held_buttons: 1 << 1, // left only
+            last_point: None,
+        }));
+
+        release_held_input(&state);
+
+        let mut released = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            released.push((ev.kind, ev.code));
+        }
+        assert_eq!(
+            released,
+            vec![(InputKind::MouseButtonUp, 1)],
+            "exactly the held button is released"
+        );
+        assert_eq!(state.lock().unwrap().held_buttons, 0);
+    }
+
+    /// Teardown runs on every exit path, and more than one of them can fire for the same session
+    /// (the window procedure's WM_DESTROY and the presenter's drop). The second pass must emit
+    /// nothing: a duplicate release would inject a spurious up event into a later session.
+    #[test]
+    fn releasing_held_input_twice_emits_nothing_the_second_time() {
+        let (sender, mut rx) = InputSender::channel();
+        sender.set_enabled(true);
+        sender.set_focused(true);
+        let state = Arc::new(Mutex::new(InputState {
+            sender: Some(sender),
+            held_keys: {
+                let mut keys = [0u64; 4];
+                keys[0x41 / 64] |= 1u64 << (0x41 % 64); // 'A'
+                keys
+            },
+            held_buttons: 1 << 3, // right
+            last_point: Some((4, 4)),
+        }));
+
+        release_held_input(&state);
+        let first: Vec<(InputKind, u32)> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|ev| (ev.kind, ev.code))
+            .collect();
+        assert_eq!(
+            first.len(),
+            2,
+            "one key-up and one button-up on the first pass, got {first:?}"
+        );
+
+        release_held_input(&state);
+        assert!(
+            matches!(rx.try_recv(), Err(_)),
+            "a second teardown released something again"
+        );
+    }
+
     /// The bug this guards: the `NoFrame` branch slept bare, so a pending close sat unhandled for
     /// as long as the stream stalled. A presenter that pumps messages while idle must observe a
     /// posted `WM_CLOSE` within 100 ms. The close is posted to the thread (as `wndproc` does for

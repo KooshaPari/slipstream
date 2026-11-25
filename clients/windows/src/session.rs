@@ -390,6 +390,11 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
 
     // Admission is the first gate: input events before this point are never queued. The second
     // gate is window focus, maintained by WM_ACTIVATE/WM_SETFOCUS/WM_KILLFOCUS in `window.rs`.
+    //
+    // Teardown release: every exit path from here (clean end, host disconnect, poll or write error)
+    // drops the presenter on the session thread, and `GdiPresenter::drop` releases whatever the
+    // window still holds down. It must NOT depend on the pump task below, which is cancelled by
+    // `InputSenderGuard` as the session ends — that is why forced releases take the direct route.
     let _input_guard = input.as_ref().map(|s| {
         s.set_enabled(true);
         // Held-input releases go straight to the connection from here on. The pump task is

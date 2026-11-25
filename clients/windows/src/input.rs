@@ -13,7 +13,7 @@ use anyhow::Result;
 use quinn::Connection;
 use slipstream_core::input::{InputEvent, InputKind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -25,14 +25,35 @@ const MOUSE_X1: u32 = 4;
 const MOUSE_X2: u32 = 5;
 const SCROLL_HORIZONTAL: u32 = 1;
 
+/// Where a forced release goes once the session has a connection: encoded input bytes, handed
+/// straight to it instead of being queued for the pump task.
+type ReleaseRoute = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 /// One client's input route. Clone it into the window procedure; it stays inert until the session
 /// is admitted and the window reports focus.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InputSender {
     tx: UnboundedSender<InputEvent>,
     enabled: Arc<AtomicBool>,
     focused: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    /// Set once admitted. A release must not depend on the pump task still being alive: the pump
+    /// is cancelled at session end, which is exactly when a held key has to be let go.
+    release_route: Arc<Mutex<Option<ReleaseRoute>>>,
+}
+
+// `ReleaseRoute` is a boxed closure with no useful `Debug`, so the flags are what a reader needs.
+impl std::fmt::Debug for InputSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputSender")
+            .field("enabled", &self.enabled.load(Ordering::Relaxed))
+            .field("focused", &self.focused.load(Ordering::Relaxed))
+            .field(
+                "direct_release",
+                &self.release_route.lock().unwrap().is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl InputSender {
@@ -46,6 +67,7 @@ impl InputSender {
                 enabled: Arc::new(AtomicBool::new(false)),
                 focused: Arc::new(AtomicBool::new(false)),
                 shutdown: Arc::new(AtomicBool::new(false)),
+                release_route: Arc::new(Mutex::new(None)),
             },
             rx,
         )
@@ -61,6 +83,27 @@ impl InputSender {
         self.focused.store(focused, Ordering::Relaxed);
     }
 
+    /// Give forced releases a direct path to `conn`, bypassing the pump queue.
+    ///
+    /// Called once the session is admitted. `Connection::send_datagram` is safe from any thread, so
+    /// the window thread can emit a release itself; nothing has to be alive in the async runtime.
+    pub fn attach_release_route(&self, conn: Connection) {
+        let route: ReleaseRoute = Arc::new(move |bytes: &[u8]| {
+            if let Err(e) = conn.send_datagram(bytes.to_vec().into()) {
+                // A release is lossy like every other input datagram, but it is the one that
+                // unsticks a key, so a failure is worth a log line.
+                tracing::debug!(error = %format!("{e:?}"), "held-input release send failed");
+            }
+        });
+        self.set_release_route(route);
+    }
+
+    /// Install the sink a forced release is handed to. Production passes the connection; tests
+    /// pass a recorder.
+    fn set_release_route(&self, route: ReleaseRoute) {
+        *self.release_route.lock().unwrap() = Some(route);
+    }
+
     /// Submit one captured event. Focus and admission are checked here, not in the window
     /// procedure, so a message-handling mistake cannot leak local input to the host.
     pub fn submit(&self, event: InputEvent) {
@@ -72,8 +115,16 @@ impl InputSender {
 
     /// Submit a forced key-up/button-up during focus loss. Admission still applies, but focus does
     /// not: the release must reach the host even though the window just became inactive.
+    ///
+    /// Prefers the direct route when one is attached, so a release queued on the way out of a
+    /// session cannot be dropped with the pump task.
     pub fn submit_release(&self, event: InputEvent) {
         if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let direct = self.release_route.lock().unwrap().clone();
+        if let Some(route) = direct {
+            route(&event.encode());
             return;
         }
         let _ = self.tx.send(event);
@@ -273,5 +324,34 @@ mod tests {
         sender.set_enabled(true);
         sender.submit_release(release);
         assert_eq!(rx.try_recv().unwrap(), release);
+    }
+
+    /// At session end the pump task is on its way out, so a queued release may never be sent. With
+    /// a route attached the release goes straight out, and admission still gates it.
+    #[test]
+    fn forced_release_uses_the_direct_route_once_attached() {
+        let (sender, mut rx) = InputSender::channel();
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        sender.set_release_route(Arc::new(move |bytes: &[u8]| {
+            sink.lock().unwrap().push(bytes.to_vec())
+        }));
+        let release = key(false, 0x41).unwrap();
+
+        sender.submit_release(release); // not admitted yet
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "admission still gates releases"
+        );
+
+        sender.set_enabled(true);
+        sender.submit_release(release);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "the release did not take the direct route");
+        assert_eq!(sent[0], release.encode());
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a direct release must not also be queued"
+        );
     }
 }

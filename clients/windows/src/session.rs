@@ -345,6 +345,10 @@ pub async fn run_stream(cfg: SessionConfig) -> Result<SessionOutcome> {
     // gate is window focus, maintained by WM_ACTIVATE/WM_SETFOCUS/WM_KILLFOCUS in `window.rs`.
     let _input_guard = input.as_ref().map(|s| {
         s.set_enabled(true);
+        // Held-input releases go straight to the connection from here on. The pump task is
+        // cancelled when the session ends, which is exactly when a stuck key has to be freed, so a
+        // release must not depend on it.
+        s.attach_release_route(conn.clone());
         InputSenderGuard::new(s.clone())
     });
     if let (Some(sender), Some(rx)) = (&input, input_rx) {

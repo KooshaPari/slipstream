@@ -303,6 +303,9 @@ pub struct GdiPresenter {
     hdc_mem: HDC,
     /// The DIB currently selected into `hdc_mem`, plus the handle to restore on drop.
     dibs: DibHandles,
+    /// This window's input bookkeeping, so `Drop` can release whatever is still held down when the
+    /// session ends (a host must not keep a key pressed after the client goes away).
+    input_state: Arc<Mutex<InputState>>,
     bits: *mut core::ffi::c_void,
     width: u32,
     height: u32,
@@ -372,7 +375,8 @@ impl GdiPresenter {
             )
         }
         .context("CreateWindowExW")?;
-        state_for(hwnd).lock().unwrap().sender = input;
+        let input_state = state_for(hwnd);
+        input_state.lock().unwrap().sender = input;
         let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
 
         let hdc_mem = unsafe { CreateCompatibleDC(None) };
@@ -392,6 +396,7 @@ impl GdiPresenter {
             hwnd,
             hdc_mem,
             dibs: DibHandles::new(stock, HGDIOBJ(dib.0)),
+            input_state,
             bits,
             width,
             height,
@@ -593,6 +598,10 @@ impl Presenter for GdiPresenter {
 
 impl Drop for GdiPresenter {
     fn drop(&mut self) {
+        // The session is over on every path that reaches here (clean end, host disconnect, error),
+        // and the window may never have received the focus-loss message that normally releases
+        // input. Do it here so the host is never left holding a key or button down.
+        release_held_input(&self.input_state);
         remove_state(self.hwnd);
         unsafe {
             // Restore the handle captured at construction, never one a resize deleted, then
@@ -609,6 +618,7 @@ impl Drop for GdiPresenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slipstream_core::input::InputKind;
 
     /// A handle value only ever compared, never passed to GDI.
     fn handle(n: usize) -> HGDIOBJ {
@@ -651,5 +661,47 @@ mod tests {
         let mut dibs = DibHandles::new(HGDIOBJ(std::ptr::null_mut()), handle(2));
         dibs.swap(handle(3));
         assert!(dibs.restore_target().is_none());
+    }
+
+    /// Session end releases what the window still holds down, including a key and buttons that
+    /// never received their up message because the session simply ended.
+    #[test]
+    fn session_end_releases_every_held_key_and_button() {
+        let (sender, mut rx) = InputSender::channel();
+        sender.set_enabled(true);
+        sender.set_focused(true);
+
+        let mut held_keys = [0u64; 4];
+        for vk in [0x41u32, 0xA0] {
+            // 'A' and left shift
+            held_keys[(vk / 64) as usize] |= 1u64 << (vk % 64);
+        }
+        let held_buttons = (1u8 << 1) | (1u8 << 3); // left + right
+        let state = Arc::new(Mutex::new(InputState {
+            sender: Some(sender),
+            held_keys,
+            held_buttons,
+            last_point: Some((10, 10)),
+        }));
+
+        release_held_input(&state);
+
+        let mut released = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            released.push((ev.kind, ev.code));
+        }
+        assert!(released.contains(&(InputKind::KeyUp, 0x41)));
+        assert!(released.contains(&(InputKind::KeyUp, 0xA0)));
+        assert!(released.contains(&(InputKind::MouseButtonUp, 1)));
+        assert!(released.contains(&(InputKind::MouseButtonUp, 3)));
+        assert_eq!(released.len(), 4, "only the held inputs are released");
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.held_keys, [0; 4],
+            "the release must clear the bookkeeping"
+        );
+        assert_eq!(state.held_buttons, 0);
+        assert!(state.last_point.is_none());
     }
 }

@@ -180,11 +180,13 @@ pub(crate) fn dedupe_to_physical_cards(
 ///
 /// Reads the PCI enum tree (`HKLM\SYSTEM\CurrentControlSet\Enum\PCI`): every hardware id key is
 /// `VEN_xxxx&DEV_xxxx&SUBSYS_...&REV_...`, and each child key is one device instance (one
-/// physical card). A genuine twin adds a second instance. Any failure yields an empty map,
-/// which disables dedupe rather than guessing.
+/// physical card). A genuine twin adds a second instance. Any failure yields an empty map, which
+/// disables dedupe rather than guessing: a *partial* count would cap a model at the instances that
+/// happened to be readable and drop a physically distinct card whose sibling key failed to open.
 #[cfg(target_os = "windows")]
 fn physical_device_counts() -> HashMap<(u32, u32), usize> {
     use windows::core::PWSTR;
+    use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
     };
@@ -198,7 +200,12 @@ fn physical_device_counts() -> HashMap<(u32, u32), usize> {
         Some((field("VEN_")?, field("DEV_")?))
     }
 
-    fn enum_subkeys(key: HKEY, mut visit: impl FnMut(&str)) {
+    /// Visit every subkey of `key` in registry order.
+    ///
+    /// `false` means the walk did not finish: only `ERROR_NO_MORE_ITEMS` is a normal end, and
+    /// anything else (a key removed mid-walk, access denied) leaves a partial list the caller must
+    /// not treat as complete.
+    fn enum_subkeys(key: HKEY, mut visit: impl FnMut(&str)) -> bool {
         let mut index = 0u32;
         loop {
             let mut name = [0u16; 256];
@@ -217,12 +224,55 @@ fn physical_device_counts() -> HashMap<(u32, u32), usize> {
                     None,
                 )
             };
+            if rc == ERROR_NO_MORE_ITEMS {
+                return true;
+            }
             if rc.is_err() {
-                return;
+                return false;
             }
             visit(&String::from_utf16_lossy(&name[..len as usize]));
             index += 1;
         }
+    }
+
+    /// Device instances per `(vendor_id, device_id)` under the opened PCI enum key.
+    ///
+    /// `None` means the tree could not be read completely; the caller then disables dedupe instead
+    /// of capping a model at a count it only partly observed.
+    fn collect_counts(root: HKEY) -> Option<HashMap<(u32, u32), usize>> {
+        let mut hardware_ids = Vec::new();
+        if !enum_subkeys(root, |name| {
+            if let Some(ids) = parse_pci_ids(name) {
+                hardware_ids.push((ids, name.to_owned()));
+            }
+        }) {
+            return None;
+        }
+        let mut counts: HashMap<(u32, u32), usize> = HashMap::new();
+        for (ids, name) in hardware_ids {
+            let mut sub = HKEY::default();
+            let mut wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: `wide` is NUL-terminated for the duration of the call; `sub` is a live
+            // out-param and is closed below on the path that opened it.
+            let rc =
+                unsafe { RegOpenKeyExW(root, PWSTR(wide.as_mut_ptr()), 0, KEY_READ, &mut sub) };
+            if rc.is_err() {
+                return None;
+            }
+            let mut instances = 0usize;
+            let complete = enum_subkeys(sub, |_| instances += 1);
+            // SAFETY: `sub` came from a successful RegOpenKeyExW and is closed exactly once.
+            unsafe {
+                let _ = RegCloseKey(sub);
+            }
+            if !complete {
+                return None;
+            }
+            if instances > 0 {
+                *counts.entry(ids).or_default() += instances;
+            }
+        }
+        Some(counts)
     }
 
     let mut counts = HashMap::new();
@@ -242,28 +292,14 @@ fn physical_device_counts() -> HashMap<(u32, u32), usize> {
         tracing::debug!("PCI enum tree unavailable — GPU inventory left undeduped");
         return counts;
     }
-    let mut hardware_ids = Vec::new();
-    enum_subkeys(root, |name| {
-        if let Some(ids) = parse_pci_ids(name) {
-            hardware_ids.push((ids, name.to_owned()));
-        }
-    });
-    for (ids, name) in hardware_ids {
-        let mut instances = 0usize;
-        let mut sub = HKEY::default();
-        let mut wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: `wide` is NUL-terminated for the duration of the call; `sub` is a live
-        // out-param and is closed right after enumeration.
-        let rc = unsafe { RegOpenKeyExW(root, PWSTR(wide.as_mut_ptr()), 0, KEY_READ, &mut sub) };
-        if rc.is_ok() {
-            enum_subkeys(sub, |_| instances += 1);
-            // SAFETY: `sub` came from a successful RegOpenKeyExW and is closed exactly once.
-            unsafe {
-                let _ = RegCloseKey(sub);
-            }
-        }
-        if instances > 0 {
-            *counts.entry(ids).or_default() += instances;
+    match collect_counts(root) {
+        Some(complete) => counts = complete,
+        // Fail closed: an incomplete tree cannot be told apart from a machine that genuinely has
+        // fewer cards, and trusting it would silently hide a real GPU from selection.
+        None => {
+            tracing::warn!(
+                "PCI device tree could not be read completely — GPU inventory left undeduped"
+            );
         }
     }
     // SAFETY: `root` came from a successful RegOpenKeyExW above; closed exactly once.

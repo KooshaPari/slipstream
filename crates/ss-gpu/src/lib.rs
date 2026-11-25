@@ -152,6 +152,27 @@ mod tests {
         assert_eq!(gpus[1].id, "10de-2c05-1");
     }
 
+    /// Occurrences are assigned after duplicate adapter instances are collapsed, so a card's
+    /// occurrence moves when the OS stops reporting a duplicate for an earlier card. Among two
+    /// physically identical cards a stale occurrence must NOT be recovered onto the first one: that
+    /// would silently stream from the other physical GPU. It reports missing (visible fallback).
+    #[test]
+    fn stale_occurrence_between_identical_twins_does_not_pick_the_wrong_card() {
+        let mut gpus = vec![
+            gpu(VENDOR_NVIDIA, 0x2c05, "NVIDIA GeForce RTX 5070 Ti", 16),
+            gpu(VENDOR_NVIDIA, 0x2c05, "NVIDIA GeForce RTX 5070 Ti", 16),
+        ];
+        assign_ids(&mut gpus);
+        let pref = manual(VENDOR_NVIDIA, 0x2c05, 2, "NVIDIA GeForce RTX 5070 Ti");
+        let want = pref.gpu.as_ref().unwrap();
+        assert!(
+            find_preferred(&gpus, want).is_none(),
+            "two same-model twins make the fallback ambiguous"
+        );
+        let (_, src) = pick(&gpus, &pref, None).unwrap();
+        assert_eq!(src, PickSource::PreferenceMissing);
+    }
+
     #[test]
     fn store_round_trips_and_survives_corruption() {
         let dir = tempfile::tempdir().unwrap();

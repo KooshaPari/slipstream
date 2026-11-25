@@ -235,8 +235,15 @@ impl ClipboardBackend {
         ClipboardBackend,
         tokio::sync::mpsc::UnboundedReceiver<ClipEvent>,
     )> {
-        let conn = Connection::connect_to_env()
-            .context("connect to Wayland for clipboard (WAYLAND_DISPLAY/XDG_RUNTIME_DIR set?)")?;
+        // `ext-data-control` is implemented by KWin, wlroots, Hyprland and Sway, so the rule is
+        // "our uid, a real executable image". It is still a check: the peer is authenticated by
+        // SO_PEERCRED and /proc/<pid>/exe before any selection crosses the socket, so a squatter
+        // at the env-named path cannot read or replace the host clipboard.
+        let conn = ss_wayland::connect_env(
+            ss_wayland::PeerRule::SameUid,
+            ss_wayland::default_proc_root(),
+        )
+        .context("connect to Wayland for clipboard (WAYLAND_DISPLAY/XDG_RUNTIME_DIR set?)")?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());

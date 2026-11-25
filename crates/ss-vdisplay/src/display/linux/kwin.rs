@@ -25,6 +25,7 @@
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
+use ss_wayland::PeerRule;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -1431,36 +1432,29 @@ pub fn warm_socket() {
 /// is absent or no longer usable (a compositor restart re-creates its socket). Also used by
 /// output management (`kwin_output_mgmt::Session::open`) so display configuration survives
 /// WAYLAND_DISPLAY being cleared, not just virtual-output creation.
-/// Connect through the one authenticated resolver every KWin session path uses. The socket env can
-/// be rewritten by session teardown, so [`connect_kwin`] also repairs the process variables before
-/// connecting; a fallback peer is accepted only after its `SO_PEERCRED` PID is proven to belong to
-/// KWin. Fail closed when that proof is unavailable.
+///
+/// Every candidate — pinned, environment-named or fallback — is authenticated by the one resolver
+/// in `ss-wayland`: `SO_PEERCRED` credentials plus `/proc/<pid>/exe` must prove the peer is KWin
+/// before the connection is used. A candidate that cannot prove itself is skipped and, if none
+/// proves itself, the call fails closed instead of connecting unauthenticated.
 pub(crate) fn connect_kwin() -> Result<Connection> {
     connect_kwin_checked()
 }
 
 fn connect_kwin_checked() -> Result<Connection> {
     // WAYLAND_SOCKET (fd inheritance, e.g. sandboxed launch) selects the compositor directly and
-    // outranks the pinned path. It has no path to record; the host that handed us the fd chose it.
+    // outranks the pinned path. It has no path to record, so the peer behind the inherited fd is
+    // what gets authenticated — the same rule, applied to the descriptor the launcher chose.
     if std::env::var_os("WAYLAND_SOCKET").is_some() {
-        return Connection::connect_to_env().context("WAYLAND_SOCKET");
+        return ss_wayland::connect_env(PeerRule::KWin, &proc_root()).context("WAYLAND_SOCKET");
     }
     if let Some(path) = pinned_socket() {
-        if let Some(connection) = connect_verified(&path, "KWin pinned socket")? {
+        if let Some(connection) = checked(&path, "KWin pinned socket")? {
             return Ok(connection);
         }
     }
-    if let (Some(display), Some(runtime)) = (
-        std::env::var_os("WAYLAND_DISPLAY"),
-        std::env::var_os("XDG_RUNTIME_DIR"),
-    ) {
-        let display_path = std::path::PathBuf::from(&display);
-        let path = if display_path.is_absolute() {
-            display_path
-        } else {
-            std::path::PathBuf::from(&runtime).join(display_path)
-        };
-        if let Some(connection) = connect_verified(&path, "KWin environment socket")? {
+    if let Some(path) = ss_wayland::env_socket_path() {
+        if let Some(connection) = checked(&path, "KWin environment socket")? {
             return Ok(connection);
         }
     }
@@ -1468,7 +1462,7 @@ fn connect_kwin_checked() -> Result<Connection> {
         // Every candidate is a *candidate*: a non-KWin listener can hold the newest slot, so keep
         // trying until one proves itself rather than letting a squatter deny the fallback.
         for path in fallback_wayland_sockets() {
-            if let Some(connection) = connect_verified(&path, "KWin fallback socket")? {
+            if let Some(connection) = checked(&path, "KWin fallback socket")? {
                 tracing::info!(socket = %path.display(),
                     "KWin: stale env repaired - connected via an authenticated runtime-dir socket");
                 // Repair the poisoned process-wide env so later diagnostics and child processes
@@ -1481,52 +1475,12 @@ fn connect_kwin_checked() -> Result<Connection> {
     bail!("no authenticated KWin Wayland socket is available")
 }
 
-/// Connect to `path` and hand the connection out only after `SO_PEERCRED` proves the peer is KWin.
+/// One authenticated candidate, resolved against this crate's test-overridable `/proc` root.
 ///
-/// `Ok(None)` means "this candidate is not usable" — the caller moves on to the next one. A peer
-/// whose credentials cannot be read is rejected too: the pinned and environment paths are just as
-/// reachable by a squatter as the fallback scan, so none of them may skip the check.
-fn connect_verified(path: &std::path::Path, what: &str) -> Result<Option<Connection>> {
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(stream) => match peer_pid(&stream) {
-            Some(pid) if peer_process_is_kwin(pid) => Ok(Some(
-                Connection::from_socket(stream)
-                    .with_context(|| format!("Wayland socket {}", path.display()))?,
-            )),
-            Some(pid) => {
-                // Log the socket name only: the full path is a local filesystem layout detail.
-                tracing::warn!(pid, socket = %socket_name(path), "{what} rejected: peer is not KWin");
-                Ok(None)
-            }
-            None => {
-                tracing::warn!(socket = %socket_name(path),
-                    "{what} rejected: peer credentials unavailable");
-                Ok(None)
-            }
-        },
-        Err(error) => {
-            // errno only: the socket *name* can itself be a caller-chosen temp path, and the
-            // diagnostic contract here is "which errno", not "which local path".
-            tracing::warn!(errno = ?error.raw_os_error(), "{what} connect failed");
-            Ok(None)
-        }
-    }
-}
-
-/// The socket's file name, for logs that must not leak local filesystem layout.
-fn socket_name(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "<socket>".into())
-}
-
-/// `(comm, argv0)` of a process from the effective `/proc` root, read without interpreting its
-/// contents as commands. Tests may override the root, but production always uses `/proc`.
-fn proc_identity(pid: i32) -> Option<(String, Vec<u8>)> {
-    let root = proc_root();
-    let comm = std::fs::read_to_string(root.join(pid.to_string()).join("comm")).ok()?;
-    let argv0 = std::fs::read(root.join(pid.to_string()).join("cmdline")).ok()?;
-    Some((comm.trim().to_string(), argv0))
+/// The checks themselves live in `ss-wayland` so input injection and the clipboard refuse the same
+/// impostors instead of each carrying (or omitting) its own copy.
+fn checked(path: &std::path::Path, what: &str) -> Result<Option<Connection>> {
+    ss_wayland::connect_verified(path, PeerRule::KWin, &proc_root(), what)
 }
 
 /// Where `/proc` lives. The override exists so tests can point at a fixture tree; it is compiled
@@ -1537,54 +1491,13 @@ fn proc_root() -> std::path::PathBuf {
     if let Some(root) = std::env::var_os("SLIPSTREAM_KWIN_PROC_ROOT") {
         return std::path::PathBuf::from(root);
     }
-    std::path::PathBuf::from("/proc")
+    std::path::PathBuf::from(ss_wayland::DEFAULT_PROC_ROOT)
 }
 
-/// True when `pid` is KWin itself, not merely another Wayland server running as this uid. Match the
-/// executable basename and require it to be KWin, allowing distribution wrappers such as
-/// `kwin_x11 --wayland` and `kwin_wayland_wrapper`.
-fn peer_process_is_kwin(pid: i32) -> bool {
-    let Some((comm, argv0)) = proc_identity(pid) else {
-        return false;
-    };
-    let comm = comm.trim_start_matches('.').to_ascii_lowercase();
-    if !(comm == "kwin_wayland" || comm.starts_with("kwin_wayland-")) {
-        return false;
-    }
-    let first_arg = argv0.split(|b| *b == 0).next().unwrap_or_default();
-    let first_arg = String::from_utf8_lossy(first_arg);
-    let base = std::path::Path::new(first_arg.as_ref())
-        .file_name()
-        .map(|n| {
-            n.to_string_lossy()
-                .trim_start_matches('.')
-                .to_ascii_lowercase()
-        });
-    base.is_some_and(|b| b == "kwin_wayland" || b.starts_with("kwin_wayland-"))
-}
-
-/// Peer PID from `SO_PEERCRED`, or `None` when the socket is not a Unix stream with credentials.
-fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
-    use std::os::fd::AsFd;
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: `libc::ucred` is a plain-old-data struct of integer fields, so all-zero is a valid
-    // initial value; `getsockopt` below overwrites it on success and the result is only read when
-    // the call reports success.
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `cred` is a live, correctly aligned `libc::ucred`; `len` is its exact byte size, and
-    // getsockopt only writes within that object. The fd belongs to `stream`, alive across the call.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_fd().as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    (rc == 0 && len as usize >= std::mem::size_of::<libc::ucred>() && cred.pid > 0)
-        .then_some(cred.pid)
+/// Test-only view of the shared KWin identity rule, resolved against the overridable `/proc` root.
+#[cfg(test)]
+fn peer_is(pid: i32) -> bool {
+    ss_wayland::peer_is(pid, PeerRule::KWin, &proc_root())
 }
 
 /// Keep process-global Wayland variables pointed at the authenticated fallback socket so later
@@ -1647,6 +1560,7 @@ mod diagnostic_socket_tests {
             "nonunicode",
             "poisoned",
             "fallback",
+            "symlink",
         ] {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
             cmd.args([
@@ -1735,6 +1649,12 @@ mod diagnostic_socket_tests {
                 std::fs::write(
                     dir.join(pid.to_string()).join("cmdline"),
                     "/usr/bin/kwin_wayland\0--wayland\0",
+                )
+                .unwrap();
+                // Identity comes from /proc/<pid>/exe now, so the fixture must carry the link too.
+                std::os::unix::fs::symlink(
+                    "/usr/bin/kwin_wayland",
+                    dir.join(pid.to_string()).join("exe"),
                 )
                 .unwrap();
                 let runtime = dir.join("run");
@@ -1828,6 +1748,12 @@ mod diagnostic_socket_tests {
                     "/usr/bin/kwin_wayland\0--wayland\0",
                 )
                 .unwrap();
+                // Identity comes from /proc/<pid>/exe now, so the fixture must carry the link too.
+                std::os::unix::fs::symlink(
+                    "/usr/bin/kwin_wayland",
+                    proc_root.join(pid.to_string()).join("exe"),
+                )
+                .unwrap();
                 std::env::set_var("SLIPSTREAM_KWIN_PROC_ROOT", &proc_root);
                 let result = super::connect_kwin();
                 let _first = listener.accept().expect("one socket connection");
@@ -1843,27 +1769,88 @@ mod diagnostic_socket_tests {
             }
             "fd" => {
                 let (client, _server) = UnixStream::pair().unwrap();
+                // The inherited fd is authenticated too: the peer behind a socketpair is this
+                // process, so the fixture must report this pid as KWin.
+                let pid = std::process::id();
+                let proc_root = std::env::temp_dir().join(format!("slipstream-wayland-fd-{pid}"));
+                let _ = std::fs::remove_dir_all(&proc_root);
+                std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+                std::fs::write(
+                    proc_root.join(pid.to_string()).join("comm"),
+                    "kwin_wayland\n",
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(
+                    "/usr/bin/kwin_wayland",
+                    proc_root.join(pid.to_string()).join("exe"),
+                )
+                .unwrap();
+                std::env::set_var("SLIPSTREAM_KWIN_PROC_ROOT", &proc_root);
                 std::env::set_var("WAYLAND_SOCKET", client.into_raw_fd().to_string());
                 std::env::set_var("WAYLAND_DISPLAY", &path);
                 assert!(super::connect_kwin().is_ok());
                 assert!(std::env::var_os("WAYLAND_SOCKET").is_none());
+                let _ = std::fs::remove_dir_all(&proc_root);
             }
             "nonunicode" => {
                 std::env::set_var("WAYLAND_SOCKET", OsString::from_vec(vec![255]));
                 std::env::set_var("WAYLAND_DISPLAY", &path);
                 assert!(super::connect_kwin().is_err());
             }
+            // A symlink planted at the env-named socket path must be refused, never followed, even
+            // when the process behind the real socket would pass authentication.
+            "symlink" => {
+                let pid = std::process::id();
+                let proc_root = std::env::temp_dir().join(format!("slipstream-wayland-link-{pid}"));
+                let _ = std::fs::remove_dir_all(&proc_root);
+                std::fs::create_dir_all(proc_root.join(pid.to_string())).unwrap();
+                std::fs::write(
+                    proc_root.join(pid.to_string()).join("comm"),
+                    "kwin_wayland\n",
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(
+                    "/usr/bin/kwin_wayland",
+                    proc_root.join(pid.to_string()).join("exe"),
+                )
+                .unwrap();
+                let dir = std::env::temp_dir().join(format!("slipstream-wayland-link-dir-{pid}"));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                let real = dir.join("wayland-0");
+                let listener = UnixListener::bind(&real).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let link = dir.join("wayland-linked");
+                std::os::unix::fs::symlink(&real, &link).unwrap();
+                std::env::set_var("XDG_RUNTIME_DIR", std::env::temp_dir());
+                std::env::set_var("WAYLAND_DISPLAY", &link);
+                std::env::set_var("SLIPSTREAM_KWIN_PROC_ROOT", &proc_root);
+                assert!(
+                    super::connect_kwin().is_err(),
+                    "a symlinked socket path must not be followed"
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "nothing may reach the socket behind the link"
+                );
+                std::env::remove_var("SLIPSTREAM_KWIN_PROC_ROOT");
+                drop(listener);
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&proc_root);
+            }
             _ => panic!("unknown connection test case"),
         }
     }
 
-    /// A PID whose `/proc` entry names a KWin executable is accepted; an ordinary process and an
-    /// unreadable PID are rejected. Auth checks textual process identity only, never spawns it.
+    /// A PID whose `/proc` entry resolves to a KWin executable is accepted; an ordinary process, an
+    /// unreadable PID, and a process whose `comm` claims KWin over a non-KWin image are rejected.
+    /// Auth reads process identity only, never spawns it.
     #[test]
     fn fallback_peer_must_look_like_kwin() {
         let self_pid = std::process::id() as i32;
-        assert!(!super::peer_process_is_kwin(self_pid));
-        assert!(!super::peer_process_is_kwin(i32::MAX));
+        assert!(!super::peer_is(self_pid));
+        assert!(!super::peer_is(i32::MAX));
         // KWin's comm is capped at 15 bytes, so the wrapper's `.kwin_wayland-w` form is expected.
         let dir = PathBuf::from(format!(
             "{}/proc-identity-{}",
@@ -1879,11 +1866,23 @@ mod diagnostic_socket_tests {
             dir.join((self_pid + 1).to_string()).join("cmdline"),
             "/usr/bin/.kwin_wayland-wrapped\0--virtual\0",
         );
+        let _ = std::os::unix::fs::symlink(
+            "/usr/bin/bash",
+            dir.join((self_pid + 1).to_string()).join("exe"),
+        );
         let path = dir.to_string_lossy();
         std::env::set_var("SLIPSTREAM_KWIN_PROC_ROOT", path.as_ref());
-        assert!(super::peer_process_is_kwin(self_pid + 1));
+        assert!(super::peer_is(self_pid + 1));
+        // The same comm over a non-interpreter image is not KWin, whatever it calls itself.
+        std::fs::remove_file(dir.join((self_pid + 1).to_string()).join("exe")).unwrap();
+        std::os::unix::fs::symlink(
+            "/usr/bin/squatter",
+            dir.join((self_pid + 1).to_string()).join("exe"),
+        )
+        .unwrap();
+        assert!(!super::peer_is(self_pid + 1));
         std::env::remove_var("SLIPSTREAM_KWIN_PROC_ROOT");
-        assert!(!super::peer_process_is_kwin(self_pid + 1));
+        assert!(!super::peer_is(self_pid + 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

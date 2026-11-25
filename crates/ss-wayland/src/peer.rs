@@ -6,7 +6,7 @@
 //! read successfully.
 
 use anyhow::{bail, Context, Result};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -91,18 +91,27 @@ fn own_gid() -> u32 {
 /// Peer credentials from `SO_PEERCRED`, or `None` when the socket is not a Unix stream that
 /// reports them. A `pid` the kernel cannot attribute (0) is treated as unavailable.
 pub fn peer_credentials(stream: &UnixStream) -> Option<PeerCredentials> {
-    use std::os::fd::AsRawFd;
+    peer_credentials_fd(stream.as_raw_fd())
+}
+
+/// Peer credentials for a raw descriptor, without taking ownership of it.
+///
+/// The inherited `WAYLAND_SOCKET` descriptor is checked this way *before* it is wrapped in a
+/// `UnixStream`: a malformed value must not become an `OwnedFd` that closes some unrelated
+/// descriptor when it is dropped.
+pub fn peer_credentials_fd(fd: RawFd) -> Option<PeerCredentials> {
     // SAFETY: `libc::ucred` is plain-old-data (integer fields), so all-zero is a valid initial
     // value; `getsockopt` below overwrites it on success and the fields are only read when the
     // call reports success and a full-sized struct was written.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: `cred` is a live, correctly aligned `libc::ucred`; `len` is its exact byte size, and
-    // `getsockopt` writes only within that object. The fd belongs to `stream`, alive across the
-    // call, and `SO_PEERCRED` reads no user-supplied option buffer.
+    // `getsockopt` writes only within that object. `SO_PEERCRED` reads no user-supplied option
+    // buffer, and a descriptor that is not a connected Unix socket simply reports failure (it is
+    // not closed or otherwise modified here).
     let rc = unsafe {
         libc::getsockopt(
-            stream.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             (&mut cred as *mut libc::ucred).cast(),
@@ -332,16 +341,25 @@ fn authenticate(
     let Some(credentials) = peer_credentials(stream) else {
         return Err(format!("{what} peer credentials unavailable"));
     };
+    authenticate_with(credentials, rule, proc_root, what)?;
+    tracing::debug!(socket = %socket_name(path), "Wayland peer authenticated");
+    Ok(())
+}
+
+/// Apply the identity half of the check to credentials already read from the descriptor.
+fn authenticate_with(
+    credentials: PeerCredentials,
+    rule: PeerRule,
+    proc_root: &Path,
+    what: &str,
+) -> std::result::Result<(), String> {
     let Some(identity) = peer_identity(credentials.pid, proc_root) else {
         return Err(format!(
             "{what} peer {} has no readable /proc identity",
             credentials.pid
         ));
     };
-    peer_allowed(&credentials, &identity, rule).map_err(|error| format!("{error:#}"))?;
-    tracing::debug!(socket = %socket_name(path), peer = %identity.exe.display(),
-        "Wayland peer authenticated");
-    Ok(())
+    peer_allowed(&credentials, &identity, rule).map_err(|error| format!("{error:#}"))
 }
 
 /// Connect to the compositor the process environment names, authenticated.
@@ -377,19 +395,18 @@ fn connect_inherited_fd(
         .and_then(|text| text.parse::<i32>().ok())
         .context("WAYLAND_SOCKET is not a numeric file descriptor")?;
     std::env::remove_var("WAYLAND_SOCKET");
+    // Read the credentials off the descriptor *before* claiming it: if the launcher's value is not
+    // a connected Unix socket (or the number names some unrelated descriptor), this fails without
+    // ever constructing the owned stream that would close it.
+    let credentials = peer_credentials_fd(parsed)
+        .context("WAYLAND_SOCKET is not a connected Unix socket with peer credentials")?;
     // SAFETY: `WAYLAND_SOCKET` carries a connected socket the launcher handed this process, and
     // taking ownership of it exactly once is this variable's documented contract. The number is
-    // validated by the peer check below before the connection is used; on any failure the stream
-    // is dropped, closing the descriptor once.
+    // proven to be a connected Unix socket above, and the peer is authenticated below before the
+    // connection is used; on that failure the stream is dropped, closing the descriptor once.
     let stream = unsafe { UnixStream::from_raw_fd(parsed) };
-    authenticate(
-        &stream,
-        rule,
-        proc_root,
-        "WAYLAND_SOCKET",
-        Path::new("<inherited fd>"),
-    )
-    .map_err(anyhow::Error::msg)?;
+    authenticate_with(credentials, rule, proc_root, "WAYLAND_SOCKET")
+        .map_err(anyhow::Error::msg)?;
     Connection::from_socket(stream).context("inherited Wayland socket")
 }
 
@@ -569,5 +586,32 @@ mod tests {
             resolve_exe(PathBuf::from("/usr/bin/kwin_wayland (deleted)")).unwrap(),
             PathBuf::from("/usr/bin/kwin_wayland")
         );
+    }
+
+    /// `WAYLAND_SOCKET` is a number from the environment, so the check must be able to look at a
+    /// descriptor without owning it: a pipe (or any non-socket) reports no credentials and is left
+    /// open, which is what stops a malformed value from closing an unrelated descriptor.
+    #[test]
+    fn a_non_socket_fd_reports_no_credentials_and_stays_open() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe(2)` writes exactly two descriptors into the two-element array supplied.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        assert!(peer_credentials_fd(fds[0]).is_none());
+        // The read end is still open, so closing it succeeds; the write end still accepts a byte.
+        // SAFETY: both descriptors were created by the `pipe(2)` above and are owned by this test,
+        // which closes each exactly once.
+        let closed = unsafe { libc::close(fds[0]) };
+        assert_eq!(
+            closed, 0,
+            "the check must not close a descriptor it did not own"
+        );
+        let byte = [1u8];
+        // SAFETY: `fds[1]` is live and `byte` is a one-byte stack array, so the write stays in
+        // bounds.
+        let wrote = unsafe { libc::write(fds[1], byte.as_ptr().cast(), 1) };
+        assert_eq!(wrote, 1);
+        // SAFETY: `fds[1]` is still owned by this test and is closed exactly once here.
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
 }

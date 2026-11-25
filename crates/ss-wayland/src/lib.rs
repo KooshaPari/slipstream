@@ -34,6 +34,6 @@ mod peer;
 #[cfg(target_os = "linux")]
 pub use peer::{
     connect_env, connect_verified, default_proc_root, env_socket_path, peer_allowed,
-    peer_credentials, peer_identity, peer_is, PeerCredentials, PeerIdentity, PeerRule,
-    DEFAULT_PROC_ROOT,
+    peer_credentials, peer_credentials_fd, peer_identity, peer_is, PeerCredentials, PeerIdentity,
+    PeerRule, DEFAULT_PROC_ROOT,
 };

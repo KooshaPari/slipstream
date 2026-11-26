@@ -193,6 +193,59 @@ fn parse_codec(c: &str) -> Option<u8> {
     }
 }
 
+/// Human name for a `CODEC_*` byte, for diagnostics.
+fn codec_name(codec: u8) -> &'static str {
+    use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+    match codec {
+        CODEC_H264 => "h264",
+        CODEC_HEVC => "hevc",
+        CODEC_AV1 => "av1",
+        _ => "unknown",
+    }
+}
+
+/// Comma-separated names of the codecs in a capability bit set, in a stable order.
+fn codec_names(available: u8) -> String {
+    use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+    [CODEC_H264, CODEC_HEVC, CODEC_AV1]
+        .into_iter()
+        .filter(|c| available & c != 0)
+        .map(codec_name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Refuse an explicit `--codec` the active decode backend cannot decode.
+///
+/// `--codec av1` stays in the accepted list because the Media Foundation backend decodes AV1 when
+/// the AV1 Video Extension is installed, and MF users legitimately need it. On the default ffmpeg
+/// backend it is not decodable, and letting the flag through only moves the failure to the host:
+/// the client would negotiate a stream it then refuses at decoder creation — the same session
+/// killer the `Hello` advertisement gate closed, reached by another door.
+///
+/// `available` is the very codec set the client advertises in `Hello` (`session::hello_codecs`),
+/// so this gate and the advertisement cannot drift: both answer "what can this backend decode?"
+/// from the one capability function.
+pub fn check_codec_support(preferred_codec: u8, available: u8) -> Result<(), String> {
+    // `0` is auto: the host picks from what we advertised, so it is always satisfiable.
+    if preferred_codec == 0 || preferred_codec & available != 0 {
+        return Ok(());
+    }
+    let name = codec_name(preferred_codec);
+    let supported = codec_names(available);
+    if preferred_codec == slipstream_core::quic::CODEC_AV1 {
+        Err(format!(
+            "--codec {name} requires the Media Foundation decoder backend with the AV1 Video \
+             Extension; supported here: {supported}"
+        ))
+    } else {
+        Err(format!(
+            "--codec {name} is not decodable by the active decoder backend; supported here: \
+             {supported}"
+        ))
+    }
+}
+
 /// The example used in `--monitor` diagnostics, spelled for a Windows host.
 pub const MONITOR_EXAMPLE: &str = r"gdi:\\.\DISPLAY1";
 
@@ -326,7 +379,15 @@ pub fn usage() -> &'static str {
     "usage: slipstream-windows [HOST[:PORT]] [--connect HOST[:PORT]] [--pin HEX | --pair PIN]\n\
      \x20      [--trust HEX] [--discover [SECS]] [--name LABEL] [--mode WxHxFPS] [--bitrate KBPS]\n\
      \x20      [--codec auto|h264|hevc|av1] [--audio-channels 2|6|8] [--seconds N] [--record FILE]\n\
-     \x20      [--play FILE] [--monitor BACKEND:NAME]"
+     \x20      [--play FILE] [--monitor BACKEND:NAME]\n\
+     \n\
+     \x20 First connect/pair to a host that has not approved this client yet waits silently:\n\
+     \x20 15 s, then up to 195 s more (~3.5 min total), while the host holds the connection in\n\
+     \x20 its pending-approval list (it parks an unknown device for 180 s). Approve this client\n\
+     \x20 in the host's client list to end the wait; an unapproved first connect is not hung.\n\
+     \n\
+     \x20 --codec av1 needs the Media Foundation decoder backend with the AV1 Video Extension;\n\
+     \x20 the default ffmpeg backend supports h264 and hevc only."
 }
 
 #[cfg(test)]
@@ -529,5 +590,31 @@ mod tests {
     fn help_is_not_silently_ignored() {
         let err = p("--help").unwrap_err();
         assert!(err.contains("usage: slipstream-windows"));
+    }
+
+    /// The gate that complements the `Hello` advertisement: AV1 stays accepted (MF users need it)
+    /// but is refused at the CLI on a backend that cannot decode it, naming what is supported.
+    #[test]
+    fn explicit_av1_is_refused_when_the_backend_cannot_decode_it() {
+        use slipstream_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC};
+        let ff = CODEC_H264 | CODEC_HEVC;
+        let err = check_codec_support(CODEC_AV1, ff).unwrap_err();
+        assert!(err.contains("av1"), "{err}");
+        assert!(err.contains("Media Foundation"), "{err}");
+        assert!(err.contains("h264, hevc"), "{err}");
+        // A capable backend accepts it, and `auto` is always satisfiable.
+        assert!(check_codec_support(CODEC_AV1, ff | CODEC_AV1).is_ok());
+        assert!(check_codec_support(0, ff).is_ok());
+        assert!(check_codec_support(CODEC_H264, ff).is_ok());
+    }
+
+    /// An unpaired first connect can sit silent for 15 s + 195 s, so the help must say so rather
+    /// than leave an operator believing the client hung.
+    #[test]
+    fn help_documents_the_first_pairing_wait() {
+        let u = usage();
+        assert!(u.contains("15 s"), "{u}");
+        assert!(u.contains("195 s"), "{u}");
+        assert!(u.contains("pending-approval"), "{u}");
     }
 }

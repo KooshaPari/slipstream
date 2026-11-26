@@ -205,7 +205,10 @@ fn advertised_codecs(mf: bool, av1_probe: impl Fn() -> bool) -> u8 {
 
 /// The advertisement for this process: the default `ffmpeg.exe` backend has no AV1 demuxer
 /// mapping, so AV1 is not advertised unless the Media Foundation backend (probed) is selected.
-fn hello_codecs() -> u8 {
+///
+/// `pub(crate)` so the CLI gate (`args::check_codec_support`) can reuse exactly this set instead
+/// of restating it: a codec the client will not advertise is a codec it must refuse explicitly.
+pub(crate) fn hello_codecs() -> u8 {
     if uses_mf_backend() {
         advertised_codecs(true, mf::supports_av1)
     } else {

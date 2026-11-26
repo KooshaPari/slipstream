@@ -174,6 +174,14 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // An explicit codec the selected decode backend cannot decode must fail here, not after the
+    // handshake: `session::hello_codecs` is the same capability set the `Hello` advertisement is
+    // built from, so a request for AV1 on the ffmpeg backend is refused at the CLI with what IS
+    // supported, instead of negotiating a stream this client would then refuse to decode.
+    if let Err(e) = args::check_codec_support(args.preferred_codec, session::hello_codecs()) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
     if let Err(e) = run(args) {
         tracing::error!("{e:#}");
         std::process::exit(1);

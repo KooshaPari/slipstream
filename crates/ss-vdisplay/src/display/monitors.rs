@@ -86,6 +86,80 @@ impl PhysicalMonitor {
     }
 }
 
+/// The trailing status tags for one head, in a fixed order.
+fn row_tags(m: &PhysicalMonitor, pinned: Option<&str>) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if m.primary {
+        tags.push("primary");
+    }
+    if !m.enabled {
+        tags.push("disabled");
+    }
+    if m.managed {
+        tags.push("slipstream virtual display");
+    }
+    if pinned.is_some_and(|p| p.eq_ignore_ascii_case(&m.connector)) {
+        tags.push("PINNED");
+    }
+    tags
+}
+
+/// Render the body of `list-monitors`: one line per head, with the columns aligned across *all*
+/// rows rather than per row.
+///
+/// Two formatting rules matter here:
+///
+/// * **Signs.** Origins are signed (`x`/`y` are `i32`; a head left of or above the primary is
+///   negative), so the sign is part of the value (`{:+}`). Formatting a signed value with a
+///   literal `+` in front produced `+-1680`; this renders `-1680` and `+0`.
+/// * **Widths.** Column widths are computed from the rows themselves. A hard-coded connector width
+///   breaks as soon as a name is wider (`\\.\DISPLAY10`), and a right-aligned mode label makes the
+///   gap before `at` differ between a 12- and 13-character mode. Deriving each width from the data
+///   keeps every column lining up regardless of connector length, mode label, or whether the row
+///   carries a `[primary]`-style tag.
+///
+/// The description is padded to the widest one so the tag column starts at the same place on
+/// every row; rows with no tags are right-trimmed so they do not carry trailing spaces.
+pub fn format_rows(monitors: &[PhysicalMonitor], pinned: Option<&str>) -> Vec<String> {
+    let modes: Vec<String> = monitors.iter().map(PhysicalMonitor::mode_label).collect();
+    let positions: Vec<String> = monitors
+        .iter()
+        .map(|m| format!("{:+},{:+}", m.x, m.y))
+        .collect();
+    let scales: Vec<String> = monitors.iter().map(|m| m.scale.to_string()).collect();
+
+    let connector_w = monitors
+        .iter()
+        .map(|m| m.connector.len())
+        .max()
+        .unwrap_or(0);
+    let mode_w = modes.iter().map(String::len).max().unwrap_or(0);
+    let position_w = positions.iter().map(String::len).max().unwrap_or(0);
+    let scale_w = scales.iter().map(String::len).max().unwrap_or(0);
+    let description_w = monitors
+        .iter()
+        .map(|m| m.description.len())
+        .max()
+        .unwrap_or(0);
+
+    monitors
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let row = format!(
+                "  {:<connector_w$}  {:<mode_w$}  at {:<position_w$}  scale {:<scale_w$}  {:<description_w$}",
+                m.connector, modes[i], positions[i], scales[i], m.description,
+            );
+            let tags = row_tags(m, pinned);
+            if tags.is_empty() {
+                row.trim_end().to_string()
+            } else {
+                format!("{row}  [{}]", tags.join(", "))
+            }
+        })
+        .collect()
+}
+
 /// Every head `compositor` reports, in the compositor's own order.
 ///
 /// Errors when the backend can't be reached (compositor not running, IPC unavailable) — that is
@@ -220,5 +294,62 @@ mod tests {
         assert_eq!(m.mode_label(), "1920x1080@60");
         m.refresh_mhz = 0;
         assert_eq!(m.mode_label(), "1920x1080");
+    }
+
+    /// A head left of the primary reports a negative origin, which must render as `-1680`, never
+    /// `+-1680`; a positive origin keeps its explicit `+`.
+    #[test]
+    fn negative_and_positive_origins_render_a_single_sign() {
+        let right = mon(r"\\.\DISPLAY1"); // x = 0, y = 0
+        let mut left = mon(r"\\.\DISPLAY2");
+        left.x = -1680;
+        left.y = 12;
+        let rows = format_rows(&[right, left], None);
+        assert!(rows[0].contains("at +0,+0"), "{}", rows[0]);
+        assert!(rows[1].contains("at -1680,+12"), "{}", rows[1]);
+        assert!(!rows[1].contains("+-"), "{}", rows[1]);
+    }
+
+    /// Columns line up across rows with different connector lengths, mode-label lengths, and the
+    /// presence of a `[primary]` tag: `at`, `scale`, and the tag column start at one offset.
+    #[test]
+    fn columns_align_across_lengths_and_tags() {
+        let mut a = mon(r"\\.\DISPLAY1");
+        a.width = 2560;
+        a.height = 1440;
+        a.refresh_mhz = 144000;
+        a.primary = true;
+        a.description = "Dell U2720Q".into();
+        let mut b = mon(r"\\.\DISPLAY10");
+        b.width = 1680;
+        b.height = 1050;
+        b.refresh_mhz = 60000;
+        b.x = -1680;
+        b.y = 12;
+        b.description = "LG".into();
+        // Captured before the rows are rendered: the description column is padded to the widest.
+        let description_pad = a.description.len() - b.description.len();
+        let rows = format_rows(&[a, b], None);
+        assert_eq!(
+            rows[0].find(" at "),
+            rows[1].find(" at "),
+            "{} || {}",
+            rows[0],
+            rows[1]
+        );
+        assert_eq!(rows[0].find(" scale "), rows[1].find(" scale "), "{rows:?}");
+        assert!(rows[0].contains("[primary]"), "{}", rows[0]);
+        // The description is padded to the widest one, so the tag column starts at the same column
+        // on every row. The tagless row is right-trimmed, so its trimmed length plus the padding it
+        // gave up is the tag column.
+        let tag_col = rows[0].find("[primary]").unwrap();
+        assert_eq!(
+            tag_col,
+            rows[1].len() + description_pad + 2,
+            "{} || {}",
+            rows[0],
+            rows[1]
+        );
+        assert_eq!(rows[1], rows[1].trim_end());
     }
 }

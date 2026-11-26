@@ -671,6 +671,13 @@ fn real_main() -> Result<()> {
         // List the host's physical monitors — the connector names `SLIPSTREAM_CAPTURE_MONITOR`
         // takes. An operator configuring an unattended host has to learn those names from
         // somewhere, and "curl the management API before the host is configured" is not it.
+        //
+        // TIMING: Windows display enumeration has a real cold-start cost. Measured on the desk
+        // box, the first `EnumDisplayDevicesW` walk of a fresh process took ~16 s while a second
+        // invocation seconds later took ~1.1 s; the cost is driver/first-touch warm-up, not this
+        // loop. A bringup script that polls `list-monitors` must allow for that first call. Do not
+        // try to "fix" it by caching here — enumeration is the point, and a stale cache would
+        // report heads that have been unplugged.
         Some("list-monitors") => {
             let compositor = vdisplay::detect()?;
             let monitors = vdisplay::monitors::list(compositor)
@@ -681,37 +688,8 @@ fn real_main() -> Result<()> {
             }
             let pinned = vdisplay::capture_monitor();
             println!("{compositor:?}:");
-            for m in &monitors {
-                let mut tags = Vec::new();
-                if m.primary {
-                    tags.push("primary");
-                }
-                if !m.enabled {
-                    tags.push("disabled");
-                }
-                if m.managed {
-                    tags.push("slipstream virtual display");
-                }
-                if pinned
-                    .as_deref()
-                    .is_some_and(|p| p.eq_ignore_ascii_case(&m.connector))
-                {
-                    tags.push("PINNED");
-                }
-                println!(
-                    "  {:<12} {:>13} at +{},+{}  scale {}  {}{}",
-                    m.connector,
-                    m.mode_label(),
-                    m.x,
-                    m.y,
-                    m.scale,
-                    m.description,
-                    if tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  [{}]", tags.join(", "))
-                    }
-                );
+            for line in vdisplay::monitors::format_rows(&monitors, pinned.as_deref()) {
+                println!("{line}");
             }
             Ok(())
         }
@@ -1105,9 +1083,23 @@ fn parse_spike(args: &[String]) -> Result<Options> {
     })
 }
 
+/// The platform this host binary targets, for the usage banner.
+///
+/// The same binary builds and runs on Windows (it enumerates Windows displays over GDI), so a
+/// hard-coded "Linux streaming host" banner was wrong on the platform it was actually running on.
+fn host_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else {
+        "desktop"
+    }
+}
+
 fn print_usage() {
     eprintln!(
-        "slipstream-host — Linux streaming host
+        "slipstream-host — {} streaming host
 
 USAGE:
     slipstream-host serve [OPTIONS]            native slipstream/1 host + management REST API
@@ -1190,5 +1182,7 @@ NOTES:
     slipstream_core host→client loopback that reassembles and byte-verifies each one.
     Both 'serve' and 'slipstream1-host' advertise the native service over mDNS
     (_slipstream._udp) for client auto-discovery — 'slipstream-probe --discover' lists them."
+        ,
+        host_platform()
     );
 }

@@ -92,6 +92,31 @@ committed SVG sources.
 | `probe.ico` | `8edf80ef14c00c4e293d95861dfa5ace06a1b13b2846aa0187479d6ea73e7a41` |
 | `cli.ico` | `6363184745191f0106f2431ae156e941b12c9e53a5a7acc9a6204889b7013b29` |
 
+## Embedded in the binaries
+
+Each crate has a `build.rs` that embeds its own `.ico` through `winresource`,
+so every Windows release exe carries an `RT_GROUP_ICON`, its seven `RT_ICON`
+frames, and a `VERSIONINFO` block (`FileDescription`, `ProductName`,
+`FileVersion`, `ProductVersion`). The build script resolves the icon as
+`CARGO_MANIFEST_DIR/../../assets/icons/<name>.ico`, so it works regardless of
+the directory cargo is invoked from. Non-Windows targets skip the resource
+compiler entirely.
+
+| Binary | Crate | Icon | 256px frame SHA-256 |
+| --- | --- | --- | --- |
+| `slipstream-host.exe` | `crates/slipstream-host` | `host.ico` | `2d4c41dbe833d46fd6fac6a325235a8539dd1cacbd01383f6936f050f684dc5f` |
+| `slipstream-tray.exe` | `crates/slipstream-tray` | `tray.ico` | `010dfc41844325d70693887c935e067b5b99655cc42fa3601decf040c783314e` |
+| `slipstream.exe` | `clients/cli` | `cli.ico` | `e753ff02f652fec74b9e0b5e5bb1097298a1d96c4d3b07843cc00c36be2c9408` |
+| `slipstream-probe.exe` | `clients/probe` | `probe.ico` | `3b89e402f0a5100ad843f60846c0c5f7fd2d8739c919976bd52c07c1f3de7339` |
+| `slipstream-windows.exe` | `clients/windows` | `windows.ico` | `5f7ae76cfca84913857b582c7788146019c822cf52bfc6fb8c70bfd5cecc7a91` |
+
+The hash in the last column is the SHA-256 of the 256-pixel frame payload, so
+it is stable across builds and machines. It also equals the hash of the
+`RT_ICON` resource with id 7 that a release build embeds, which is how the
+wiring is checked: parse the PE resource directory, hash each `RT_ICON` blob,
+and compare frame 7 against the source `.ico`. All five values above are
+distinct, so the five binaries really do carry five different icons.
+
 ## Source rules
 
 The SVG sources are plain SVG with no scripting, no `foreignObject`, no

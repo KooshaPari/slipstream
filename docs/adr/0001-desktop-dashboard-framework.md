@@ -10,7 +10,7 @@
 ## Context
 
 Slipstream is a Rust game-streaming host plus client. The management dashboard today is a
-web application: React 19 + Vite 7 + Tailwind 4 + TypeScript 5.9, with 16 feature
+web application: React 19 + Vite 7 + Tailwind 4 + TypeScript 5.9, with 15 feature
 sections, a Nitro/h3 server under `web/server`, Storybook, an orval-generated typed API
 client, and Biome.
 
@@ -36,7 +36,7 @@ path from the LAN to the management API. Both processes are required: the consol
 502 with no host running. That means any "native" option either embeds the existing React
 app in a webview pointed at the Nitro server (preserving the same-origin proxy path), or
 reimplements that proxy inside the Rust host, or throws the React app away and rebuilds
-all 16 sections in a different toolkit.
+all 15 sections in a different toolkit.
 
 ## Constraints
 
@@ -49,7 +49,7 @@ These are the constraints the decision must respect. They are real, not invented
 | C3 | **Cross-platform**: Windows is primary, but Linux and Steam Deck exist in the repo | The repo has Linux systemd packaging, a Steam Deck install script, a Decky client, an Android client, and an Apple client | Root `Cargo.toml` workspace members; `packaging/`, `scripts/steamdeck/`, `clients/` |
 | C4 | **Memory and startup footprint** for an always-running background host with a tray | The host already runs FFmpeg, Vulkan, PipeWire, and a QUIC control plane. The dashboard must not be the thing that makes the host heavy | `crates/slipstream-tray/Cargo.toml:14-19` states the tray deliberately does **not** depend on `slipstream-host` so it does not drag FFmpeg/PipeWire into a 2 MB helper |
 | C5 | **Licensing**: no GPL obligation and no commercial royalty on a project the maintainers ship | Slint has a GPL-or-commercial split with a royalty-free tier, and the exact tier must be stated. Avalonia is MIT, egui is MIT or Apache-2.0, GPUI is Apache-2.0, Flutter is BSD-3, React Native is MIT, Tauri is MIT or Apache-2.0 | Workspace `license = "MIT OR Apache-2.0"` (root `Cargo.toml` `[workspace.package]`) |
-| C6 | **Effort to a polished, non-embarrassing UI**, judged against the existing React design-system work | The existing console has a vendored design system (`web/vendor/unom-ui`, `web/vendor/unom-style`), an Observatory component family, Storybook, and screenshot tooling | `web/src/components/ui/` (12 files), `web/src/components/observatory/` (9 files), `web/vendor/unom-ui/` (11 files), `web/vendor/unom-style/` (2 files) |
+| C6 | **Effort to a polished, non-embarrassing UI**, judged against the existing React design-system work | The existing console has a vendored design system (`web/vendor/unom-ui`, `web/vendor/unom-style`), an Observatory component family, Storybook, and screenshot tooling | `web/src/components/ui/` (11 files), `web/src/components/observatory/` (9 files), `web/vendor/unom-ui/` (11 files), `web/vendor/unom-style/` (2 files) |
 | C7 | The honest question of whether the operator wants **a branded native app at all**, versus keeping the web app and serving it locally | A native app is a second implementation to maintain. If the web console plus a tray shortcut is good enough, the native rewrite is a cost with no user-visible payoff | `crates/slipstream-tray/src/platform/windows.rs` already has an "Open web console" menu item |
 
 ## Repo evidence
@@ -223,15 +223,15 @@ Design-system surface, which is the part a rewrite has to replace, not just re-c
 
 | Path | Files | Bytes | Contents |
 |---|---|---|---|
-| `web/src/components/ui` | 12 | | `badge, button, card, dialog, input, label, spinner, switch, table, tabs, tooltip` |
-| `web/src/components/observatory` | 9 | | `AlertStrip, EventTimeline, MetricCard, PageHeader, StatusIndicator, Summary` plus `state.tsx`, `types.ts` |
-| `web/src/components` (top level) | 7 | | `app-shell.tsx`, `brand-mark.tsx`, `command-palette.tsx`, `logo.tsx`, `option-help.tsx`, `os-icon.tsx`, `query-state.tsx` |
+| `web/src/components/ui` | 11 | 17,617 | `badge, button, card, dialog, input, label, spinner, switch, table, tabs, tooltip` |
+| `web/src/components/observatory` | 9 | 29,269 | `AlertStrip, EventTimeline, MetricCard, PageHeader, StatusIndicator, Summary` plus `index.ts`, `state.tsx`, `types.ts` |
+| `web/src/components` (top level) | 8 | | `app-shell.tsx`, `brand-mark.tsx`, `command-palette.tsx`, `logo.tsx`, `option-help.tsx`, `os-icon.tsx`, `query-state.tsx`, `wordmark.tsx` |
 | `web/vendor/unom-ui` | 11 | 12,828 | `button, card, dialog, material, section, tabs, toast` plus `form/checkbox`, `form/input-text`, `form/label` |
 | `web/vendor/unom-style` | 2 | 365 | `src/index.ts` (the Tailwind 4 token layer) |
 
 The two largest sections by byte count are **Config** (104,993 bytes, 3,250 lines) and
 **Displays** (82,404 bytes, 2,242 lines). Together with **Host** (62,531) and **Store**
-(64,929) they account for 314,956 bytes, which is 39.9 percent of `web/src`.
+(64,929) they account for 314,857 bytes, which is 39.9 percent of `web/src`.
 
 **This is the rewrite-cost number.** Rebuilding the console in a toolkit that cannot
 reuse React means re-implementing 22,411 lines of application code plus 28 design-system

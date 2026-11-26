@@ -50,15 +50,6 @@ jobs:
       - run: cargo test -p ss-host-config -p ss-update-check --locked
       - run: cargo check -p slipstream-host --locked
       - run: cargo test -p slipstream-host --locked
-      # `ss-vdisplay` and `ss-capture` carry modules that exist only on Linux: the per-compositor
-      # backends (gamescope, kwin, kwin_output_mgmt, mutter, hyprland, headless, portal_config) and
-      # the PipeWire/KMS/portal capture sources. None of that compiles on the Windows runners, and
-      # no other job covers these crates, so a regression in the KWin or Wayland paths used to ship
-      # unnoticed. The `Install native dependencies` step above already provides the Wayland,
-      # PipeWire and FFmpeg development libraries they need, so no extra packages are installed.
-      - run: cargo clippy -p ss-vdisplay --all-targets --locked -- -D warnings
-      - run: cargo test -p ss-vdisplay --locked
-      - run: cargo test -p ss-capture --locked
       - name: Verify generated C header
         run: git diff --exit-code -- include/slipstream_core.h
       - name: Verify generated OpenAPI
@@ -66,6 +57,42 @@ jobs:
           cargo run -p slipstream-host --locked -- openapi > "$RUNNER_TEMP/openapi.json"
           cmp "$RUNNER_TEMP/openapi.json" api/openapi.json
           cmp api/openapi.json docs-site/public/openapi.json
+
+  linux-crates:
+    name: Linux-only crate checks
+    runs-on: ubuntu-24.04
+    # `ss-vdisplay` and `ss-capture` carry modules that exist only on Linux: the per-compositor
+    # backends (gamescope, kwin, kwin_output_mgmt, mutter, hyprland, headless, portal_config) and
+    # the PipeWire/KMS/portal capture sources. None of that compiles on the Windows runners, and
+    # no other job covers these crates, so a regression in the KWin or Wayland paths used to ship
+    # unnoticed.
+    #
+    # These checks live in their OWN job rather than after the portable-core steps in `rust`:
+    # GitHub skips every later step once one fails, so a failure anywhere in the core job marked
+    # the Linux-only builds "skipped" and their compile/test state was never learned. An
+    # independent job cannot be masked by a core-crate regression. The install step mirrors the
+    # `rust` job's, providing the Wayland, PipeWire and FFmpeg development libraries they need.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config cmake libdrm-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
+            libavdevice-dev libpipewire-0.3-dev libopus-dev libwayland-dev libxkbcommon-dev \
+            libgl-dev libegl-dev libgbm-dev libvulkan-dev
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, pinned
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+
+      - run: cargo clippy -p ss-vdisplay --all-targets --locked -- -D warnings
+      - run: cargo test -p ss-vdisplay --locked
+      - run: cargo test -p ss-capture --locked
 
   windows-host:
     name: Windows host compile

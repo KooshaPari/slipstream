@@ -50,6 +50,15 @@ jobs:
       - run: cargo test -p ss-host-config -p ss-update-check --locked
       - run: cargo check -p slipstream-host --locked
       - run: cargo test -p slipstream-host --locked
+      # `ss-vdisplay` and `ss-capture` carry modules that exist only on Linux: the per-compositor
+      # backends (gamescope, kwin, kwin_output_mgmt, mutter, hyprland, headless, portal_config) and
+      # the PipeWire/KMS/portal capture sources. None of that compiles on the Windows runners, and
+      # no other job covers these crates, so a regression in the KWin or Wayland paths used to ship
+      # unnoticed. The `Install native dependencies` step above already provides the Wayland,
+      # PipeWire and FFmpeg development libraries they need, so no extra packages are installed.
+      - run: cargo clippy -p ss-vdisplay --all-targets --locked -- -D warnings
+      - run: cargo test -p ss-vdisplay --locked
+      - run: cargo test -p ss-capture --locked
       - name: Verify generated C header
         run: git diff --exit-code -- include/slipstream_core.h
       - name: Verify generated OpenAPI

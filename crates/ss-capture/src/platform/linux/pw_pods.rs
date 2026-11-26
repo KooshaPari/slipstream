@@ -119,6 +119,10 @@ pub(super) fn build_dmabuf_format(
 /// together, so the value is identical on every libspa that has the symbol at all. On one that
 /// doesn't, PipeWire simply fails to intersect this format offer and the session negotiates
 /// SDR — the same outcome as not offering HDR.
+///
+/// `build.rs` probes the headers the bindings are generated from and sets `libspa_has_smpte2084`
+/// when they DO export the symbol; `tests::pq_transfer_id_matches_libspa` uses it to cross-check
+/// this literal against libspa's enum where that is compilable, and to pin `14` where it is not.
 const SPA_VIDEO_TRANSFER_SMPTE2084: u32 = 14;
 
 pub(super) fn build_hdr_dmabuf_format(
@@ -496,16 +500,32 @@ mod tests {
         }
     }
 
-    /// Pin our hand-written PQ transfer id against the real libspa binding. We can't take the
-    /// constant from `pw::spa::sys` directly (older distro headers don't export it — see
-    /// [`super::SPA_VIDEO_TRANSFER_SMPTE2084`]), so assert the two agree wherever the symbol
-    /// DOES exist. Any libspa that renumbers the enum fails this instead of silently tagging
-    /// the HDR offer with the wrong transfer function.
+    /// Pin our hand-written PQ transfer id against the real libspa binding where the installed
+    /// headers export it — and against its wire position everywhere, because the two must agree
+    /// and only one of them always compiles.
     ///
-    /// Only builds where tests are compiled — the .deb/.rpm builders run plain `cargo build`,
-    /// so this never reintroduces the compile failure it exists to prevent.
+    /// We can't take the constant from `pw::spa::sys` directly: `libspa-sys` bindgens the SYSTEM
+    /// headers, so older ones (Ubuntu 24.04 noble, PipeWire 1.0) have no
+    /// `SPA_VIDEO_TRANSFER_SMPTE2084` at all and naming it fails the build with E0425 — including
+    /// the TEST build, which is how this surfaced in CI. `build.rs` probes those same headers and
+    /// sets `libspa_has_smpte2084` when the block is present:
+    ///
+    /// * symbol present — assert the hardcoded id equals `spa::sys`'s enum value, so any libspa
+    ///   that renumbers the enum fails here instead of silently tagging the HDR offer with the
+    ///   wrong transfer function;
+    /// * symbol absent — assert the id is still 14, its position in `spa_video_transfer_function`
+    ///   (wire ABI, shared with GStreamer's `GstVideoTransferFunction`), so a wrong literal is
+    ///   caught on old headers too instead of becoming untestable.
     #[test]
     fn pq_transfer_id_matches_libspa() {
+        // Unconditional: 14 is the enum's wire position and must hold on every libspa.
+        assert_eq!(
+            super::SPA_VIDEO_TRANSFER_SMPTE2084,
+            14,
+            "PQ transfer id must be spa_video_transfer_function's position 14"
+        );
+        // Conditional: only compiles where the installed headers export the symbol.
+        #[cfg(libspa_has_smpte2084)]
         assert_eq!(
             super::SPA_VIDEO_TRANSFER_SMPTE2084,
             super::pw::spa::sys::SPA_VIDEO_TRANSFER_SMPTE2084,

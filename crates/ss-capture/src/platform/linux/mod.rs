@@ -129,6 +129,12 @@ struct CaptureSignals {
     frames_published: Arc<AtomicU64>,
     frames_overwritten: Arc<AtomicU64>,
     buffers_drained: Arc<AtomicU64>,
+    /// Wall-clock microseconds the PipeWire callback's production path took for the most recent
+    /// published frame: callback entry (`CaptureStageTimes::callback_entry_ns`) to publish
+    /// (`publish_ns`) — buffer selection, the implicit-fence wait, the import/handoff (GPU) or
+    /// de-pad + conversion (CPU), and cursor composition. The Linux analogue of
+    /// `CaptureTelemetry::producer_us`; `0` until the first frame is produced.
+    producer_us: Arc<AtomicU64>,
     /// Frames the consumer has TAKEN out of the slot (Phase 3: guards the CPU de-pad buffer
     /// pool's reuse — a pooled buffer is only refilled once a take proves the consumer is
     /// draining).
@@ -156,6 +162,7 @@ impl CaptureSignals {
             frames_published: Arc::new(AtomicU64::new(0)),
             frames_overwritten: Arc::new(AtomicU64::new(0)),
             buffers_drained: Arc::new(AtomicU64::new(0)),
+            producer_us: Arc::new(AtomicU64::new(0)),
             frames_taken: Arc::new(AtomicU64::new(0)),
             fence_timeouts: Arc::new(AtomicU64::new(0)),
             negotiated_width: Arc::new(AtomicU64::new(0)),
@@ -578,6 +585,9 @@ impl Capturer for PortalCapturer {
             try_next_ok: 0,
             try_next_empty: 0,
             buffers_drained: self.signals.buffers_drained.load(Ordering::Relaxed),
+            // Per-frame production cost measured in `UserData::publish` from the stage stamps
+            // (callback entry → publish) — the Linux analogue of the WGC staging-copy probe.
+            producer_us: self.signals.producer_us.load(Ordering::Relaxed) as u32,
             width: self.signals.negotiated_width.load(Ordering::Relaxed) as u32,
             height: self.signals.negotiated_height.load(Ordering::Relaxed) as u32,
             modifier: self.signals.negotiated_modifier.load(Ordering::Relaxed),

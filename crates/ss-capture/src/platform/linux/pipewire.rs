@@ -239,6 +239,26 @@ impl UserData {
     fn publish(&self, frame: CapturedFrame) {
         let mut frame = frame;
         frame.stage_ns.publish_ns = now_ns();
+        // Per-frame producer cost — the Linux analogue of the Windows staging-copy probe. WGC
+        // starts its probe once the pool drain has selected the newest frame, i.e. AFTER source
+        // delivery; the equivalent anchor here is `newest_selection_ns` (selection complete, this
+        // frame is known), so the span covers the fence wait, the import/handoff or CPU de-pad +
+        // conversion, and cursor composition — the work of turning that source frame into a
+        // published one. Falls back to callback entry on a timeline without that stamp; a zero
+        // anchor means the timeline was never instrumented (no `.process` callback behind the
+        // publish), in which case the last measured cost is left in place rather than reporting a
+        // bogus span.
+        let start_ns = match frame.stage_ns.newest_selection_ns {
+            0 => frame.stage_ns.callback_entry_ns,
+            selection_ns => selection_ns,
+        };
+        if start_ns != 0 {
+            let produced_ns = frame.stage_ns.publish_ns.saturating_sub(start_ns);
+            self.signals.producer_us.store(
+                (produced_ns / 1_000).min(u32::MAX as u64),
+                Ordering::Relaxed,
+            );
+        }
         self.signals
             .last_frame_ns
             .store(frame.pts_ns, Ordering::Relaxed);

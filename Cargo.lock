@@ -3820,6 +3820,7 @@ dependencies = [
  "ss-client-core",
  "tracing",
  "tracing-subscriber",
+ "winresource",
 ]
 
 [[package]]
@@ -3974,6 +3975,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "wayland-scanner",
  "windows",
+ "winresource",
  "x509-parser",
  "xkbcommon",
 ]
@@ -3990,6 +3992,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "winresource",
 ]
 
 [[package]]
@@ -4020,6 +4023,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+ "winresource",
 ]
 
 [[package]]

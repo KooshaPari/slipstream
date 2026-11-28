@@ -42,6 +42,33 @@ the same binary runs on AMD and Intel: those GPUs use the software H.264 encoder
 A Linux CI job cross-checks this crate graph with `x86_64-pc-windows-gnu`. That job does not open
 a GPU or a display.
 
+### Crates that build native dependencies with CMake
+
+`slipstream-probe` pulls Opus through `audiopus_sys`, which configures and builds it with CMake. Two
+things bite on a machine that has only the standalone Visual Studio Build Tools, and neither is a
+problem with this repository.
+
+CMake 4 removed compatibility with `cmake_minimum_required` below 3.5, so older crates fail to
+configure even though nothing is wrong with them. Set `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+
+`cmake-rs` asks for the `Visual Studio 17 2022` generator. When the installed toolset is newer, for
+example Visual Studio Build Tools 2026, that generator cannot find an instance to attach to, and
+CMake 4.0.3 offers no generator for the newer toolset at all. Building through Ninja from an MSVC
+environment works:
+
+```sh
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set CMAKE_POLICY_VERSION_MINIMUM=3.5
+set CMAKE_GENERATOR_x86_64-pc-windows-msvc=Ninja
+cargo build --release -p slipstream-probe
+```
+
+If you change generators, delete that crate's cached build directory under
+`target\release\build\audiopus_sys-*` first. A cached `CMakeCache.txt` pins the old generator and
+CMake then stops with "generator does not match the generator used previously".
+
+These are environment workarounds. Nothing in the repository build is configured this way.
+
 ## Config and the service
 
 Config, pairing state, and the console password live in `%APPDATA%\slipstream`

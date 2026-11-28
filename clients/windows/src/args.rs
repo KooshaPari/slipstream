@@ -113,9 +113,7 @@ impl Target {
                 .split_once(']')
                 .ok_or_else(|| format!("unterminated '[' in {s:?}"))?;
             let port = match tail.strip_prefix(':') {
-                Some(p) => p
-                    .parse::<u16>()
-                    .map_err(|_| format!("bad port in {s:?}"))?,
+                Some(p) => p.parse::<u16>().map_err(|_| format!("bad port in {s:?}"))?,
                 None if tail.is_empty() => DEFAULT_PORT,
                 None => return Err(format!("unexpected {tail:?} after ] in {s:?}")),
             };
@@ -219,8 +217,8 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             "--name" => args.name = value(&mut i, "--name")?,
             "--mode" => {
                 let raw = value(&mut i, "--mode")?;
-                args.mode =
-                    parse_mode(&raw).ok_or_else(|| format!("--mode must be WxHxFPS, got {raw:?}"))?;
+                args.mode = parse_mode(&raw)
+                    .ok_or_else(|| format!("--mode must be WxHxFPS, got {raw:?}"))?;
             }
             "--bitrate" => {
                 let raw = value(&mut i, "--bitrate")?;
@@ -230,9 +228,8 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
             }
             "--codec" => {
                 let raw = value(&mut i, "--codec")?;
-                args.preferred_codec = parse_codec(&raw).ok_or_else(|| {
-                    format!("--codec must be auto|h264|hevc|av1, got {raw:?}")
-                })?;
+                args.preferred_codec = parse_codec(&raw)
+                    .ok_or_else(|| format!("--codec must be auto|h264|hevc|av1, got {raw:?}"))?;
             }
             "--audio-channels" => {
                 let raw = value(&mut i, "--audio-channels")?;
@@ -265,7 +262,8 @@ pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Args, String> {
         }
         i += 1;
     }
-    if args.connect.is_some() && (args.discover.is_some() || args.pair.is_some() || args.play.is_some())
+    if args.connect.is_some()
+        && (args.discover.is_some() || args.pair.is_some() || args.play.is_some())
     {
         return Err("--connect cannot be combined with --discover, --pair or --play".into());
     }

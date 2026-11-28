@@ -25,7 +25,10 @@ fn main() {
     let mut res = winresource::WindowsResource::new();
     res.set_icon(&icon.to_string_lossy());
     res.set("ProductName", "Slipstream");
-    res.set("FileDescription", "Slipstream probe and latency diagnostic client");
+    res.set(
+        "FileDescription",
+        "Slipstream probe and latency diagnostic client",
+    );
     res.set("LegalCopyright", "Slipstream contributors");
     if let Ok(version) = std::env::var("CARGO_PKG_VERSION") {
         res.set("ProductVersion", &version);

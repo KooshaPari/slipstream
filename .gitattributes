@@ -1,0 +1,10 @@
+# Generated C header line-ending pin.
+#
+# include/slipstream_core.h is written by crates/slipstream-core/build.rs, which
+# emits LF endings. With core.autocrlf=true Git expects CRLF in the working tree,
+# so every build rewrote the file and left `git status` reporting it as modified
+# with an empty diff. Pinning this path to LF makes the generator output and the
+# checkout agree, so a build no longer dirties the tree.
+#
+# Path-scoped deliberately: this says nothing about any other file.
+include/slipstream_core.h text eol=lf

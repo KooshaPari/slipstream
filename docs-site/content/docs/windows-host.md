@@ -88,6 +88,32 @@ runs the default `serve` plane (management API and slipstream/1, GameStream off)
 console, the dispatcher declines and the normal CLI runs, so `slipstream-host serve` and
 `slipstream-host serve --gamestream` still work. The tray is `slipstream-tray.exe`.
 
+### Upgrading from a pre-MSI per-user install
+
+The MSI installs everything under `%ProgramFiles%\Slipstream` and adds one autostart entry:
+
+```
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+  SlipstreamTray = "%ProgramFiles%\Slipstream\slipstream-tray.exe" --autostart
+```
+
+An earlier per-user install used a different name and a different location:
+
+```
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+  Slipstream = %LOCALAPPDATA%\Programs\Slipstream\slipstream-tray.exe
+```
+
+The MSI does not remove that older `Slipstream` value. Upgrading a machine that carries it leaves
+two autostart entries pointing at two different binaries, and the older one keeps launching a tray
+from `%LOCALAPPDATA%` that no longer matches the installed host. Check before upgrading and delete
+the stale value:
+
+```bat
+reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Slipstream
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Slipstream /f
+```
+
 ## Encode
 
 `SLIPSTREAM_ENCODER` selects the backend:

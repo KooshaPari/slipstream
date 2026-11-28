@@ -125,3 +125,44 @@ external references, no `xlink:href`, no web fonts, no embedded rasters, no
 `stop`, `rect`, `path`, `circle` and `line` are used. The only URL that
 appears is the required `http://www.w3.org/2000/svg` namespace declaration.
 Each file stays under 4 KB.
+
+## Runtime verification after the icon and version-resource wiring
+
+Date: 2026-11-28. These are measured results from running the built Windows binaries, not inferences. The purpose is to show the resource changes did not disturb startup or the management API.
+
+Artifact under test: `slipstream-host.exe`, 20,292,096 bytes, built with `cargo build --release -p slipstream-host`.
+
+Command, with an isolated config directory and non-default ports so nothing collides with an installed service:
+
+```
+set SLIPSTREAM_CONFIG_DIR=<scratch>\cfg
+slipstream-host.exe serve --mgmt-bind 127.0.0.1:48001 --native-port 48101 --no-mdns --mgmt-token <64 hex chars>
+```
+
+Measured startup log lines:
+
+```
+slipstream_host: slipstream-host 0.24.0 (slipstream_core ABI v14)
+slipstream_host::mgmt: management API listening over HTTPS addr=127.0.0.1:48001 auth="mTLS (paired cert) or bearer (required)"
+slipstream_host::protocol::slipstream1: slipstream/1 host listening (QUIC) port=48101
+slipstream_host::protocol::slipstream1: accepting sessions (concurrent) max_concurrent=4
+```
+
+Measured management API responses:
+
+| Request | Result |
+|---|---|
+| `GET https://127.0.0.1:48001/api/v1/health` | `200` with `{"status":"ok","version":"0.24.0","abi_version":14}` |
+| `GET https://127.0.0.1:48001/api/v1/host` with no token | `401` |
+| `GET https://127.0.0.1:48001/api/v1/host` with `Authorization: Bearer <token>` | `200` with the host descriptor JSON |
+
+Conclusion: the host still hosts after the per-binary icon and VERSIONINFO wiring, and the bearer auth boundary is intact.
+
+### Two observed caveats, neither caused by the icon work
+
+1. Without `--native-port`, a second host instance exits with `os error 10048` ("Only one usage of each socket address") because the default QUIC port 9777 is already held by the installed Windows service. Use `--native-port` and `--no-mdns` when running a second instance for testing.
+2. The binary reports `"os":"linux","os_name":"Linux"` in the `/api/v1/host` response on a Windows build. That is a separate host OS-identity defect, tracked outside this branch, and it is unrelated to icons or version resources.
+
+### Cleanup
+
+The host process was terminated after measurement. No listeners remained on ports 48001 or 48101. The installed service running before the test was left untouched.
